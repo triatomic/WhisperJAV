@@ -2598,6 +2598,20 @@ class WhisperJAVAPI:
                         ],
                         "default": "auto",
                     },
+                    "attn_implementation": {
+                        "type": "dropdown",
+                        "label": "Attention",
+                        "group": "hardware",
+                        "options": [
+                            {"value": "auto", "label": "Auto (transformers default)"},
+                            {"value": "sdpa", "label": "SDPA (usually fastest)"},
+                            {"value": "eager", "label": "Eager (safest)"},
+                        ],
+                        "default": "auto",
+                        "description": "Attention kernel. Best-effort: if the "
+                                       "model's remote code rejects the choice, "
+                                       "loading retries with the default.",
+                    },
                 },
                 # Audio: qwen-shell framing/scene/VAD knobs — Cohere rides the
                 # same outer shell as Anime-Whisper, so these all apply. Field
@@ -2680,6 +2694,29 @@ class WhisperJAVAPI:
                         "max": 1024,
                         "step": 64,
                         "default": 512,
+                    },
+                    "batched": {
+                        "type": "checkbox",
+                        "label": "Batched inference",
+                        "default": True,
+                        "description": "Transcribe multiple VAD frames per "
+                                       "model call. Pure speed win (same "
+                                       "greedy decode) — batch-1 decoding "
+                                       "leaves the GPU mostly idle. Falls "
+                                       "back to sequential automatically on "
+                                       "any batching error.",
+                    },
+                    "batch_size": {
+                        "type": "slider",
+                        "label": "Batch Size",
+                        "description": "Frames per model call when batched "
+                                       "inference is on. 8 is a good fit for "
+                                       "8-12GB GPUs; lower it if VRAM is "
+                                       "tight.",
+                        "min": 2,
+                        "max": 16,
+                        "step": 1,
+                        "default": 8,
                     },
                 },
                 "alignment": {
@@ -3036,6 +3073,10 @@ class WhisperJAVAPI:
                 else:
                     qwen1_params['timestamp_mode'] = 'vad_only'
                     qwen1_params['stepdown'] = False
+                # 'batched' is a GUI-only key: off forces sequential
+                # (batch_size=1); on lets batch_size flow (worker default 8).
+                if qwen1_params.pop('batched', True) is False:
+                    qwen1_params['batch_size'] = 1
             if qwen1_params:
                 args += ["--pass1-qwen-params", json.dumps(qwen1_params)]
         else:
@@ -3147,6 +3188,10 @@ class WhisperJAVAPI:
                     else:
                         qwen2_params['timestamp_mode'] = 'vad_only'
                         qwen2_params['stepdown'] = False
+                    # 'batched' is a GUI-only key: off forces sequential
+                    # (batch_size=1); on lets batch_size flow (worker default 8).
+                    if qwen2_params.pop('batched', True) is False:
+                        qwen2_params['batch_size'] = 1
                 if qwen2_params:
                     args += ["--pass2-qwen-params", json.dumps(qwen2_params)]
             else:

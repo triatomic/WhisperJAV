@@ -1339,6 +1339,9 @@ def _build_pipeline(
                 qwen_pipeline_params["segmenter_chunk_threshold"] = 1.0
             if "max_group_duration" not in _user_qwen:
                 qwen_pipeline_params["segmenter_max_group_duration"] = 6.0
+            if "batch_size" not in _user_qwen:
+                # Batched frame transcription (speed default; see main.py)
+                qwen_pipeline_params["batch_size"] = 8
         # Pipeline-owned defaults: only forward when ensemble config explicitly overrides
         if "qwen_scene_min_duration" in qwen_defaults:
             qwen_pipeline_params["scene_min_duration"] = qwen_defaults["qwen_scene_min_duration"]

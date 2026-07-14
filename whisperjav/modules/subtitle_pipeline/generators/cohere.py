@@ -103,6 +103,8 @@ class CohereTextGenerator:
         language: str = "ja",
         punctuation: bool = True,
         max_new_tokens: int = 512,
+        batch_size: int = 1,
+        attn_implementation: str = "auto",
         trust_remote_code: bool = True,
     ):
         """
@@ -119,6 +121,13 @@ class CohereTextGenerator:
             max_new_tokens: Maximum generated tokens per utterance.  Default
                 512 — Cohere has no Whisper-style max_target_positions=448
                 constraint, but 512 is a safe ceiling for JAV-length monologues.
+            batch_size: Frames transcribed per generate() call in
+                generate_batch(). 1 = sequential (original behavior); >1
+                batches VAD frames together, which is the main GPU-utilization
+                lever (a 2B model at batch 1 leaves the GPU mostly idle).
+            attn_implementation: 'auto' (transformers default), 'sdpa', or
+                'eager'. Applied best-effort — if the remote modeling code
+                rejects it, load() retries without and logs a warning.
             trust_remote_code: Required True until transformers exposes
                 CohereAsrForConditionalGeneration natively.
         """
@@ -129,6 +138,8 @@ class CohereTextGenerator:
             "language": language,
             "punctuation": punctuation,
             "max_new_tokens": max_new_tokens,
+            "batch_size": max(1, int(batch_size or 1)),
+            "attn_implementation": attn_implementation or "auto",
             "trust_remote_code": trust_remote_code,
         }
         self._processor = None
@@ -773,18 +784,41 @@ class CohereTextGenerator:
         if cached_snapshot or local_path:
             self._ensure_remote_code(_load_target)
 
+        # Requested attention kernel (best-effort — remote modeling code may
+        # not support it; retried without on failure).
+        _attn = cfg.get("attn_implementation", "auto")
+        _attn_kwargs = (
+            {"attn_implementation": _attn} if _attn and _attn != "auto" else {}
+        )
+
         try:
             self._processor = AutoProcessor.from_pretrained(
                 _load_target,
                 trust_remote_code=cfg["trust_remote_code"],
                 **_offline,
             )
-            self._model = _AutoModelClass.from_pretrained(
-                _load_target,
-                dtype=dtype,
-                trust_remote_code=cfg["trust_remote_code"],
-                **_offline,
-            ).to(device)
+            try:
+                self._model = _AutoModelClass.from_pretrained(
+                    _load_target,
+                    dtype=dtype,
+                    trust_remote_code=cfg["trust_remote_code"],
+                    **_offline,
+                    **_attn_kwargs,
+                ).to(device)
+            except Exception as attn_exc:
+                if not _attn_kwargs:
+                    raise
+                logger.warning(
+                    "[CohereTextGenerator] attn_implementation=%s rejected by "
+                    "the model (%s) — retrying with the default kernel.",
+                    _attn, attn_exc,
+                )
+                self._model = _AutoModelClass.from_pretrained(
+                    _load_target,
+                    dtype=dtype,
+                    trust_remote_code=cfg["trust_remote_code"],
+                    **_offline,
+                ).to(device)
             self._model.eval()
         except Exception as exc:
             raise RuntimeError(self._format_load_error(exc)) from exc
@@ -1099,8 +1133,14 @@ class CohereTextGenerator:
         """
         Transcribe a batch of audio files to text.
 
-        Processes one file at a time.  The VRAM lifecycle (load/unload)
-        is managed by the orchestrator, not per-call.
+        With batch_size > 1, VAD frames are transcribed batch_size at a time
+        through a single model.generate() call — the main GPU-utilization
+        lever (batch-1 autoregressive decoding leaves most of the GPU idle).
+        Any batched-group failure falls back to the verified sequential path
+        for that group, so batching can never lose output.
+
+        The VRAM lifecycle (load/unload) is managed by the orchestrator,
+        not per-call.
         """
         if not self._loaded:
             raise RuntimeError(
@@ -1108,17 +1148,161 @@ class CohereTextGenerator:
                 "Call load() first."
             )
 
-        results = []
-        for i, audio_path in enumerate(audio_paths):
+        batch_size = self._config.get("batch_size", 1)
+        results: list[TranscriptionResult] = []
+
+        if batch_size <= 1 or len(audio_paths) <= 1:
+            for i, audio_path in enumerate(audio_paths):
+                logger.debug(
+                    "[CohereTextGenerator] Generating %d/%d: %s",
+                    i + 1, len(audio_paths),
+                    audio_path.name if hasattr(audio_path, "name") else audio_path,
+                )
+                results.append(self.generate(audio_path, language=language))
+            return results
+
+        for start in range(0, len(audio_paths), batch_size):
+            group = audio_paths[start:start + batch_size]
             logger.debug(
-                "[CohereTextGenerator] Generating %d/%d: %s",
-                i + 1, len(audio_paths),
-                audio_path.name if hasattr(audio_path, "name") else audio_path,
+                "[CohereTextGenerator] Batched generate %d-%d/%d (batch=%d)",
+                start + 1, start + len(group), len(audio_paths), batch_size,
             )
-            result = self.generate(audio_path, language=language)
-            results.append(result)
+            try:
+                results.extend(self._generate_group(group, language))
+            except Exception as e:
+                logger.warning(
+                    "[CohereTextGenerator] Batched generation failed (%s) — "
+                    "falling back to sequential for this group.", e
+                )
+                for audio_path in group:
+                    results.append(self.generate(audio_path, language=language))
 
         return results
+
+    def _generate_group(
+        self, audio_paths: list[Path], language: str
+    ) -> list[TranscriptionResult]:
+        """
+        Transcribe a group of audio files in ONE model.generate() call.
+
+        Mirrors generate() step-for-step but with lists (the processor and
+        the model's own _transcribe_waveforms_batched() support batched
+        input natively). All rows share the same decoder prompt, so prompt
+        length / start token / attention mask are uniform across the batch.
+
+        Raises on any shape surprise (e.g. long-audio chunk expansion where
+        the processor emits more rows than inputs) — generate_batch() catches
+        and falls back to the sequential path.
+        """
+        import torch
+
+        cfg = self._config
+        resolved_language = _normalize_language(language or cfg["language"])
+        resolved_punctuation = cfg["punctuation"]
+        n = len(audio_paths)
+
+        audios = [self._load_audio(p) for p in audio_paths]
+
+        # Same prompt-forcing flow as generate() (the ONLY language mechanism).
+        if hasattr(self._model, "build_prompt"):
+            prompt_text = self._model.build_prompt(
+                language=resolved_language, punctuation=resolved_punctuation
+            )
+        else:
+            pnc_token = "<|pnc|>" if resolved_punctuation else "<|nopnc|>"
+            prompt_text = (
+                "<|startofcontext|><|startoftranscript|><|emo:undefined|>"
+                f"<|{resolved_language}|><|{resolved_language}|>"
+                f"{pnc_token}<|noitn|><|notimestamp|><|nodiarize|>"
+            )
+
+        inputs = self._processor(
+            audio=audios,
+            text=[prompt_text] * n,
+            sampling_rate=16000,
+            return_tensors="pt",
+        )
+
+        # Long-audio chunk expansion (>~30s frames) yields more feature rows
+        # than inputs; per-row reassembly is a sequential-path concern.
+        if inputs["input_features"].shape[0] != n:
+            raise RuntimeError(
+                f"processor expanded {n} inputs to "
+                f"{inputs['input_features'].shape[0]} chunks (long-audio "
+                "chunking) — batched path does not reassemble chunks"
+            )
+
+        cast_inputs = {}
+        for key, value in inputs.items():
+            if key == "audio_chunk_index":
+                continue  # metadata; unused in the batched path
+            if hasattr(value, "is_floating_point") and value.is_floating_point():
+                cast_inputs[key] = value.to(self._device, dtype=self._dtype)
+            elif hasattr(value, "to"):
+                cast_inputs[key] = value.to(self._device)
+            else:
+                cast_inputs[key] = value
+        inputs = cast_inputs
+
+        if "input_ids" not in inputs and "decoder_input_ids" not in inputs:
+            raise RuntimeError(
+                "processor did not return prompt ids — batched language "
+                "forcing unavailable"
+            )
+        if "input_ids" in inputs and "decoder_input_ids" not in inputs:
+            inputs["decoder_input_ids"] = inputs.pop("input_ids")
+
+        dec_ids = inputs["decoder_input_ids"]
+        pad_id = getattr(self._processor.tokenizer, "pad_token_id", None)
+        if "decoder_attention_mask" not in inputs:
+            if pad_id is None:
+                inputs["decoder_attention_mask"] = torch.ones_like(dec_ids)
+            else:
+                inputs["decoder_attention_mask"] = dec_ids.ne(pad_id).long()
+        # Identical prompt on every row → uniform prompt length / start token.
+        prompt_len = int(inputs["decoder_attention_mask"][0].sum().item())
+
+        with torch.inference_mode():
+            outputs = self._model.generate(
+                **inputs,
+                decoder_start_token_id=int(dec_ids[0, 0].item()),
+                max_new_tokens=cfg["max_new_tokens"],
+                do_sample=False,
+                num_beams=1,
+                use_cache=True,
+            )
+
+        outputs = outputs.cpu()
+
+        # Trim the echoed prompt prefix (uniform across rows).
+        if (
+            prompt_len
+            and outputs.shape[1] >= prompt_len
+            and torch.equal(
+                outputs[0, :prompt_len],
+                inputs["decoder_input_ids"][0, :prompt_len].cpu(),
+            )
+        ):
+            outputs = outputs[:, prompt_len:]
+
+        texts = self._processor.batch_decode(outputs, skip_special_tokens=True)
+        if len(texts) != n:
+            raise RuntimeError(
+                f"batch_decode returned {len(texts)} rows for {n} inputs"
+            )
+
+        return [
+            TranscriptionResult(
+                text=(text or "").strip(),
+                language=resolved_language,
+                metadata={
+                    "generator": "cohere",
+                    "audio_path": str(audio_path),
+                    "batched": True,
+                },
+            )
+            for audio_path, text in zip(audio_paths, texts)
+        ]
 
     def cleanup(self) -> None:
         """Final cleanup — unload if still loaded."""

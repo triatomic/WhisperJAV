@@ -3421,7 +3421,10 @@ const EnsembleManager = {
         language: 'ja',          // ISO code — Cohere's processor takes codes, not full names
         device: 'auto',
         dtype: 'auto',
+        attn_implementation: 'auto',
         max_new_tokens: 512,     // D2
+        batched: true,           // batch VAD frames per generate() — speed default
+        batch_size: 8,
         aligner_backend: 'qwen3', // D7: ForcedAligner ON by default (no native timestamps)
         // Audio tab (qwen-shell framing/VAD — same plumbing as Anime-Whisper).
         // vad_threshold/vad_padding become threshold/speech_pad_ms overrides on
@@ -3506,6 +3509,11 @@ const EnsembleManager = {
                 secM.dtype.options, currentValues.dtype || secM.dtype.default,
                 'Model precision (auto selects based on hardware; ~4-8GB VRAM at FP16)'));
         }
+        if (secM.attn_implementation) {
+            modelTab.appendChild(this.createTransformersDropdown('attn_implementation', secM.attn_implementation.label,
+                secM.attn_implementation.options, currentValues.attn_implementation || secM.attn_implementation.default,
+                secM.attn_implementation.description));
+        }
         // NOTE: schema.model.punctuation is intentionally NOT rendered — the
         // qwen-shell plumbing does not forward it to the generator yet, so a
         // checkbox here would be a silent no-op. The generator's default (on)
@@ -3526,6 +3534,30 @@ const EnsembleManager = {
                 mt.description || 'Maximum tokens generated per scene.'));
             const mtCtrl = genTab.querySelector('.param-control[data-param="max_new_tokens"]');
             if (mtCtrl) mtCtrl.dataset.originalType = 'int';
+        }
+        if (secG.batched) {
+            genTab.appendChild(this.createParamCheckbox('batched', secG.batched.label,
+                currentValues.batched !== undefined ? currentValues.batched : secG.batched.default,
+                secG.batched.description));
+        }
+        if (secG.batch_size) {
+            const bs = secG.batch_size;
+            genTab.appendChild(this.createTransformersSlider('batch_size', bs.label,
+                bs.min, bs.max, bs.step, currentValues.batch_size ?? bs.default,
+                bs.description));
+            const bsCtrl = genTab.querySelector('.param-control[data-param="batch_size"]');
+            if (bsCtrl) bsCtrl.dataset.originalType = 'int';
+            // Grey the slider when batching is off (pack time forces batch_size=1)
+            const batchedCb = genTab.querySelector('.param-control[data-param="batched"] input.param-checkbox');
+            if (batchedCb && bsCtrl) {
+                const syncBatchSlider = () => {
+                    bsCtrl.style.opacity = batchedCb.checked ? '' : '0.5';
+                    const slider = bsCtrl.querySelector('input');
+                    if (slider) slider.disabled = !batchedCb.checked;
+                };
+                batchedCb.addEventListener('change', syncBatchSlider);
+                syncBatchSlider();
+            }
         }
 
         // Alignment tab. Pack-time triple-flip in api.py is bidirectional:

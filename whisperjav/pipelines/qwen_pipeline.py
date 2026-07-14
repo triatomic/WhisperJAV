@@ -455,6 +455,8 @@ class QwenPipeline(BasePipeline):
                 dtype=cfg["dtype"],
                 language=cfg.get("language", "ja"),
                 max_new_tokens=cfg.get("max_new_tokens", 512),
+                batch_size=cfg.get("batch_size", 1),
+                attn_implementation=cfg.get("attn_implementation", "auto"),
             )
         else:
             # Default: Qwen3 text-only mode (existing behavior)

@@ -1339,6 +1339,11 @@ def process_files_sync(media_files: List[Dict], args: argparse.Namespace, resolv
                 qwen_kwargs["segmenter_chunk_threshold"] = 1.0
             if not any(a.startswith('--qwen-max-group-duration') for a in sys.argv):
                 qwen_kwargs["segmenter_max_group_duration"] = 6.0
+            if not any(a.startswith('--qwen-batch-size') for a in sys.argv):
+                # Batched frame transcription: batch-1 autoregressive decoding
+                # leaves the GPU mostly idle; 8 frames/generate is a pure
+                # speed win (same greedy decode).
+                qwen_kwargs["batch_size"] = 8
 
         pipeline = QwenPipeline(**qwen_kwargs)
         effective_mode = args.mode
