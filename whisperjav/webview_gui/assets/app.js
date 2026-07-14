@@ -1651,6 +1651,13 @@ const EnsembleManager = {
             }
         });
 
+        // BYOP: manually typed/pasted exe path (Browse has its own handler above)
+        document.getElementById('xxl-exe-path')?.addEventListener('change', (e) => {
+            this.state.pass2.xxlExePath = e.target.value.trim();
+            // Persist for future sessions
+            pywebview.api.save_byop_preferences({ xxl_exe_path: this.state.pass2.xxlExePath });
+        });
+
         // BYOP: Extra args input
         document.getElementById('xxl-extra-args')?.addEventListener('change', (e) => {
             this.state.pass2.xxlExtraArgs = e.target.value.trim();
@@ -8401,13 +8408,16 @@ window.addEventListener('pywebviewready', async () => {
     try {
         const byopPrefs = await pywebview.api.get_byop_preferences();
         if (byopPrefs) {
+            // NOTE: ensemble pass state lives on EnsembleManager.state (NOT
+            // AppState) — the old AppState.state reference threw TypeError
+            // into the catch below, so the saved path never reached the UI.
             if (byopPrefs.xxl_exe_path) {
-                AppState.state.pass2.xxlExePath = byopPrefs.xxl_exe_path;
+                EnsembleManager.state.pass2.xxlExePath = byopPrefs.xxl_exe_path;
                 const pathInput = document.getElementById('xxl-exe-path');
                 if (pathInput) pathInput.value = byopPrefs.xxl_exe_path;
             }
             if (byopPrefs.xxl_extra_args) {
-                AppState.state.pass2.xxlExtraArgs = byopPrefs.xxl_extra_args;
+                EnsembleManager.state.pass2.xxlExtraArgs = byopPrefs.xxl_extra_args;
                 const argsInput = document.getElementById('xxl-extra-args');
                 if (argsInput) argsInput.value = byopPrefs.xxl_extra_args;
             }
