@@ -803,6 +803,47 @@ class WhisperJAVAPI:
         except Exception as e:
             return {"success": False, "message": str(e)}
 
+    def open_translation_instructions(self, tone: str = "standard") -> Dict[str, Any]:
+        """
+        Open the user's custom translation-instruction file for a tone in the
+        system editor, creating it (seeded with the currently effective
+        instructions) on first use.
+
+        The file lives at <translate settings dir>/instructions/<tone>.txt and
+        takes precedence over Gist/cache/bundled content on every future run
+        (see translate.instructions.get_instruction_content). Clearing the
+        file's content reverts to defaults.
+        """
+        try:
+            tone = (tone or "standard").strip().lower()
+            if tone not in ("standard", "contextual", "pornify"):
+                return {"success": False, "message": f"Unknown tone: {tone}"}
+
+            from whisperjav.translate.instructions import (
+                get_instruction_content, get_user_instruction_path,
+            )
+            path = get_user_instruction_path(tone)
+            if not path.is_file():
+                seed = get_instruction_content(tone=tone) or ""
+                path.parent.mkdir(parents=True, exist_ok=True)
+                header = (
+                    "### NOTE (WhisperJAV)\n"
+                    f"# Custom instructions for tone '{tone}'. This file OVERRIDES the\n"
+                    "# built-in/Gist instructions on every translate run while it has\n"
+                    "# content; clear the file to go back to defaults.\n\n"
+                )
+                path.write_text(header + seed, encoding="utf-8")
+
+            if sys.platform.startswith("win"):
+                os.startfile(str(path))
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(path)])
+            else:
+                subprocess.run(["xdg-open", str(path)])
+            return {"success": True, "path": str(path)}
+        except Exception as e:
+            return {"success": False, "message": f"Cannot open instructions: {e}"}
+
     def open_output_folder(self, path: str) -> Dict[str, Any]:
         """
         Open output folder in file explorer.

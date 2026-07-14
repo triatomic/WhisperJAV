@@ -25,6 +25,36 @@ def get_cache_dir() -> Path:
     return get_settings_path().parent / 'cache'
 
 
+def get_user_instruction_path(tone: str) -> Path:
+    """Path of the user's custom instruction file for a tone.
+
+    Lives next to the settings file (NOT in cache/, which Gist refreshes
+    overwrite). When this file exists and is non-empty it takes precedence
+    over Gist, cache, and bundled defaults — the user's edits always win.
+    """
+    from .settings import get_settings_path
+    return get_settings_path().parent / 'instructions' / f'{tone}.txt'
+
+
+def load_user_override(tone: str) -> Optional[str]:
+    """Return the user's custom instructions for a tone, or None.
+
+    An empty/whitespace-only file is treated as absent so a user can
+    'reset to defaults' by clearing the file instead of deleting it.
+    """
+    path = get_user_instruction_path(tone)
+    if not path.is_file():
+        return None
+    try:
+        content = path.read_text(encoding='utf-8')
+    except Exception as e:
+        logger.warning(f"Failed to read user instructions {path}: {e}")
+        return None
+    if not content.strip():
+        return None
+    return content
+
+
 def get_cache_path(tone: str) -> Path:
     """Get cache file path for a specific tone."""
     cache_dir = get_cache_dir()
@@ -172,9 +202,10 @@ def get_instruction_content(tone: str = 'standard', refresh: bool = False) -> Op
     Get instruction content with fallback strategy.
 
     Strategy:
-    1. Fetch from Gist (with ETag caching)
-    2. Load from cache (if fetch fails or not modified)
-    3. Load bundled default (if all else fails)
+    1. User custom file (settings dir /instructions/<tone>.txt) — always wins
+    2. Fetch from Gist (with ETag caching)
+    3. Load from cache (if fetch fails or not modified)
+    4. Load bundled default (if all else fails)
 
     Args:
         tone: Instruction tone (standard, pornify, etc.)
@@ -183,6 +214,13 @@ def get_instruction_content(tone: str = 'standard', refresh: bool = False) -> Op
     Returns:
         Instruction content or None
     """
+    # User override beats everything — including refresh (a network refresh
+    # must never clobber deliberate local edits).
+    user_content = load_user_override(tone)
+    if user_content is not None:
+        logger.info(f"Using user custom instructions: {get_user_instruction_path(tone)}")
+        return user_content
+
     # Get URL for this tone
     url = DEFAULT_INSTRUCTION_URLS.get(tone)
 
