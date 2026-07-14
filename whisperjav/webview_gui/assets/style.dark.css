@@ -1,0 +1,89 @@
+/*
+ * WhisperJAV Web GUI - Dark Theme
+ * -------------------------------
+ * Dark variant of the default theme: imports the base stylesheet for
+ * layout/components and overrides only CSS variables (plus a few spots
+ * where the base hardcodes light colors). Keeps the default theme's
+ * deep-blue identity (#024873), brightened for dark-surface contrast.
+ *
+ * Usage:
+ * - Select "Dark Theme" from the theme menu, or set ThemeManager to 'dark'.
+ */
+
+@import url("style.css");
+
+/* ============================================================
+   CSS Variables (dark palette)
+   ============================================================ */
+:root {
+    /* Tabs and surfaces — active tab "lifts" into the content area,
+       so active-tab-bg must equal content-area-bg (same as light). */
+    --tab-bar-bg: #1F242B;
+    --content-area-bg: #191D23;
+    --active-tab-bg: #191D23;
+    --inactive-tab-bg: #242A32;
+    --hover-tab-bg: #2A313A;
+    --active-tab-text: #7CC0EF;
+    --inactive-tab-text: #9AA3AD;
+    --border-color: #3A414B;
+
+    /* UI colors — default blue brightened for dark backgrounds */
+    --primary-color: #1272AE;
+    --primary-hover: #1E88CE;
+    --secondary-color: #5C6672;
+    --secondary-hover: #6E7885;
+    --danger-color: #E05260;
+    --success-color: #34B75A;
+    --warning-color: #FFC107;
+    --info-color: #2AA8BE;
+
+    /* Backgrounds */
+    --body-bg: #14171B;
+    --section-bg: #1F242B;
+    --input-bg: #171A1F;
+    --disabled-bg: #2A2F38;
+
+    /* Text colors */
+    --text-primary: #E6E9ED;
+    --text-secondary: #A8B0BA;
+    --text-muted: #737D89;
+    --text-disabled: #4E5661;
+
+    /* Shadows need more weight on dark surfaces */
+    --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.5), 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.45), 0 2px 4px rgba(0, 0, 0, 0.35);
+    --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.5), 0 4px 6px rgba(0, 0, 0, 0.35);
+}
+
+/* ============================================================
+   Spot fixes — places where the base stylesheet hardcodes light
+   colors instead of using the variables above.
+   ============================================================ */
+
+/* Disabled / coming-soon dropdown options (base: #f5f5f5 / #f0f0f0) */
+.form-select option:disabled {
+    color: var(--text-muted) !important;
+    background-color: var(--disabled-bg);
+}
+
+.form-select option.coming-soon {
+    color: var(--text-disabled) !important;
+    background-color: var(--disabled-bg);
+}
+
+/* Ensemble row dropdowns (base hardcodes background: #FFFFFF) */
+.ensemble-select {
+    background: var(--input-bg);
+}
+
+/* Loading spinner ring (base: #f3f3f3) */
+.spinner {
+    border-color: var(--disabled-bg);
+    border-top-color: var(--primary-color);
+}
+
+/* Update progress dialog (base: white card) */
+.update-progress-dialog {
+    background: var(--section-bg);
+    color: var(--text-primary);
+}

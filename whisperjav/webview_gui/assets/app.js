@@ -6141,6 +6141,7 @@ const ThemeManager = {
     storageKey: 'wj_theme',
     themes: {
         'default': 'style.css',
+        'dark': 'style.dark.css',
         'google': 'style.google.css',
         'carbon': 'style.carbon.css',
         'primer': 'style.primer.css'
