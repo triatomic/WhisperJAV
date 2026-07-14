@@ -1067,6 +1067,10 @@
                                             <div class="section-header-inline" style="margin-bottom:6px;">
                                                 <span class="section-title">Ollama Tuning</span>
                                                 <span class="section-note">(leave blank for model defaults)</span>
+                                                <button type="button" class="btn btn-secondary btn-sm" id="translatorOllamaSpeedBtn"
+                                                    title="Fill in a faster-translation preset: num_ctx 8192 (faster prefill, less VRAM), batch 10 (the most that safely fits 8K context), top_k 20, keep-alive 30m (no model reload between files). Quality knobs (temperature, top_p, min_p, repeat penalty) are left untouched. You can still edit any field afterwards.">
+                                                    Speed
+                                                </button>
                                             </div>
                                             <div class="translator-advanced-grid">
                                                 <div class="form-group" title="Token budget for the whole prompt+reply per batch. Larger lets more subtitle lines fit per request (batch size is auto-recomputed from this).&#10;ACCURACY: higher avoids context overflow that truncates/garbles output and drops lines.&#10;SPEED: slightly slower per batch, but fewer batches overall.&#10;VRAM: HIGHER COST — KV cache grows with context (8192→16384 adds ~1-2GB on a 12B model). 4070/12GB: 16384 is safe with a Q4 12B model.&#10;Blank = model default (often 8192).">

@@ -7433,6 +7433,27 @@ const TranslatorManager = {
             }
         });
 
+        // Ollama "Speed" preset: fill the tuning fields with a faster config.
+        // Speed levers only — num_ctx 8192 (faster prefill, smaller KV cache),
+        // batch 10 (the context cap at 8K is 11 lines — see
+        // cap_batch_size_for_context; a bigger number would be silently
+        // reduced, so show the truth), top_k 20 (marginal), keep-alive 30m
+        // (no model reload between files). Quality knobs (temperature/top_p/
+        // min_p/repeat penalty) untouched.
+        document.getElementById('translatorOllamaSpeedBtn')?.addEventListener('click', () => {
+            const set = (id, value) => {
+                const el = document.getElementById(id);
+                if (el) el.value = value;
+            };
+            set('translatorOllamaNumCtx', 8192);
+            set('translatorOllamaTopK', 20);
+            set('translatorOllamaKeepAlive', '30m');
+            set('translatorMaxBatchSize', 10);
+            ConsoleManager.log(
+                'Ollama Speed preset applied: num_ctx 8192, batch 10, top_k 20, keep-alive 30m '
+                + '(quality knobs untouched — clear fields to revert to defaults)', 'info');
+        });
+
         // No default provider initialization — dropdown starts blank
 
         console.log('TranslatorManager initialized');
