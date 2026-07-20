@@ -803,6 +803,21 @@ class WhisperJAVAPI:
         except Exception as e:
             return {"success": False, "message": str(e)}
 
+    @staticmethod
+    def _os_open(target: str) -> None:
+        """Open a file or folder with the platform's default handler.
+
+        Shared by open_translation_instructions / open_output_folder /
+        open_model_path so the win/darwin/linux dispatch lives in one place.
+        Callers own directory creation and existence checks.
+        """
+        if sys.platform.startswith("win"):
+            os.startfile(str(target))
+        elif sys.platform == "darwin":
+            subprocess.run(["open", str(target)])
+        else:
+            subprocess.run(["xdg-open", str(target)])
+
     def open_translation_instructions(self, tone: str = "standard") -> Dict[str, Any]:
         """
         Open the user's custom translation-instruction file for a tone in the
@@ -834,12 +849,7 @@ class WhisperJAVAPI:
                 )
                 path.write_text(header + seed, encoding="utf-8")
 
-            if sys.platform.startswith("win"):
-                os.startfile(str(path))
-            elif sys.platform == "darwin":
-                subprocess.run(["open", str(path)])
-            else:
-                subprocess.run(["xdg-open", str(path)])
+            self._os_open(str(path))
             return {"success": True, "path": str(path)}
         except Exception as e:
             return {"success": False, "message": f"Cannot open instructions: {e}"}
@@ -858,12 +868,7 @@ class WhisperJAVAPI:
             folder = Path(path)
             folder.mkdir(parents=True, exist_ok=True)
 
-            if sys.platform.startswith("win"):
-                os.startfile(str(folder))
-            elif sys.platform == "darwin":
-                subprocess.run(["open", str(folder)])
-            else:
-                subprocess.run(["xdg-open", str(folder)])
+            self._os_open(str(folder))
 
             return {
                 "success": True,
@@ -1059,12 +1064,7 @@ class WhisperJAVAPI:
                 return {"success": False,
                         "message": "Path no longer exists (cache may have been cleaned). Use Refresh."}
             target = p if p.is_dir() else p.parent
-            if sys.platform.startswith("win"):
-                os.startfile(str(target))
-            elif sys.platform == "darwin":
-                subprocess.run(["open", str(target)])
-            else:
-                subprocess.run(["xdg-open", str(target)])
+            self._os_open(str(target))
             return {"success": True, "message": "Folder opened"}
         except Exception as e:
             return {"success": False, "message": f"Cannot open path: {e}"}

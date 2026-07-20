@@ -7362,6 +7362,27 @@ const ProviderUIManager = {
     }
 };
 
+// Wire an "Edit instructions…" button to open the current tone's user
+// override file (created from the effective instructions on first use; the
+// file beats Gist/cache/bundled content on every future run). Shared by the
+// SRT Translate tab and the ensemble translation-settings modal — both point
+// at the same api method, only their tone-select id differs.
+function wireEditInstructionsButton(btnId, toneSelectId) {
+    document.getElementById(btnId)?.addEventListener('click', async () => {
+        const tone = document.getElementById(toneSelectId)?.value || 'standard';
+        try {
+            const r = await pywebview.api.open_translation_instructions(tone);
+            if (r && r.success) {
+                ConsoleManager.log(`Custom '${tone}' instructions: ${r.path} (overrides defaults while non-empty)`, 'info');
+            } else {
+                ErrorHandler.show('Error', (r && r.message) || 'Could not open instructions');
+            }
+        } catch (error) {
+            ErrorHandler.show('Error', 'Could not open instructions: ' + error);
+        }
+    });
+}
+
 // ============================================================
 // Translator Manager (Tab 4 - Standalone Translation)
 // ============================================================
@@ -7416,22 +7437,8 @@ const TranslatorManager = {
         document.getElementById('translatorStartBtn')?.addEventListener('click', () => this.startTranslation());
         document.getElementById('translatorCancelBtn')?.addEventListener('click', () => this.cancelTranslation());
 
-        // Edit-instructions: opens the current tone's user override file
-        // (created from the effective instructions on first use; the file
-        // beats Gist/cache/bundled content on every future run)
-        document.getElementById('translatorEditInstructionsBtn')?.addEventListener('click', async () => {
-            const tone = document.getElementById('translatorTone')?.value || 'standard';
-            try {
-                const r = await pywebview.api.open_translation_instructions(tone);
-                if (r && r.success) {
-                    ConsoleManager.log(`Custom '${tone}' instructions: ${r.path} (overrides defaults while non-empty)`, 'info');
-                } else {
-                    ErrorHandler.show('Error', (r && r.message) || 'Could not open instructions');
-                }
-            } catch (error) {
-                ErrorHandler.show('Error', 'Could not open instructions: ' + error);
-            }
-        });
+        // Edit-instructions: opens the current tone's user override file.
+        wireEditInstructionsButton('translatorEditInstructionsBtn', 'translatorTone');
 
         // Ollama "Speed" preset: fill the tuning fields with a faster config.
         // Speed levers only — num_ctx 8192 (faster prefill, smaller KV cache),
@@ -8140,20 +8147,8 @@ const TranslationSettingsModal = {
         });
 
         // Edit-instructions: opens the current tone's user override file
-        // (same mechanism as the SRT Translate tab button)
-        document.getElementById('translationEditInstructionsBtn')?.addEventListener('click', async () => {
-            const tone = document.getElementById('translationTone')?.value || 'standard';
-            try {
-                const r = await pywebview.api.open_translation_instructions(tone);
-                if (r && r.success) {
-                    ConsoleManager.log(`Custom '${tone}' instructions: ${r.path} (overrides defaults while non-empty)`, 'info');
-                } else {
-                    ErrorHandler.show('Error', (r && r.message) || 'Could not open instructions');
-                }
-            } catch (error) {
-                ErrorHandler.show('Error', 'Could not open instructions: ' + error);
-            }
-        });
+        // (same mechanism as the SRT Translate tab button).
+        wireEditInstructionsButton('translationEditInstructionsBtn', 'translationTone');
 
         // Provider change handler for inline dropdown — route through ProviderUIManager
         document.getElementById('ensembleTranslateProvider')?.addEventListener('change', (e) => {

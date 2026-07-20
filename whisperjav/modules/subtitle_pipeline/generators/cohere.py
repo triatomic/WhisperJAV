@@ -895,6 +895,48 @@ class CohereTextGenerator:
     # Generation
     # ------------------------------------------------------------------
 
+    def _build_prompt_text(self, resolved_language: str, resolved_punctuation: bool) -> str:
+        """Build the decoder prompt that FORCES language/punctuation.
+
+        CRITICAL (root cause of non-Japanese output, found 2026-06-10): the
+        processor IGNORES language=/punctuation= kwargs, and the model does NO
+        language detection — the ONLY language mechanism is this decoder prompt
+        prefix fed as decoder_input_ids. Shared by generate() and
+        _generate_group() so the fallback token order can never desync between
+        the sequential and batched paths.
+        """
+        if hasattr(self._model, "build_prompt"):
+            return self._model.build_prompt(
+                language=resolved_language, punctuation=resolved_punctuation
+            )
+        # Fallback mirrors build_prompt() from the cached repo revision.
+        pnc_token = "<|pnc|>" if resolved_punctuation else "<|nopnc|>"
+        return (
+            "<|startofcontext|><|startoftranscript|><|emo:undefined|>"
+            f"<|{resolved_language}|><|{resolved_language}|>"
+            f"{pnc_token}<|noitn|><|notimestamp|><|nodiarize|>"
+        )
+
+    def _cast_inputs(self, inputs, skip_keys=()):
+        """Cast a processor BatchEncoding onto device with per-key dtype rules.
+
+        Floating tensors get the model dtype; integer tensors (input_ids etc.)
+        must stay long — a blanket .to(device, dtype) would corrupt the prompt
+        ids. Shared by generate() and _generate_group(); the batched path skips
+        audio_chunk_index metadata via skip_keys.
+        """
+        cast = {}
+        for key, value in inputs.items():
+            if key in skip_keys:
+                continue
+            if hasattr(value, "is_floating_point") and value.is_floating_point():
+                cast[key] = value.to(self._device, dtype=self._dtype)
+            elif hasattr(value, "to"):
+                cast[key] = value.to(self._device)
+            else:
+                cast[key] = value
+        return cast
+
     def generate(
         self,
         audio_path: Path,
@@ -971,18 +1013,7 @@ class CohereTextGenerator:
                 f"'{resolved_language}': {exc}"
             ) from exc
 
-        if hasattr(self._model, "build_prompt"):
-            prompt_text = self._model.build_prompt(
-                language=resolved_language, punctuation=resolved_punctuation
-            )
-        else:
-            # Fallback mirrors build_prompt() from the cached repo revision.
-            pnc_token = "<|pnc|>" if resolved_punctuation else "<|nopnc|>"
-            prompt_text = (
-                "<|startofcontext|><|startoftranscript|><|emo:undefined|>"
-                f"<|{resolved_language}|><|{resolved_language}|>"
-                f"{pnc_token}<|noitn|><|notimestamp|><|nodiarize|>"
-            )
+        prompt_text = self._build_prompt_text(resolved_language, resolved_punctuation)
 
         # Step 3: Run processor with audio AND the prompt text (lists, exactly
         # like the model's own batched transcribe path). With text= present
@@ -998,18 +1029,8 @@ class CohereTextGenerator:
         # not a tensor we want on GPU.
         audio_chunk_index = inputs.get("audio_chunk_index")
 
-        # Step 4: Cast per-key: floating tensors get the model dtype,
-        # integer tensors (input_ids etc.) must stay long — a blanket
-        # .to(device, dtype) would corrupt the prompt ids.
-        cast_inputs = {}
-        for key, value in inputs.items():
-            if hasattr(value, "is_floating_point") and value.is_floating_point():
-                cast_inputs[key] = value.to(self._device, dtype=self._dtype)
-            elif hasattr(value, "to"):
-                cast_inputs[key] = value.to(self._device)
-            else:
-                cast_inputs[key] = value
-        inputs = cast_inputs
+        # Step 4: Cast per-key (floating -> model dtype, ints stay long).
+        inputs = self._cast_inputs(inputs)
 
         # Step 5: Rename input_ids -> decoder_input_ids and build the decoder
         # attention mask (same as the model's transcribe path). Providing a
@@ -1204,17 +1225,7 @@ class CohereTextGenerator:
         audios = [self._load_audio(p) for p in audio_paths]
 
         # Same prompt-forcing flow as generate() (the ONLY language mechanism).
-        if hasattr(self._model, "build_prompt"):
-            prompt_text = self._model.build_prompt(
-                language=resolved_language, punctuation=resolved_punctuation
-            )
-        else:
-            pnc_token = "<|pnc|>" if resolved_punctuation else "<|nopnc|>"
-            prompt_text = (
-                "<|startofcontext|><|startoftranscript|><|emo:undefined|>"
-                f"<|{resolved_language}|><|{resolved_language}|>"
-                f"{pnc_token}<|noitn|><|notimestamp|><|nodiarize|>"
-            )
+        prompt_text = self._build_prompt_text(resolved_language, resolved_punctuation)
 
         inputs = self._processor(
             audio=audios,
@@ -1232,17 +1243,9 @@ class CohereTextGenerator:
                 "chunking) — batched path does not reassemble chunks"
             )
 
-        cast_inputs = {}
-        for key, value in inputs.items():
-            if key == "audio_chunk_index":
-                continue  # metadata; unused in the batched path
-            if hasattr(value, "is_floating_point") and value.is_floating_point():
-                cast_inputs[key] = value.to(self._device, dtype=self._dtype)
-            elif hasattr(value, "to"):
-                cast_inputs[key] = value.to(self._device)
-            else:
-                cast_inputs[key] = value
-        inputs = cast_inputs
+        # Cast per-key (floating -> model dtype, ints stay long); skip
+        # audio_chunk_index metadata, unused in the batched path.
+        inputs = self._cast_inputs(inputs, skip_keys=("audio_chunk_index",))
 
         if "input_ids" not in inputs and "decoder_input_ids" not in inputs:
             raise RuntimeError(
