@@ -144,6 +144,7 @@ class CohereTextGenerator:
         }
         self._processor = None
         self._model = None
+        self._native = False  # set in load(): True on transformers >= 5.4
         self._device = None   # Resolved device string (e.g. "cuda:0")
         self._dtype = None    # Resolved torch dtype (e.g. torch.float16)
         self._loaded = False
@@ -778,10 +779,20 @@ class CohereTextGenerator:
         _load_target = cached_snapshot or cfg["model_id"]
         _offline = {"local_files_only": True} if cached_snapshot else {}
 
+        # transformers >= 5.4 ships Cohere ASR natively. The repo's remote
+        # modeling code targets 4.57 and no longer loads on 5.x
+        # (_keys_to_ignore_on_load_unexpected is a list there; 5.x unions it
+        # with a set -> TypeError), so the native class is used whenever it
+        # exists and the remote-code path stays for older transformers only.
+        self._native = self._native_cohere_available()
+        _trust = False if self._native else cfg["trust_remote_code"]
+        logger.info("  Code path:    %s", "native (transformers)" if self._native else "remote code")
+
         # Weights-only finetune dirs need the base repo's remote-code modules
         # copied in before trust_remote_code can resolve auto_map. No-op when
         # the .py files are already present (base repo, or a prior run).
-        if cached_snapshot or local_path:
+        # Not needed on the native path.
+        if (cached_snapshot or local_path) and not self._native:
             self._ensure_remote_code(_load_target)
 
         # Requested attention kernel (best-effort — remote modeling code may
@@ -794,14 +805,14 @@ class CohereTextGenerator:
         try:
             self._processor = AutoProcessor.from_pretrained(
                 _load_target,
-                trust_remote_code=cfg["trust_remote_code"],
+                trust_remote_code=_trust,
                 **_offline,
             )
             try:
                 self._model = _AutoModelClass.from_pretrained(
                     _load_target,
                     dtype=dtype,
-                    trust_remote_code=cfg["trust_remote_code"],
+                    trust_remote_code=_trust,
                     **_offline,
                     **_attn_kwargs,
                 ).to(device)
@@ -816,7 +827,7 @@ class CohereTextGenerator:
                 self._model = _AutoModelClass.from_pretrained(
                     _load_target,
                     dtype=dtype,
-                    trust_remote_code=cfg["trust_remote_code"],
+                    trust_remote_code=_trust,
                     **_offline,
                 ).to(device)
             self._model.eval()
@@ -894,6 +905,88 @@ class CohereTextGenerator:
     # ------------------------------------------------------------------
     # Generation
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _native_cohere_available() -> bool:
+        """True when the installed transformers ships Cohere ASR natively (>= 5.4)."""
+        try:
+            import importlib.util
+            return importlib.util.find_spec("transformers.models.cohere_asr") is not None
+        except Exception:
+            return False
+
+    def _generate_native(
+        self,
+        audio_paths: list,
+        audios: list,
+        resolved_language: str,
+        resolved_punctuation: bool,
+        max_new_tokens: int,
+    ) -> list[TranscriptionResult]:
+        """Transcribe one or more clips through transformers' native Cohere class.
+
+        The native processor takes language/punctuation directly and builds the
+        decoder prompt itself; its decode() reassembles long-audio chunks from
+        audio_chunk_index, so one call serves both the single and batched paths.
+        Raises if the decoded row count does not match the inputs —
+        generate_batch() then falls back to one clip per call.
+        """
+        import torch
+
+        inputs = self._processor(
+            audios,
+            sampling_rate=16000,
+            return_tensors="pt",
+            language=resolved_language,
+            punctuation=resolved_punctuation,
+        )
+        # Metadata for decode(), not a tensor for the GPU.
+        audio_chunk_index = inputs.get("audio_chunk_index")
+        inputs = self._cast_inputs(inputs, skip_keys=("audio_chunk_index",))
+
+        # Weights-only finetunes (e.g. efwkjn/cohere-asr-ja) ship no
+        # generation config, so generate() cannot find a decoder start token
+        # there. The prompt the processor built starts with it — pass it on.
+        gen_kwargs = {}
+        dec_ids = inputs.get("decoder_input_ids")
+        if dec_ids is not None:
+            gen_kwargs["decoder_start_token_id"] = int(dec_ids[0, 0].item())
+
+        with torch.inference_mode():
+            outputs = self._model.generate(
+                **inputs,
+                **gen_kwargs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                num_beams=1,
+            )
+
+        texts = self._processor.decode(
+            outputs.cpu(),
+            skip_special_tokens=True,
+            audio_chunk_index=audio_chunk_index,
+            language=resolved_language,
+        )
+        if isinstance(texts, str):
+            texts = [texts]
+        if len(texts) != len(audio_paths):
+            raise RuntimeError(
+                f"native decode returned {len(texts)} rows for {len(audio_paths)} inputs"
+            )
+
+        return [
+            TranscriptionResult(
+                text=(text or "").strip(),
+                language=resolved_language,
+                metadata={
+                    "generator": "cohere",
+                    "audio_path": str(audio_path),
+                    "batched": len(audio_paths) > 1,
+                    "native": True,
+                },
+            )
+            for audio_path, text in zip(audio_paths, texts)
+        ]
 
     def _build_prompt_text(self, resolved_language: str, resolved_punctuation: bool) -> str:
         """Build the decoder prompt that FORCES language/punctuation.
@@ -993,6 +1086,14 @@ class CohereTextGenerator:
 
         # Step 1: Load audio (16 kHz mono float32).
         audio = self._load_audio(audio_path)
+
+        # transformers >= 5.4: the native class does prompt forcing, casting
+        # and chunk reassembly itself — none of the remote-code steps apply.
+        if getattr(self, "_native", False):
+            return self._generate_native(
+                [audio_path], [audio], resolved_language,
+                resolved_punctuation, resolved_max_new_tokens,
+            )[0]
 
         # Step 2: Build the decoder prompt that FORCES language/punctuation.
         # CRITICAL (root cause of non-Japanese output, found 2026-06-10):
@@ -1223,6 +1324,12 @@ class CohereTextGenerator:
         n = len(audio_paths)
 
         audios = [self._load_audio(p) for p in audio_paths]
+
+        if getattr(self, "_native", False):
+            return self._generate_native(
+                audio_paths, audios, resolved_language,
+                resolved_punctuation, cfg["max_new_tokens"],
+            )
 
         # Same prompt-forcing flow as generate() (the ONLY language mechanism).
         prompt_text = self._build_prompt_text(resolved_language, resolved_punctuation)
