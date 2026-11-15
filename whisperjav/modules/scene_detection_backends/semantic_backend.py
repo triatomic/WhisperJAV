@@ -88,12 +88,16 @@ class SemanticSceneDetector:
                 )),
             )
 
+            # v1.9.2: hand the engine the pipeline logger. Without it the engine falls
+            # back to print(), so its WARNING about a scene exceeding max_duration never
+            # reached whisperjav.log on the pipeline path.
             self._adapter = SemanticClusteringAdapter(
                 config=config,
                 preset=str(self._kwargs.get("preset", "default")),
+                logger_instance=logger,
             )
 
-            logger.info("SemanticSceneDetector initialized")
+            logger.debug("SemanticSceneDetector initialized")
 
         except ImportError as e:
             # Let ImportError propagate naturally so the factory's fallback

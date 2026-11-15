@@ -17,6 +17,313 @@
  */
 
 // ============================================================
+// Interface language (1.10.0, item 6, #448; owner W283): English or Simplified Chinese.
+// The catalogue (i18n_zh.js, window.WJ_I18N_ZH) is keyed by the English text. apply()
+// translates what the window shows -- text, tooltips, placeholders, menu group labels --
+// and a MutationObserver runs it on everything app.js and the Python schemas add later,
+// so the English sources stay as they are. A key may hold {name} parts (a computed value,
+// carried over unchanged). The console, the file list and program messages stay English
+// (R01: program outputs stay as is). The English of each translated node is kept, so
+// switching back restores it exactly.
+// ============================================================
+const I18n = {
+    lang: 'en',
+    // Never translated: the console and the file list (program output, paths), commands,
+    // typed text, the release notes and commit messages fetched from GitHub.
+    SKIP: '[data-i18n-skip], .file-path, code, textarea, script, style',
+    ATTRS: ['title', 'placeholder', 'aria-label', 'label'],
+    missing: new Set(),     // English texts met while Chinese is on that have no entry
+    _exact: null,           // normalized English -> Chinese
+    _reverse: null,         // Chinese -> English, for copies of translated nodes
+    _templates: [],         // {re, names, zh} for keys with {name} parts
+    _keep: null,            // texts reviewed and left as they are (names, units)
+    _contexts: [],          // {selector, map}: where one English word means two things
+                            // ("Balanced" the pipeline, kept; "Balanced" the sensitivity)
+    _textRec: new WeakMap(),  // Text node -> {en, zh} as written
+    _attrRec: new WeakMap(),  // Element -> {attr: {en, zh}}
+    _observer: null,
+
+    norm(s) {
+        return String(s).replace(/[\s ]+/g, ' ').trim();
+    },
+
+    _load() {
+        if (this._exact) return;
+        const cat = window.WJ_I18N_ZH || { texts: {}, keep: [] };
+        this._exact = new Map();
+        this._reverse = new Map();
+        this._templates = [];
+        this._keep = new Set((cat.keep || []).map(k => this.norm(k)));
+        for (const [en, zh] of Object.entries(cat.texts || {})) {
+            const key = this.norm(en);
+            if (/\{[A-Za-z_]\w*\}/.test(key)) {
+                const names = [];
+                const pattern = key.split(/(\{[A-Za-z_]\w*\})/).map(part => {
+                    const m = part.match(/^\{([A-Za-z_]\w*)\}$/);
+                    if (m) {
+                        names.push(m[1]);
+                        return '([\\s\\S]*?)';
+                    }
+                    return part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                }).join('');
+                this._templates.push({ re: new RegExp('^' + pattern + '$'), names, zh });
+            } else {
+                this._exact.set(key, zh);
+                this._reverse.set(this.norm(zh), key);
+            }
+        }
+        // The most specific template first: the one with the most fixed text.
+        const fixed = t => t.re.source.replace(/\(\[\\s\\S\]\*\?\)/g, '').length;
+        this._templates.sort((a, b) => fixed(b) - fixed(a));
+        this._contexts = Object.entries(cat.contexts || {}).map(([selector, texts]) => {
+            const map = new Map();
+            for (const [en, zh] of Object.entries(texts)) {
+                map.set(this.norm(en), zh);
+                this._reverse.set(this.norm(zh), this.norm(en));
+            }
+            return { selector, map };
+        });
+    },
+
+    // The Chinese for a text shown in a node: a context entry first (the node sits inside
+    // its selector), then the catalogue.
+    _lookupAt(node, text) {
+        this._load();
+        const el = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+        if (el) {
+            for (const ctx of this._contexts) {
+                if (!el.closest(ctx.selector)) continue;
+                const hit = ctx.map.get(this.norm(text));
+                if (hit !== undefined) return hit;
+            }
+        }
+        return this.lookup(text);
+    },
+
+    // The Chinese for an English text, or null. A computed part that is itself a
+    // catalogue text (e.g. "Pass 1", or a whole sentence) is translated too; it is
+    // shorter than the text, so this ends. A part named raw_... is data -- a preset
+    // name, a file, a message from the program -- and is never translated.
+    lookup(text) {
+        this._load();
+        const key = this.norm(text);
+        if (!key) return null;
+        const hit = this._exact.get(key);
+        if (hit !== undefined) return hit;
+        for (const tpl of this._templates) {
+            const m = key.match(tpl.re);
+            if (!m) continue;
+            let out = tpl.zh;
+            tpl.names.forEach((name, i) => {
+                const part = m[i + 1];
+                const sub = (!name.startsWith('raw_') && part.trim() && this.norm(part) !== key)
+                    ? this.lookup(part) : null;
+                out = out.split('{' + name + '}').join(sub !== null ? sub : part);
+            });
+            return out;
+        }
+        return null;
+    },
+
+    _miss(text) {
+        const key = this.norm(text);
+        if (/[A-Za-z]{2,}/.test(key) && !this._keep.has(key)) this.missing.add(key);
+    },
+
+    // The English of what an element shows, whatever the language: for code that reads a
+    // shown text back (a menu entry's name for a console line, " (N/A)" added to an entry).
+    englishText(el) {
+        if (!el) return '';
+        this._load();
+        let out = '';
+        el.childNodes.forEach(n => {
+            if (n.nodeType === Node.TEXT_NODE) {
+                const rec = this._textRec.get(n);
+                if (rec && n.nodeValue === rec.zh) {
+                    out += rec.en;
+                } else {
+                    const en = this._reverse.get(this.norm(n.nodeValue));
+                    out += en !== undefined ? this._wrap(n.nodeValue, en) : n.nodeValue;
+                }
+            } else if (n.nodeType === Node.ELEMENT_NODE) {
+                out += this.englishText(n);
+            }
+        });
+        return out;
+    },
+
+    // The English HTML of an element's content, for code that keeps a copy to put back
+    // later (the external segmenter list): a copy is never left in the other language.
+    englishHTML(el) {
+        const copy = el.cloneNode(true);
+        this.restore(copy);
+        return copy.innerHTML;
+    },
+
+    // For texts that never enter the window: alert(), confirm(), prompt().
+    t(text) {
+        if (this.lang !== 'zh-CN' || typeof text !== 'string') return text;
+        const zh = this.lookup(text);
+        if (zh === null) {
+            this._miss(text);
+            return text;
+        }
+        return zh;
+    },
+
+    // Keep a text node's leading and trailing white space around the new text.
+    _wrap(raw, core) {
+        const m = raw.match(/^(\s*)[\s\S]*?(\s*)$/);
+        return m[1] + core + m[2];
+    },
+
+    _skipped(node) {
+        const el = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+        return !el || !!el.closest(this.SKIP);
+    },
+
+    _applyText(node) {
+        const raw = node.nodeValue;
+        if (!raw || !raw.trim()) return;
+        const rec = this._textRec.get(node);
+        if (rec && raw === rec.zh) return;
+        const zh = this._lookupAt(node, raw);
+        if (zh === null) {
+            this._miss(raw);
+            return;
+        }
+        const out = this._wrap(raw, zh);
+        this._textRec.set(node, { en: raw, zh: out });
+        if (out !== raw) node.nodeValue = out;
+    },
+
+    _applyAttr(el, attr) {
+        if (attr === 'label' && el.tagName !== 'OPTGROUP') return;
+        const raw = el.getAttribute(attr);
+        if (!raw || !raw.trim()) return;
+        const recs = this._attrRec.get(el) || {};
+        if (recs[attr] && raw === recs[attr].zh) return;
+        const zh = this._lookupAt(el, raw);
+        if (zh === null) {
+            this._miss(raw);
+            return;
+        }
+        recs[attr] = { en: raw, zh };
+        this._attrRec.set(el, recs);
+        if (zh !== raw) el.setAttribute(attr, zh);
+    },
+
+    _walk(root, onText, onElement) {
+        if (!root) return;
+        if (root.nodeType === Node.TEXT_NODE) {
+            if (!this._skipped(root)) onText(root);
+            return;
+        }
+        if (root.nodeType !== Node.ELEMENT_NODE || this._skipped(root)) return;
+        onElement(root);
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+            acceptNode: (n) => (n.nodeType === Node.ELEMENT_NODE && n.matches(this.SKIP))
+                ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT
+        });
+        for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+            if (n.nodeType === Node.TEXT_NODE) onText(n);
+            else onElement(n);
+        }
+    },
+
+    apply(root) {
+        if (this.lang !== 'zh-CN') return;
+        this._walk(root, n => this._applyText(n),
+            el => this.ATTRS.forEach(a => { if (el.hasAttribute(a)) this._applyAttr(el, a); }));
+    },
+
+    // Back to English: the kept English where the node still shows what was written,
+    // else the catalogue read backwards (a node copied from a translated one).
+    restore(root) {
+        this._load();
+        this._walk(root, n => {
+            const rec = this._textRec.get(n);
+            if (rec && n.nodeValue === rec.zh) {
+                n.nodeValue = rec.en;
+            } else if (n.nodeValue && n.nodeValue.trim()) {
+                const en = this._reverse.get(this.norm(n.nodeValue));
+                if (en !== undefined) n.nodeValue = this._wrap(n.nodeValue, en);
+            }
+            this._textRec.delete(n);
+        }, el => {
+            const recs = this._attrRec.get(el) || {};
+            this.ATTRS.forEach(a => {
+                const v = el.getAttribute(a);
+                if (v === null) return;
+                if (recs[a] && v === recs[a].zh) {
+                    el.setAttribute(a, recs[a].en);
+                } else {
+                    const en = this._reverse.get(this.norm(v));
+                    if (en !== undefined) el.setAttribute(a, en);
+                }
+            });
+            this._attrRec.delete(el);
+        });
+    },
+
+    _startObserver() {
+        if (this._observer || typeof MutationObserver === 'undefined') return;
+        this._observer = new MutationObserver(records => {
+            if (this.lang !== 'zh-CN') return;
+            for (const r of records) {
+                if (r.type === 'childList') {
+                    r.addedNodes.forEach(n => this.apply(n));
+                } else if (r.type === 'characterData') {
+                    this.apply(r.target);
+                } else if (r.type === 'attributes' && !this._skipped(r.target)) {
+                    this._applyAttr(r.target, r.attributeName);
+                }
+            }
+        });
+        this._observer.observe(document.body, {
+            childList: true, subtree: true, characterData: true,
+            attributes: true, attributeFilter: this.ATTRS
+        });
+    },
+
+    _updateButton() {
+        const btn = document.getElementById('langBtn');
+        // The button names the language it switches to, in that language.
+        if (btn) btn.textContent = this.lang === 'zh-CN' ? 'English' : '中文';
+    },
+
+    setLanguage(lang, save = true) {
+        this._startObserver();
+        this.lang = lang === 'zh-CN' ? 'zh-CN' : 'en';
+        document.documentElement.lang = this.lang;
+        if (this.lang === 'zh-CN') this.apply(document.body);
+        else this.restore(document.body);
+        this._updateButton();
+        if (save && window.pywebview && pywebview.api && pywebview.api.set_ui_language) {
+            pywebview.api.set_ui_language(this.lang).catch(e => console.warn('Could not save the language:', e));
+        }
+    },
+
+    init() {
+        this._startObserver();
+        this._updateButton();
+        const btn = document.getElementById('langBtn');
+        if (btn) btn.addEventListener('click', () => this.setLanguage(this.lang === 'zh-CN' ? 'en' : 'zh-CN'));
+    },
+
+    // Called first when the Python side is ready: the saved choice, or at the first start
+    // the computer's display language (owner W283 3).
+    async loadSaved() {
+        try {
+            const res = await pywebview.api.get_ui_language();
+            if (res && res.success) this.setLanguage(res.language, false);
+        } catch (e) {
+            console.warn('Could not read the saved language:', e);
+        }
+    }
+};
+
+// ============================================================
 // State Management
 // ============================================================
 const AppState = {
@@ -276,7 +583,7 @@ const ModeManager = {
             sensitivitySelect.value = 'n/a';
 
             // Show info row
-            if (transformersInfoRow) transformersInfoRow.style.display = 'block';
+            if (transformersInfoRow) transformersInfoRow.style.display = (mode === 'transformers') ? 'block' : 'none';
             sensitivityLabel.textContent = 'Sensitivity (not used for this mode):';
         } else {
             // Re-enable sensitivity
@@ -348,6 +655,26 @@ const TransformersManager = {
 // Qwen3-ASR Manager (v1.8.4+)
 // ============================================================
 const QwenManager = {
+    // v1.9.4: the Customize-dialog values that depend on the pass's model,
+    // sensitivity and speech segmenter. Python (get_qwen_schema) resolves them as
+    // the run will; a key missing from the schema is a control this segmenter
+    // does not have, and is removed so it is neither shown nor sent.
+    SEGMENTER_KEYS: ['chunk_threshold_ms', 'max_group_duration', 'vad_threshold',
+                     'vad_start_pad', 'vad_end_pad', 'vad_decoder', 'vad_grow_floor',
+                     'vad_gap_merge_ms', 'max_speech_duration'],
+
+    applySegmenterDefaults(values, schema) {
+        const aud = (schema && schema.audio) || {};
+        for (const key of this.SEGMENTER_KEYS) {
+            if (aud[key] && aud[key].default !== undefined) {
+                values[key] = aud[key].default;
+            } else {
+                delete values[key];
+            }
+        }
+        return values;
+    },
+
     params: null,
     customized: false,
 
@@ -364,10 +691,12 @@ const QwenManager = {
         safe_chunking: true,
         scene_min_duration: 12,
         scene_max_duration: 48,
-        chunk_threshold: 1.0,
-        max_group_duration: 6,
-        vad_threshold: 0.35,
-        vad_padding: 250,
+        scene_clustering_threshold: 22,  // v1.9.2 CFF2 (semantic detector); O1 made 22 the one product-wide value
+        chunk_threshold_ms: 300,
+        max_group_duration: 3,
+        vad_threshold: 0.25,
+        vad_start_pad: 100,
+        vad_end_pad: 100,
         // Scene detection (from main dropdown)
         scene: 'semantic',
         input_mode: 'assembly',
@@ -377,11 +706,15 @@ const QwenManager = {
         repetition_penalty: 1.1,
         max_tokens_per_audio_second: 20.0,
         // Alignment
-        aligner_backend: 'qwen3',
-        aligner_id: 'Qwen/Qwen3-ForcedAligner-0.6B',
+        // 1.10.1 (owner W498 D1): VAD Only and no timing model are the default for Qwen3-ASR and
+        // anime-whisper -- no aligner is loaded, each subtitle takes its VAD group's edges. The
+        // aligner choice below is what an aligner mode uses when the user picks one (1.10.0, item 12).
+        aligner_backend: 'crispasr',
+        aligner_id: 'wav2vec2-ja',
+        timing_model: 'none',
         assembly_cleaner: 'qwen3',
-        timestamp_mode: 'aligner_vad_fallback',
-        stepdown: true,
+        timestamp_mode: 'vad_only',
+        stepdown: false,  // 1.10.0 (owner W266 1): a collapsed scene takes its VAD groups' times
         stepdown_initial_group: 6.0,
         stepdown_fallback_group: 6.0,
         // Output
@@ -865,8 +1198,15 @@ const FormManager = {
             subs_language: document.getElementById('language').value,
             debug: document.getElementById('debugLogging').checked,
             keep_temp: document.getElementById('keepTemp').checked,
+            skip_existing: document.getElementById('skipExisting').checked,
+            fail_on_empty: document.getElementById('failOnEmpty').checked,
+            fail_on_suspect: document.getElementById('failOnSuspect').checked,
+            asr_telemetry: document.getElementById('asrTelemetry').checked,
+            // v1.9.2 (CFF1): minutes of scene audio before the recognizer is reloaded (0 = never)
+            model_refresh_audio_minutes: document.getElementById('modelRefreshAudioMinutes').value,
             temp_dir: document.getElementById('tempDir').value.trim(),
-            accept_cpu_mode: document.getElementById('acceptCpuMode').checked,
+            // #415: downloaded Hugging Face models only (--offline)
+            offline_mode: document.getElementById('offlineMode').checked,
             output_format: document.getElementById('outputFormat').value,
         };
 
@@ -1047,7 +1387,9 @@ const ErrorHandler = {
 
         // Also show browser alert for critical errors
         // In future, could be replaced with custom modal dialog
-        alert(`${title}\n\n${message}`);
+        // The GUI's own titles and messages in the chosen language; a message from the
+        // program (no catalogue entry) stays as it is.
+        alert(`${I18n.t(title)}\n\n${I18n.t(message)}`);
     },
 
     showWarning(title, message) {
@@ -1056,6 +1398,42 @@ const ErrorHandler = {
 
     showSuccess(title, message) {
         ConsoleManager.log(`✓ ${title}: ${message}`, 'success');
+    }
+};
+
+// ============================================================
+// A run that did not start, or ended without a run summary (design 22.9.2; owner D-G)
+// ============================================================
+const RunStopDialog = {
+    show(title, text, offerCpu) {
+        ConsoleManager.log(`✗ ${title}: ${text}`, 'error');
+        document.getElementById('runStopTitle').textContent = title;
+        document.getElementById('runStopText').textContent = text;
+        document.getElementById('runStopCpuBtn').style.display = offerCpu ? '' : 'none';
+        document.getElementById('runStopModal').classList.add('active');
+    },
+
+    close() {
+        document.getElementById('runStopModal').classList.remove('active');
+    },
+
+    async runOnCpu() {
+        // "Run on the CPU this time": the same run again with --device cpu (every part on the CPU).
+        this.close();
+        const result = await pywebview.api.rerun_on_cpu();
+        if (result && result.success) {
+            AppState.isRunning = true;
+            ProcessManager.updateButtonStates();
+            ProgressManager.setIndeterminate(true);
+            ProgressManager.setStatus('Running on the CPU (not accelerated)...');
+            // The command line is echoed by the API (api.py) into the run's output (owner W509: not twice). The
+            // stopped run ended the log polling; start it again, or this run's console stays empty to the end.
+            ProcessManager.stopLogPolling();
+            ProcessManager.startLogPolling();
+            ProcessManager.startStatusMonitoring();
+        } else {
+            ErrorHandler.show('The run could not start again', (result && result.message) || '');
+        }
     }
 };
 
@@ -1091,7 +1469,7 @@ const ProcessManager = {
 
                 // Log command
                 if (result.command) {
-                    ConsoleManager.appendRaw(`\n> ${result.command}\n`);
+                    // The command line is echoed by the API (api.py) into the run's output; not twice (owner W509).
                 }
 
                 // Start log polling
@@ -1198,24 +1576,37 @@ const ProcessManager = {
                     AppState.isRunning = false;
                     this.updateButtonStates();
 
-                    // Show completion status
+                    // Show completion status, in the CLI's own words: the per-file
+                    // tally from whisperjav_run.json. The exit status is the CLI's
+                    // decision; the GUI repeats it and never re-derives it.
+                    const summary = status.run_summary || null;
+                    const tally = summary ? summary.tally : null;
                     if (status.status === 'completed') {
                         ProgressManager.setProgress(100);
-                        ProgressManager.setStatus('Completed');
+                        ProgressManager.setStatus(tally ? `Finished · ${tally}` : 'Finished');
 
                         // For Ensemble Mode (tab3), translation is handled by CLI --translate flag
                         // For other modes, trigger separate translation subprocess if enabled
                         const isEnsembleMode = AppState.activeTab === 'tab3';
+                        const needsALook = summary && (summary.counts.empty > 0 || summary.counts.suspect > 0);
+                        // The tally is in the run summary and in the API's closing line; this line says only
+                        // what they do not (owner W509: the end lines once).
+                        const body = needsALook ? 'Some files ended empty or suspect (listed above).' : '';
+                        this.logFileStates(summary);
 
                         if (isEnsembleMode) {
                             // CLI handled everything including translation (if enabled)
-                            ErrorHandler.showSuccess('Process Completed',
-                                TranslateIntegrationManager.wasEnabledOnStart()
-                                    ? 'Transcription and translation finished successfully'
-                                    : 'Transcription finished successfully');
+                            const note = TranslateIntegrationManager.wasEnabledOnStart()
+                                ? `${body} Translation was run as part of the ensemble.`.trim()
+                                : body;
+                            if (note) {
+                                ErrorHandler.showSuccess('Finished', note);
+                            }
                         } else {
                             // Transcription Mode - translation needs separate subprocess (legacy)
-                            ErrorHandler.showSuccess('Process Completed', 'Transcription finished successfully');
+                            if (body) {
+                                ErrorHandler.showSuccess('Finished', body);
+                            }
 
                             if (TranslateIntegrationManager.wasEnabledOnStart()) {
                                 // Use output_files from API (computed based on mode/language)
@@ -1229,8 +1620,33 @@ const ProcessManager = {
                         }
                     } else if (status.status === 'error') {
                         ProgressManager.reset();
-                        ProgressManager.setStatus(`Error (exit code: ${status.exit_code})`);
-                        ErrorHandler.show('Process Failed', `Process exited with code ${status.exit_code}. Check console for details.`);
+                        this.logFileStates(summary);
+                        if (summary && summary.note) {
+                            ProgressManager.setStatus(`Stopped · ${tally}`);
+                            ErrorHandler.show('Run stopped', `${summary.note} Files: ${tally}. Exit status ${status.exit_code}.`);
+                        } else if (tally) {
+                            ProgressManager.setStatus(`Finished with failures · ${tally}`);
+                            ErrorHandler.show('Finished with failures',
+                                `Files: ${tally}. Exit status ${status.exit_code}; a run fails on: ${(summary.fails_on || ['failed']).join(', ')}. See the RUN SUMMARY in the console.`);
+                        } else if (status.exit_code === 3) {
+                            // design 22.9.2 (owner D-G): this install's NVIDIA GPU cannot be used now.
+                            ProgressManager.setStatus('The run did not start (exit status 3)');
+                            RunStopDialog.show('The NVIDIA GPU cannot be used', status.reason || '', true);
+                        } else if (status.exit_code === 2 || status.exit_code === 4) {
+                            // T68: an argument error (2) or PyTorch missing (4): nothing was processed.
+                            ProgressManager.setStatus(`The run did not start (exit status ${status.exit_code})`);
+                            // The probe's reason already ends with "Nothing was processed." (P7 finding 7).
+                            const reason = (status.reason || '').replace(/\s*Nothing was processed\.\s*$/, '');
+                            RunStopDialog.show('The run did not start',
+                                `${reason} Nothing was processed.`.trim(), false);
+                        } else {
+                            // T68x: a crash, possibly after some files were written -- not "did not start".
+                            ProgressManager.setStatus(`Ended without a run summary (exit status ${status.exit_code})`);
+                            RunStopDialog.show('The run ended without a run summary',
+                                `WhisperJAV stopped (exit status ${status.exit_code}) before it could write its run ` +
+                                `summary. Files finished before that are in the output folder. The console shows what happened.`,
+                                false);
+                        }
                     } else if (status.status === 'cancelled') {
                         ProgressManager.reset();
                         ProgressManager.setStatus('Cancelled');
@@ -1267,14 +1683,28 @@ const ProcessManager = {
         }
     },
 
+    logFileStates(summary) {
+        // State-aware close: name every file that did not end 'done', in the
+        // CLI's words, and say where the manifest is. 'done' files are counted
+        // in the tally; the RUN SUMMARY table in the console has all of them.
+        if (!summary) return;
+        const files = summary.files || [];
+        for (const f of files) {
+            if (f.state === 'done') continue;
+            const level = f.state === 'failed' ? 'error' : (f.state === 'skipped' ? 'info' : 'warning');
+            ConsoleManager.log(`${f.state}: ${f.name}${f.detail ? ' — ' + f.detail : ''}`, level);
+        }
+        // The manifest's path is the run summary's last line (owner W509: said once).
+    },
+
     formatStatus(status) {
         // Format status for display
         const statusMap = {
             'idle': 'Idle',
             'running': 'Running...',
-            'completed': 'Completed',
+            'completed': 'Finished',
             'cancelled': 'Cancelled',
-            'error': 'Error'
+            'error': 'Finished with failures'
         };
         return statusMap[status] || status;
     },
@@ -1332,6 +1762,30 @@ const DirectoryControls = {
             outputDirInput.disabled = false;
             browseBtn.disabled = false;
         }
+    },
+
+    // #454: called after Remember settings restores the form. The "Save next to source
+    // video" box is not saved; the Output field is, and the field is what the run sends
+    // as --output-dir. So set the box from the field: blank or "source" means next to
+    // the video (a blank used to stay under a ticked box and reach the program as
+    // --output-dir "", which wrote into site-packages); any other folder means that
+    // folder, with the box unticked so the screen shows where the files will go.
+    syncOutputDir() {
+        const sourceCheckbox = document.getElementById('outputToSource');
+        const outputDirInput = document.getElementById('outputDir');
+        const browseBtn = document.getElementById('browseOutputBtn');
+        if (!sourceCheckbox || !outputDirInput) return;
+        const value = (outputDirInput.value || '').trim();
+        const toSource = !value || value.toLowerCase() === 'source';
+        sourceCheckbox.checked = toSource;
+        if (toSource) {
+            outputDirInput.value = 'source';
+        } else {
+            this._savedOutputDir = outputDirInput.value;
+        }
+        AppState.outputDir = outputDirInput.value;
+        outputDirInput.disabled = toSource;
+        if (browseBtn) browseBtn.disabled = toSource;
     },
 
     async browseOutput() {
@@ -1399,15 +1853,30 @@ const DirectoryControls = {
 // Two-Pass Ensemble Manager
 // ============================================================
 const EnsembleManager = {
+    // v1.10.0 (item 3, owner W75): speech enhancers WhisperJAV no longer includes.
+    // A remembered setting or an Ensemble preset can still name one. That pass is
+    // then marked until the user chooses an entry in its enhancer list, and Start
+    // is refused while it is marked (text M2, owner W79). removedEnhancer holds the
+    // saved value while the mark stands, so the settings file keeps it until the
+    // user chooses (it is not rewritten on load).
+    REMOVED_ENHANCERS: { clearvoice: 'ClearVoice' },
+    removedEnhancer: { pass1: null, pass2: null },
+
     // State - Full Configuration Snapshot approach
     state: {
         pass1: {
-            pipeline: 'balanced',
-            sensitivity: 'aggressive',
-            sceneDetector: 'auditok',
+            // 1.10.0 (owner W343, W344): pass 1 is Cohere-CrispASR ("cohere") / balanced /
+            // semantic / none / FireRedVAD. Keep in step with index.html's selected options,
+            // CRISPASR_DEFAULT_SENSITIVITY in config/segmenter_presets.py and applyPipelinePresets below.
+            pipeline: 'cohere-crispasr',
+            sensitivity: 'balanced',
+            sceneDetector: 'semantic',
             speechEnhancer: 'none',
-            speechSegmenter: 'whisperseg',  // v1.8.13: WhisperSeg system-wide default
-            model: 'large-v2',
+            speechSegmenter: 'firered-vad',
+            vadVersion: '4.0',  // v1.9.2: which Silero build the BUILT-IN VAD runs (balanced only).
+                                // Keep in step with defaultVadVersion below and with
+                                // DEFAULT_VAD_VERSION in modules/silero_vad_adapter.py.
+            model: 'cohere-asr-ja-v0.1',
             customized: false,
             params: null,  // null = use defaults, object = full custom config
             presetName: null,  // Name of loaded preset, or null if none
@@ -1416,35 +1885,54 @@ const EnsembleManager = {
             isAnimeWhisper: false,  // Track if using Anime-Whisper specifically
             isCohere: false,  // Track if using Cohere-Transcribe specifically (v1.8.14)
             isSenseVoice: false,  // Track if using SenseVoice (FunASR, issue #350)
+            isCrispasr: true,  // Track if using a CrispASR pipeline (parakeet-crispasr / cohere-crispasr, 1.10.0)
+            isXxl: false,  // Track if using BYOP Faster Whisper XXL (pass 1 too since 1.10.0, item 5)
             framer: 'vad-grouped',  // Qwen temporal framer (vad-grouped/full-scene)
             dspEffects: ['loudnorm'],  // Default FFmpeg DSP effects
-            enhanceForVad: false  // Dual-track: use enhanced audio for VAD only, original for ASR
+            enhanceForVad: false,  // Dual-track: use enhanced audio for VAD only, original for ASR
+            // A CrispASR pass's word timestamps, from its Customize Timing tab (1.10.1; owner W413): 'model',
+            // 'aligner', or null for the pipeline's default (crispasrDefaults). Sent as --passN-word-timestamps.
+            wordTimestamps: null
         },
         pass2: {
             enabled: false,
-            pipeline: 'qwen',
-            sensitivity: 'balanced',
+            // 1.10.0 (owner W343, W344): pass 2 is Parakeet-CrispASR ("parakeet") / aggressive /
+            // semantic / none / TEN VAD, and stays off until the user ticks it.
+            pipeline: 'parakeet-crispasr',
+            sensitivity: 'aggressive',
             sceneDetector: 'semantic',
             speechEnhancer: 'none',
-            speechSegmenter: 'whisperseg',  // v1.8.13: WhisperSeg system-wide default
-            model: 'Qwen/Qwen3-ASR-1.7B',
+            speechSegmenter: 'ten',  // TEN VAD on pass 2 for segmentation diversity vs pass 1's FireRedVAD
+            vadVersion: '4.0',  // v1.9.2: which Silero build the BUILT-IN VAD runs (balanced only).
+                                // Keep in step with defaultVadVersion below and with
+                                // DEFAULT_VAD_VERSION in modules/silero_vad_adapter.py.
+            model: 'parakeet-tdt-0.6b-ja',
             customized: false,
             params: null,
             presetName: null,  // Name of loaded preset, or null if none
             isTransformers: false,
-            isQwen: true,  // Default pipeline is Qwen3-ASR (ChronosJAV umbrella)
+            isQwen: false,  // ChronosJAV umbrella: any of qwen / anime-whisper / cohere
             isAnimeWhisper: false,
             isCohere: false,  // v1.8.14: Cohere-Transcribe preview (gated HF model)
             isSenseVoice: false,  // Track if using SenseVoice (FunASR, issue #350)
+            isCrispasr: true,  // Track if using a CrispASR pipeline (parakeet-crispasr / cohere-crispasr, 1.10.0)
             isXxl: false,  // Track if using BYOP Faster Whisper XXL
             framer: 'vad-grouped',  // Qwen temporal framer (vad-grouped/full-scene)
             dspEffects: ['loudnorm'],  // Default FFmpeg DSP effects
             enhanceForVad: false,  // Dual-track: use enhanced audio for VAD only, original for ASR
-            xxlExePath: '',  // Persisted path to XXL executable
-            xxlExtraArgs: '--verbose True --standard_asia'  // Default XXL args (model flows via dedicated model field)
+            // A CrispASR pass's word timestamps, from its Customize Timing tab (1.10.1; owner W413): 'model',
+            // 'aligner', or null for the pipeline's default (crispasrDefaults). Sent as --passN-word-timestamps.
+            wordTimestamps: null
+        },
+        // BYOP Faster Whisper XXL: one program and one Extra Args box for the install, used by
+        // whichever pass is XXL -- either or both (1.10.0, item 5; owner W271 3). Each pass sends
+        // its own model from its Model column.
+        xxl: {
+            exePath: '',  // Persisted path to XXL executable
+            extraArgs: '--verbose True --standard_asia'  // Default XXL args (model flows via the Model column)
         },
         mergeStrategy: 'pass1_primary',
-        serialMode: false,
+        serialMode: true,  // 1.10.1: "Finish each file" ticked by default (owner W493 1)
         currentCustomize: null  // 'pass1' or 'pass2'
     },
 
@@ -1452,7 +1940,11 @@ const EnsembleManager = {
     legacyModels: [
         { value: 'large-v2', label: 'Large V2' },
         { value: 'large-v3', label: 'Large V3' },
-        { value: 'turbo', label: 'Turbo' }
+        { value: 'turbo', label: 'Turbo' },
+        // v1.9.0: whisper-ja-1.5B Japanese finetune (CT2 conversion, word timestamps
+        // intact). Balanced pipeline only — the Fidelity (OpenAI Whisper) pipeline
+        // cannot load CTranslate2 checkpoints.
+        { value: 'TransWithAI/whisper-ja-1.5B-ct2', label: 'whisper-ja-1.5B (CT2, JA)' }
     ],
     transformersModels: [
         { value: 'kotoba-tech/kotoba-whisper-bilingual-v1.0', label: 'Kotoba Bilingual v1.0' },
@@ -1464,7 +1956,13 @@ const EnsembleManager = {
     ],
     qwenModels: [
         { value: 'Qwen/Qwen3-ASR-1.7B', label: 'Qwen3-ASR-1.7B    8GB' },
-        { value: 'Qwen/Qwen3-ASR-0.6B', label: 'Qwen3-ASR-0.6B    4GB' }
+        { value: 'Qwen/Qwen3-ASR-0.6B', label: 'Qwen3-ASR-0.6B    4GB' },
+        // v1.9.0 (R6.4): full SFT on litagin galgame speech corpus. Published
+        // CER 0.1437→0.1285 vs base (anime speech −26.8% rel.); owner-tested.
+        { value: 'jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame', label: 'JA Anime-Galgame 1.7B    8GB' },
+        // v1.9.0 (R6.1): JA finetune focused on proper nouns / kanji-heavy
+        // expressions; owner-tested.
+        { value: 'neosophie/Qwen3-ASR-1.7B-JA', label: 'JA-tuned 1.7B (neosophie)    8GB' }
     ],
     sensevoiceModels: [
         { value: 'iic/SenseVoiceSmall', label: 'SenseVoice Small    ~1GB' }
@@ -1481,6 +1979,104 @@ const EnsembleManager = {
         // from the cached base repo by the cohere generator's load().
         { value: 'efwkjn/cohere-asr-ja', label: 'Cohere-ASR-JA anime finetune    ~4-8GB (public)' }
     ],
+    // The CrispASR pipelines' models (1.10.0; 1.10.1, owner W400, W401): per pipeline, the short names
+    // --passN-model takes, the pipeline's default first, each named by its quantization and the GPU memory
+    // it needs. Keep in step with whisperjav/crispasr/manifest.py (PIPELINE_MODELS, PIPELINE_DEFAULT_MODEL,
+    // menu_label); tests/test_gui_crispasr_pipelines.py compares them.
+    crispasrModels: {
+        'parakeet-crispasr': [
+            { value: 'parakeet-tdt-0.6b-ja', label: 'Parakeet TDT 0.6B ja (q8_0), ~0.9 GB VRAM' },
+            { value: 'parakeet-tdt-0.6b-ja-f16', label: 'Parakeet TDT 0.6B ja (f16), ~1.5 GB VRAM' }
+        ],
+        'cohere-crispasr': [
+            { value: 'cohere-asr-ja-v0.1', label: 'Cohere Transcribe ja v0.1 (q8_0), ~2.5 GB VRAM' },
+            { value: 'cohere-asr-ja-v0.1-f16', label: 'Cohere Transcribe ja v0.1 (f16), ~4.1 GB VRAM' },
+            { value: 'cohere-asr-ja', label: 'Cohere ASR ja (q8_0), ~2.5 GB VRAM' },
+            { value: 'cohere-asr-ja-f16', label: 'Cohere ASR ja (f16), ~4.1 GB VRAM' }
+        ],
+        'reazonspeech-crispasr': [
+            { value: 'reazonspeech-nemo-v2-f16', label: 'ReazonSpeech NeMo v2 (f16), ~1.5 GB VRAM' },
+            { value: 'reazonspeech-nemo-v2-q8_0', label: 'ReazonSpeech NeMo v2 (q8_0), ~0.9 GB VRAM' }
+        ],
+        'kotoba-crispasr': [
+            { value: 'kotoba-whisper-v2.0-f16', label: 'Kotoba-Whisper v2.0 (f16), ~1.9 GB VRAM' },
+            { value: 'kotoba-whisper-v2.0-q5_0', label: 'Kotoba-Whisper v2.0 (q5_0), ~0.9 GB VRAM' }
+        ],
+        'whisper-turbo-crispasr': [
+            { value: 'whisper-large-v3-turbo-f16', label: 'Whisper large-v3-turbo (f16), ~2.0 GB VRAM' },
+            { value: 'whisper-large-v3-turbo-q8_0', label: 'Whisper large-v3-turbo (q8_0), ~1.3 GB VRAM' }
+        ],
+        'whisper-large-crispasr': [
+            { value: 'whisper-large-v2-f16', label: 'Whisper large-v2 (f16), ~4.1 GB VRAM' },
+            { value: 'whisper-large-v2-q8_0', label: 'Whisper large-v2 (q8_0), ~2.7 GB VRAM' },
+            { value: 'whisper-large-v3-f16', label: 'Whisper large-v3 (f16), ~4.3 GB VRAM' },
+            { value: 'whisper-large-v3-q5_0', label: 'Whisper large-v3 (q5_0), ~2.2 GB VRAM' }
+        ],
+        'moss-crispasr': [
+            { value: 'moss-transcribe-diarize-0.9b-f16', label: 'MOSS-Transcribe-Diarize 0.9B (f16), ~2.1 GB VRAM' },
+            { value: 'moss-transcribe-diarize-0.9b-q8_0', label: 'MOSS-Transcribe-Diarize 0.9B (q8_0), ~1.7 GB VRAM' }
+        ]
+    },
+    // Each CrispASR pipeline's speech segmenter and sensitivity when a pass names none
+    // (CRISPASR_DEFAULT_SEGMENTERS, CRISPASR_DEFAULT_SENSITIVITY, config/segmenter_presets.py; owner W202 3,
+    // W343, W344, W401); tests/test_gui_crispasr_pipelines.py compares them. wordTimestamps: where the pass's
+    // subtitle times come from by default (crispasr/manifest.py word_timestamps_for; owner W411-W414). scene:
+    // the scene detector a pass starts on (crispasr/pass_settings.py scene_detector_for; semantic when absent;
+    // MOSS-CrispASR semantic too, owner W482; silero before it, W426 4).
+    crispasrDefaults: {
+        'parakeet-crispasr': { segmenter: 'ten', sensitivity: 'aggressive', wordTimestamps: 'model' },
+        'cohere-crispasr': { segmenter: 'firered-vad', sensitivity: 'balanced', wordTimestamps: 'aligner' },
+        'reazonspeech-crispasr': { segmenter: 'ten', sensitivity: 'aggressive', wordTimestamps: 'model' },
+        'kotoba-crispasr': { segmenter: 'firered-vad', sensitivity: 'balanced', wordTimestamps: 'model' },
+        'whisper-turbo-crispasr': { segmenter: 'firered-vad', sensitivity: 'balanced', wordTimestamps: 'model' },
+        'whisper-large-crispasr': { segmenter: 'firered-vad', sensitivity: 'balanced', wordTimestamps: 'model' },
+        // MOSS-CrispASR (owner W482): semantic scenes of 90-240 s and FireRedVAD (crispasr/pass_settings.py).
+        'moss-crispasr': { segmenter: 'firered-vad', sensitivity: 'balanced', wordTimestamps: 'model', scene: 'semantic' }
+    },
+    crispasrDefaultScene(pipeline) {
+        const defaults = this.crispasrDefaults[pipeline];
+        return (defaults && defaults.scene) || 'semantic';
+    },
+    // R-SCN (1.10.1; owner W448-W455; design docs/plans/design/2026-11-02-rscn-design.md section 15): the scene
+    // detector rscn is offered for the pipelines the command line accepts it for (crispasr/pass_settings.py
+    // RSCN_PIPELINES; tests/test_gui_rscn.py compares the two lists). Not offered in 1.10.1 (owner W482): the list
+    // is empty, the dropdowns have no rscn option and the Customize Scene tab does not list it; the code stays for
+    // the new scene detector R to replace (W481).
+    rscnPipelines: [],
+    offersRscn(pipeline) {
+        return this.rscnPipelines.includes(pipeline);
+    },
+    // Enable or disable the rscn option of a pass's Scene Detector dropdown for the pipeline the pass now runs. A pass
+    // that held rscn and moved to a pipeline without it goes back to that pipeline's own scene detector, with one
+    // log-panel line; a saved preset that carries rscn is kept only where the pipeline offers it.
+    updateRscnOption(passKey) {
+        const select = document.getElementById(`${passKey}-scene`);
+        if (!select) return;
+        const passState = this.state[passKey];
+        const offered = this.offersRscn(passState.pipeline);
+        const option = Array.from(select.options).find(o => o.value === 'rscn');
+        if (option) option.disabled = !offered;
+        if (!offered && passState.sceneDetector === 'rscn') {
+            // The row keeps what it shows (a preset's rscn was not taken into it, setSilent); else the pipeline's own.
+            const shown = select.value && select.value !== 'rscn' ? select.value : '';
+            const fallback = shown || (this.isCrispasrPipeline(passState.pipeline)
+                ? this.crispasrDefaultScene(passState.pipeline) : 'semantic');
+            passState.sceneDetector = fallback;
+            select.value = fallback;
+            ConsoleManager.log(
+                `${passKey === 'pass1' ? 'Pass 1' : 'Pass 2'}: the R-SCN scene detector is not offered in this ` +
+                `version, so ${this.pipelineLabel(passKey)} runs with ${fallback}.`, 'warning');
+        }
+    },
+    // BYOP Faster Whisper XXL (1.10.0, item 5): the model names XXL takes, sent as --passN-model.
+    // large-v2 first, the default (owner W24 2; DEFAULT_XXL_MODEL in byop/xxl_runner.py); the
+    // list is owner W271 2.
+    xxlModels: [
+        { value: 'large-v2', label: 'Large V2' },
+        { value: 'large-v3', label: 'Large V3' },
+        { value: 'large-v3-turbo', label: 'Large V3 Turbo' },
+        { value: 'medium', label: 'Medium' }
+    ],
 
     async init() {
         // SYNC: Initialize state from actual HTML form values
@@ -1492,7 +2088,12 @@ const EnsembleManager = {
         this.state.pass1.sensitivity = document.getElementById('pass1-sensitivity').value;
         this.state.pass1.sceneDetector = document.getElementById('pass1-scene').value;
         this.state.pass1.speechEnhancer = document.getElementById('pass1-enhancer').value;
-        this.state.pass1.speechSegmenter = document.getElementById('pass1-segmenter').value;
+        const seg1 = document.getElementById('pass1-segmenter');
+        if (seg1.dataset.mode === 'vad-version') {
+            this.state.pass1.vadVersion = seg1.value;
+        } else {
+            this.state.pass1.speechSegmenter = seg1.value;
+        }
         this.state.pass1.model = document.getElementById('pass1-model').value;
 
         // Pass 2 state sync
@@ -1501,7 +2102,12 @@ const EnsembleManager = {
         this.state.pass2.sensitivity = document.getElementById('pass2-sensitivity').value;
         this.state.pass2.sceneDetector = document.getElementById('pass2-scene').value;
         this.state.pass2.speechEnhancer = document.getElementById('pass2-enhancer').value;
-        this.state.pass2.speechSegmenter = document.getElementById('pass2-segmenter').value;
+        const seg2 = document.getElementById('pass2-segmenter');
+        if (seg2.dataset.mode === 'vad-version') {
+            this.state.pass2.vadVersion = seg2.value;
+        } else {
+            this.state.pass2.speechSegmenter = seg2.value;
+        }
         this.state.pass2.model = document.getElementById('pass2-model').value;
 
         this.state.mergeStrategy = document.getElementById('merge-strategy').value;
@@ -1515,24 +2121,30 @@ const EnsembleManager = {
         this.state.pass1.isAnimeWhisper = this.state.pass1.pipeline === 'anime-whisper';
         this.state.pass1.isCohere = this.state.pass1.pipeline === 'cohere';
         this.state.pass1.isSenseVoice = this.state.pass1.pipeline === 'sensevoice';
+        this.state.pass1.isCrispasr = this.isCrispasrPipeline(this.state.pass1.pipeline);
+        this.state.pass1.isXxl = this.state.pass1.pipeline === 'xxl';
         this.state.pass2.isTransformers = this.state.pass2.pipeline === 'transformers';
         this.state.pass2.isQwen = (this.state.pass2.pipeline === 'qwen' || this.state.pass2.pipeline === 'anime-whisper' || this.state.pass2.pipeline === 'cohere');
         this.state.pass2.isAnimeWhisper = this.state.pass2.pipeline === 'anime-whisper';
         this.state.pass2.isCohere = this.state.pass2.pipeline === 'cohere';
         this.state.pass2.isSenseVoice = this.state.pass2.pipeline === 'sensevoice';
+        this.state.pass2.isCrispasr = this.isCrispasrPipeline(this.state.pass2.pipeline);
         this.state.pass2.isXxl = this.state.pass2.pipeline === 'xxl';
+        // R-SCN (1.10.1): the rscn option follows each pass's pipeline from the start.
+        this.updateRscnOption('pass1');
+        this.updateRscnOption('pass2');
 
         // Load persisted BYOP preferences (XXL exe path, extra args)
         try {
             const byopPrefs = await pywebview.api.get_byop_preferences();
             if (byopPrefs) {
                 if (byopPrefs.xxl_exe_path) {
-                    this.state.pass2.xxlExePath = byopPrefs.xxl_exe_path;
+                    this.state.xxl.exePath = byopPrefs.xxl_exe_path;
                     const pathInput = document.getElementById('xxl-exe-path');
                     if (pathInput) pathInput.value = byopPrefs.xxl_exe_path;
                 }
                 if (byopPrefs.xxl_extra_args) {
-                    this.state.pass2.xxlExtraArgs = byopPrefs.xxl_extra_args;
+                    this.state.xxl.extraArgs = byopPrefs.xxl_extra_args;
                     const argsInput = document.getElementById('xxl-extra-args');
                     if (argsInput) argsInput.value = byopPrefs.xxl_extra_args;
                 }
@@ -1545,10 +2157,15 @@ const EnsembleManager = {
         // Order matters: more specific ChronosJAV backends (anime-whisper, cohere)
         // must be checked before the isQwen umbrella, because isQwen is true
         // for all of them.
+        ['pass1', 'pass2'].forEach(passKey => {
+            if (this.state[passKey].isXxl) this.swapModelOptions(passKey, 'xxl');
+        });
         if (this.state.pass1.isAnimeWhisper) {
             this.swapModelOptions('pass1', 'anime-whisper');
         } else if (this.state.pass1.isCohere) {
             this.swapModelOptions('pass1', 'cohere');
+        } else if (this.state.pass1.isCrispasr) {
+            this.swapModelOptions('pass1', this.state.pass1.pipeline);
         } else if (this.state.pass1.isQwen) {
             this.swapModelOptions('pass1', 'qwen');
         } else if (this.state.pass1.isTransformers) {
@@ -1560,6 +2177,8 @@ const EnsembleManager = {
             this.swapModelOptions('pass2', 'anime-whisper');
         } else if (this.state.pass2.isCohere) {
             this.swapModelOptions('pass2', 'cohere');
+        } else if (this.state.pass2.isCrispasr) {
+            this.swapModelOptions('pass2', this.state.pass2.pipeline);
         } else if (this.state.pass2.isQwen) {
             this.swapModelOptions('pass2', 'qwen');
         } else if (this.state.pass2.isTransformers) {
@@ -1567,6 +2186,19 @@ const EnsembleManager = {
         } else if (this.state.pass2.isSenseVoice) {
             this.swapModelOptions('pass2', 'sensevoice');
         }
+
+        // v1.9.3: filter the legacy passes at startup too. The branches above only cover
+        // the non-legacy families, so a pass left on a legacy pipeline kept index.html's
+        // static option list -- which carries every model, including turbo for Balanced,
+        // the pair the compatibility filtering exists to prevent. Nothing rebuilt it until
+        // the user touched the pipeline dropdown.
+        ['pass1', 'pass2'].forEach(passKey => {
+            const s = this.state[passKey];
+            const isLegacyFamily = !s.isTransformers && !s.isQwen && !s.isCrispasr && !s.isXxl;
+            if (isLegacyFamily) {
+                this.swapModelOptions(passKey, 'legacy');
+            }
+        });
 
         // Pass 2 enable/disable
         document.getElementById('pass2-enabled').addEventListener('change', (e) => {
@@ -1591,6 +2223,12 @@ const EnsembleManager = {
 
         // New dropdown event handlers - Pass 1
         document.getElementById('pass1-scene').addEventListener('change', (e) => {
+            // A disabled option (rscn for a pipeline without it, 1.10.1) is not a choice: keep what the pass had.
+            const chosen = e.target.options[e.target.selectedIndex];
+            if (chosen && chosen.disabled) {
+                e.target.value = this.state.pass1.sceneDetector;
+                return;
+            }
             this.state.pass1.sceneDetector = e.target.value;
         });
         document.getElementById('pass1-enhancer').addEventListener('change', (e) => {
@@ -1601,6 +2239,7 @@ const EnsembleManager = {
                 return;
             }
             this.state.pass1.speechEnhancer = e.target.value;
+            this.clearRemovedEnhancer('pass1');
             this.updateDspPanel('pass1');
             this.updateEnhanceForVadCheckbox('pass1');
         });
@@ -1608,14 +2247,27 @@ const EnsembleManager = {
             this.state.pass1.enhanceForVad = e.target.checked;
         });
         document.getElementById('pass1-segmenter').addEventListener('change', (e) => {
-            this.state.pass1.speechSegmenter = e.target.value;
+            // v1.9.2: on a balanced pass this dropdown selects the built-in VAD's
+            // Silero version, not an external segmenter.
+            if (e.target.dataset.mode === 'vad-version') {
+                this.state.pass1.vadVersion = e.target.value;
+            } else {
+                this.state.pass1.speechSegmenter = e.target.value;
+            }
         });
         document.getElementById('pass1-model').addEventListener('change', (e) => {
             this.state.pass1.model = e.target.value;
+            this.updateCrispasrStatus('pass1');
         });
 
         // New dropdown event handlers - Pass 2
         document.getElementById('pass2-scene').addEventListener('change', (e) => {
+            // A disabled option (rscn for a pipeline without it, 1.10.1) is not a choice: keep what the pass had.
+            const chosen = e.target.options[e.target.selectedIndex];
+            if (chosen && chosen.disabled) {
+                e.target.value = this.state.pass2.sceneDetector;
+                return;
+            }
             this.state.pass2.sceneDetector = e.target.value;
         });
         document.getElementById('pass2-enhancer').addEventListener('change', (e) => {
@@ -1626,6 +2278,7 @@ const EnsembleManager = {
                 return;
             }
             this.state.pass2.speechEnhancer = e.target.value;
+            this.clearRemovedEnhancer('pass2');
             this.updateDspPanel('pass2');
             this.updateEnhanceForVadCheckbox('pass2');
         });
@@ -1633,7 +2286,13 @@ const EnsembleManager = {
             this.state.pass2.enhanceForVad = e.target.checked;
         });
         document.getElementById('pass2-segmenter').addEventListener('change', (e) => {
-            this.state.pass2.speechSegmenter = e.target.value;
+            // v1.9.2: on a balanced pass this dropdown selects the built-in VAD's
+            // Silero version, not an external segmenter.
+            if (e.target.dataset.mode === 'vad-version') {
+                this.state.pass2.vadVersion = e.target.value;
+            } else {
+                this.state.pass2.speechSegmenter = e.target.value;
+            }
         });
 
         // BYOP: Browse for XXL executable
@@ -1642,7 +2301,7 @@ const EnsembleManager = {
                 const result = await pywebview.api.select_xxl_exe();
                 if (result.success && result.path) {
                     document.getElementById('xxl-exe-path').value = result.path;
-                    this.state.pass2.xxlExePath = result.path;
+                    this.state.xxl.exePath = result.path;
                     // Persist for future sessions
                     pywebview.api.save_byop_preferences({ xxl_exe_path: result.path });
                 }
@@ -1653,22 +2312,23 @@ const EnsembleManager = {
 
         // BYOP: manually typed/pasted exe path (Browse has its own handler above)
         document.getElementById('xxl-exe-path')?.addEventListener('change', (e) => {
-            this.state.pass2.xxlExePath = e.target.value.trim();
+            this.state.xxl.exePath = e.target.value.trim();
             // Persist for future sessions
-            pywebview.api.save_byop_preferences({ xxl_exe_path: this.state.pass2.xxlExePath });
+            pywebview.api.save_byop_preferences({ xxl_exe_path: this.state.xxl.exePath });
         });
 
         // BYOP: Extra args input
         document.getElementById('xxl-extra-args')?.addEventListener('change', (e) => {
-            this.state.pass2.xxlExtraArgs = e.target.value.trim();
+            this.state.xxl.extraArgs = e.target.value.trim();
             // Persist for future sessions
-            pywebview.api.save_byop_preferences({ xxl_extra_args: this.state.pass2.xxlExtraArgs });
+            pywebview.api.save_byop_preferences({ xxl_extra_args: this.state.xxl.extraArgs });
         });
 
         // DSP effects checkbox handlers
         this.initDspCheckboxes();
         document.getElementById('pass2-model').addEventListener('change', (e) => {
             this.state.pass2.model = e.target.value;
+            this.updateCrispasrStatus('pass2');
         });
 
         // Merge strategy
@@ -1718,10 +2378,96 @@ const EnsembleManager = {
         });
 
         // Initialize UI state based on synced values
+        // v1.9.2: the browser can restore a pass's Pipeline to Balanced across a
+        // reload without firing a change event, so the segmenter dropdown is put in
+        // the right mode here too, not only in handlePipelineChange.
+        this.populateSegmenterOptions('pass1');
+        this.populateSegmenterOptions('pass2');
         this.updatePass2State();
         this.updateBadges();
         this.updateRowGreyingState('pass1');
         this.updateRowGreyingState('pass2');
+    },
+
+    // The CrispASR pipelines (1.10.0; 1.10.1, owner W401): the keys of crispasrModels, which are
+    // CRISPASR_PIPELINES in whisperjav/crispasr/manifest.py.
+    isCrispasrPipeline(pipeline) {
+        return Object.prototype.hasOwnProperty.call(this.crispasrModels, pipeline);
+    },
+
+    CRISPASR_CJK_NOTE: 'Experimental (early release). The GGUF (CrispASR) pipelines need folder names in plain Western letters (ASCII). When your user folder has Chinese, Japanese or Korean characters, WhisperJAV links or copies the model to a plain-named folder (the original stays where it is).',
+
+    // Each CrispASR pipeline's speech segmenter when a pass names none (CRISPASR_DEFAULT_SEGMENTERS,
+    // config/segmenter_presets.py; owner W202 3, W344); tests/test_gui_crispasr_pipelines.py compares them.
+    crispasrDefaultSegmenter(pipeline) {
+        return this.crispasrDefaults[pipeline].segmenter;
+    },
+
+    // Each CrispASR pipeline's sensitivity when a pass names none (CRISPASR_DEFAULT_SENSITIVITY,
+    // config/segmenter_presets.py; owner W343, W344); tests/test_gui_crispasr_pipelines.py compares them.
+    crispasrDefaultSensitivity(pipeline) {
+        return this.crispasrDefaults[pipeline].sensitivity;
+    },
+
+    // The CrispASR status panel under a pass row (owner W133 2; route B design 12, T16): the model,
+    // downloaded or not, and where CrispASR runs, or why it cannot run here. Shown for a pass that
+    // runs a CrispASR pipeline, and since 1.10.0 (item 12) for a ChronosJAV pass, whose aligner and
+    // timing model run in CrispASR; filled from api.get_crispasr_status /
+    // get_chronosjav_crispasr_status, which never download.
+    async updateCrispasrStatus(passKey) {
+        const passState = this.state[passKey];
+        // The CJK folder-name note (owner W203 O14, T24) on the Pipeline dropdown itself while a GGUF
+        // pipeline is selected: a tooltip on an <option> inside an open dropdown may not be shown.
+        const pipelineSelect = document.getElementById(`${passKey}-pipeline`);
+        if (pipelineSelect) pipelineSelect.title = passState.isCrispasr ? this.CRISPASR_CJK_NOTE : '';
+        const panel = document.getElementById(`${passKey}-crispasr-status`);
+        if (!panel) return;
+        const enabled = passKey === 'pass1' || this.state.pass2.enabled;
+        if (!(passState.isCrispasr || passState.isQwen) || !enabled) {
+            panel.style.display = 'none';
+            return;
+        }
+        const pipeline = passState.pipeline;
+        const model = passState.model || '';
+        // A CrispASR pass's Timing tab choice (1.10.1): the aligner line follows it; '' = the pipeline's default.
+        const wordTimestamps = passState.wordTimestamps || '';
+        // A ChronosJAV pass: the aligner and timing model it will use (QwenManager defaults, or the
+        // values applied in its Customize window).
+        const chronos = passState.isQwen
+            ? { ...QwenManager.defaults, ...((passState.customized && passState.params) || {}) }
+            : null;
+        const key = chronos
+            ? [chronos.aligner_backend, chronos.aligner_id, chronos.timing_model, chronos.timestamp_mode].join('|')
+            : '';
+        try {
+            const result = chronos
+                ? await pywebview.api.get_chronosjav_crispasr_status(
+                    chronos.aligner_backend, chronos.aligner_id, chronos.timing_model, chronos.timestamp_mode)
+                : await pywebview.api.get_crispasr_status(pipeline, model, wordTimestamps);
+            // The pass may have changed while CrispASR was asked.
+            if (passState.pipeline !== pipeline || (passState.model || '') !== model
+                || (passState.wordTimestamps || '') !== wordTimestamps
+                || !(passState.isCrispasr || passState.isQwen)) return;
+            if (chronos) {
+                const now = { ...QwenManager.defaults, ...((passState.customized && passState.params) || {}) };
+                if ([now.aligner_backend, now.aligner_id, now.timing_model, now.timestamp_mode].join('|') !== key) return;
+            }
+            if (!result || !result.success || !result.lines.length) {
+                panel.style.display = 'none';
+                return;
+            }
+            panel.replaceChildren(...result.lines.map((text) => {
+                const line = document.createElement('div');
+                line.className = 'crispasr-status-line';
+                line.textContent = text;
+                return line;
+            }));
+            panel.classList.toggle('cannot-run', !result.can_run);
+            panel.style.display = 'block';
+        } catch (error) {
+            console.error('CrispASR status:', error);
+            panel.style.display = 'none';
+        }
     },
 
     handlePipelineChange(passKey, newValue, selectElement) {
@@ -1733,6 +2479,7 @@ const EnsembleManager = {
         const isCohere = newValue === 'cohere';
         const isSenseVoice = newValue === 'sensevoice';
         const isXxl = newValue === 'xxl';
+        const isCrispasr = this.isCrispasrPipeline(newValue);
         const wasTransformers = passState.isTransformers;
         const wasQwen = passState.isQwen;
         const wasAnimeWhisper = passState.isAnimeWhisper;
@@ -1741,15 +2488,19 @@ const EnsembleManager = {
 
         // Determine pipeline category for model swapping. Specific ChronosJAV
         // backends (anime-whisper, cohere) take precedence over the qwen umbrella.
-        const getPipelineType = (isT, isQ, isAW, isC, isSV) =>
-            isT ? 'transformers' : (isAW ? 'anime-whisper' : (isC ? 'cohere' : (isSV ? 'sensevoice' : (isQ ? 'qwen' : 'legacy'))));
-        const oldType = getPipelineType(wasTransformers, wasQwen, wasAnimeWhisper, wasCohere, wasSenseVoice);
-        const newType = getPipelineType(isTransformers, isQwen, isAnimeWhisper, isCohere, isSenseVoice);
+        // Each CrispASR pipeline is its own category, named as the pipeline: it has its own models.
+        const crispasrType = (pipeline) => this.isCrispasrPipeline(pipeline) ? pipeline : null;
+        // XXL (1.10.0, item 5) is its own category too: its Model column lists the models XXL runs.
+        const getPipelineType = (isT, isQ, isAW, isC, crispasr, isX, isSV) =>
+            isX ? 'xxl' : (isT ? 'transformers' : (isAW ? 'anime-whisper' : (isC ? 'cohere' : (isSV ? 'sensevoice' : (crispasr || (isQ ? 'qwen' : 'legacy'))))));
+        const oldType = getPipelineType(wasTransformers, wasQwen, wasAnimeWhisper, wasCohere, crispasrType(passState.pipeline), passState.isXxl, wasSenseVoice);
+        const newType = getPipelineType(isTransformers, isQwen, isAnimeWhisper, isCohere, crispasrType(newValue), isXxl, isSenseVoice);
 
         if (passState.customized) {
             // Warn user that custom params will be reset
-            if (confirm(`You have custom parameters for ${passKey === 'pass1' ? 'Pass 1' : 'Pass 2'}. Changing the pipeline will reset them. Continue?`)) {
+            if (confirm(I18n.t(`You have custom parameters for ${passKey === 'pass1' ? 'Pass 1' : 'Pass 2'}. Changing the pipeline will reset them. Continue?`))) {
                 passState.pipeline = newValue;
+                passState.wordTimestamps = null;  // the new pipeline's own default (1.10.1)
                 passState.customized = false;
                 passState.params = null;
                 passState.presetName = null;
@@ -1758,53 +2509,151 @@ const EnsembleManager = {
                 passState.isAnimeWhisper = isAnimeWhisper;
                 passState.isCohere = isCohere;
                 passState.isSenseVoice = isSenseVoice;
+                passState.isCrispasr = isCrispasr;
                 passState.isXxl = isXxl;
                 this.updateBadges();
                 this.updateRowGreyingState(passKey);
                 this.updateByopPanel();
-                if (oldType !== newType) {
+                // v1.9.3: also re-run for a legacy->legacy change. All four legacy
+                // pipelines share the type 'legacy', so the old condition never
+                // refiltered the model list when moving between them (Balanced and
+                // Fidelity run different engines and allow different models).
+                if (oldType !== newType || newType === 'legacy') {
                     this.swapModelOptions(passKey, newType);
                 }
                 this.applyPipelinePresets(passKey, newType);
+                this.updateRscnOption(passKey);
             } else {
                 // Revert selection
                 selectElement.value = passState.pipeline;
             }
         } else {
             passState.pipeline = newValue;
+            passState.wordTimestamps = null;  // the new pipeline's own default (1.10.1)
             passState.presetName = null;
             passState.isTransformers = isTransformers;
             passState.isQwen = isQwen;
             passState.isAnimeWhisper = isAnimeWhisper;
             passState.isCohere = isCohere;
             passState.isSenseVoice = isSenseVoice;
+            passState.isCrispasr = isCrispasr;
             passState.isXxl = isXxl;
             this.updateRowGreyingState(passKey);
             this.updateByopPanel();
-            if (oldType !== newType) {
+            // v1.9.3: see the note above -- legacy->legacy must refilter too.
+            if (oldType !== newType || newType === 'legacy') {
                 this.swapModelOptions(passKey, newType);
             }
             this.applyPipelinePresets(passKey, newType);
+            this.updateRscnOption(passKey);
             this.updateBadges();
+        }
+    },
+
+    // v1.9.2 (S7/S8): the Silero builds the balanced pipeline's BUILT-IN VAD can run.
+    // Order and default come from whisperjav/modules/silero_vad_adapter.py.
+    // Labels must match VAD_VERSION_LABELS in whisperjav/modules/silero_vad_adapter.py.
+    vadVersionOptions: [
+        { value: '3.1', label: 'Internal FW Silero VAD 3.1' },
+        { value: '4.0', label: 'Internal FW Silero VAD 4.0 (default)' },
+        { value: '6.2', label: 'Internal FW Silero VAD 6.2 (latest)' },
+    ],
+    defaultVadVersion: '4.0',
+
+    // The external-segmenter option list, captured from index.html the first time a
+    // dropdown is swapped, so the markup stays the single source for that list.
+    _externalSegmenterHTML: {},
+
+    /**
+     * Rebuild a pass's Speech Segmenter dropdown for the pipeline it now runs.
+     *
+     * v1.9.2 (S2/S9/S9.1): the balanced pipeline has NO external speech segmenter.
+     * It runs faster-whisper's built-in VAD, so for a balanced pass this dropdown
+     * becomes the VAD *version* selector -- Silero 3.1, 4.0 (default), 6.2 and
+     * nothing else. Every other pipeline gets the external list back unchanged.
+     * `dataset.mode` tells the change handler, the DOM sync and the availability
+     * check which of the two things the select currently means.
+     */
+    populateSegmenterOptions(passKey) {
+        const select = document.getElementById(`${passKey}-segmenter`);
+        if (!select) return;
+        if (this._externalSegmenterHTML[passKey] === undefined) {
+            this._externalSegmenterHTML[passKey] = I18n.englishHTML(select);  // 1.10.0 (item 6)
+        }
+        const passState = this.state[passKey];
+        const isBalanced = passState.pipeline === 'balanced';
+
+        if (isBalanced) {
+            if (select.dataset.mode !== 'vad-version') {
+                select.innerHTML = this.vadVersionOptions.map(o =>
+                    `<option value="${o.value}">${o.label}</option>`).join('');
+                select.dataset.mode = 'vad-version';
+            }
+            const version = passState.vadVersion || this.defaultVadVersion;
+            passState.vadVersion = version;
+            select.value = version;
+            select.title = 'Which version of the internal FW Silero VAD to use. '
+                + 'Balanced has no external speech segmenter since v1.9.2.';
+            // Keep the backend name consistent for everything that still reads it
+            // (Customize > Segmenter tab, get_pipeline_defaults, saved presets).
+            passState.speechSegmenter = 'faster-whisper';
+        } else if (select.dataset.mode === 'vad-version') {
+            select.innerHTML = this._externalSegmenterHTML[passKey];
+            delete select.dataset.mode;
+            select.title = '';
+            // Availability marking was applied to the options we just replaced.
+            this.updateSegmenterAvailability();
         }
     },
 
     // Set scene detector, segmenter, and sensitivity to appropriate defaults for the pipeline type
     applyPipelinePresets(passKey, pipelineType) {
+        // v1.9.2: put the right OPTION LIST in the segmenter dropdown before anything
+        // below assigns a value to it -- balanced gets the Silero VAD versions,
+        // everything else gets the external segmenters back.
+        this.populateSegmenterOptions(passKey);
+
         const sceneSelect = document.getElementById(`${passKey}-scene`);
         const segmenterSelect = document.getElementById(`${passKey}-segmenter`);
         const sensitivitySelect = document.getElementById(`${passKey}-sensitivity`);
 
-        // v1.8.13: WhisperSeg is the system-wide segmenter default. All branches
-        // below set whisperseg as the per-pipeline preset; users can manually
-        // override via the dropdown (e.g., switch to silero-v3.1 for non-JA audio).
+        // The CrispASR pipelines (1.10.0): the same defaults as the command line. The speech
+        // segmenter and sensitivity are each pipeline's own when a pass names none
+        // (CRISPASR_DEFAULT_SEGMENTERS, CRISPASR_DEFAULT_SENSITIVITY, config/segmenter_presets.py:
+        // TEN VAD at aggressive for Parakeet, FireRedVAD at balanced for Cohere, owner W343, W344);
+        // the scene detector starts at the pipeline's own (semantic, owner W214 2; MOSS-CrispASR semantic too,
+        // W482: crispasrDefaultScene), and the user may choose another (design 22.9.1).
+        if (this.isCrispasrPipeline(pipelineType)) {
+            const segmenter = this.crispasrDefaultSegmenter(pipelineType);
+            const sensitivity = this.crispasrDefaultSensitivity(pipelineType);
+            const scene = this.crispasrDefaultScene(pipelineType);
+            sceneSelect.value = scene;
+            segmenterSelect.value = segmenter;
+            sensitivitySelect.value = sensitivity;
+            this.state[passKey].sceneDetector = scene;
+            this.state[passKey].speechSegmenter = segmenter;
+            this.state[passKey].sensitivity = sensitivity;
+            return;
+        }
+
+        // v1.8.13: WhisperSeg is the system-wide segmenter default, and most branches
+        // below set it as the per-pipeline preset. Two do not: a Balanced pass has no
+        // external segmenter at all (v1.9.2), and Fidelity uses FireRedVAD
+        // (2026-09-12). Users can override via the dropdown (e.g. switch to
+        // silero-v3.1 for non-JA audio).
         if (pipelineType === 'anime-whisper') {
+            // v1.9.0: pass 1 anime-whisper defaults to aggressive — the tuned
+            // WhisperSeg row (wide-net capture).
+            // v1.9.5 (owner, 2026-10-12): pass 2 anime-whisper is TEN VAD at
+            // aggressive (ENSEMBLE_PASS_DEFAULTS, config/segmenter_presets.py).
+            const animeSensitivity = 'aggressive';
+            const animeSegmenter = passKey === 'pass2' ? 'ten' : 'whisperseg';
             sceneSelect.value = 'semantic';
-            segmenterSelect.value = 'whisperseg';
-            sensitivitySelect.value = 'balanced';
+            segmenterSelect.value = animeSegmenter;
+            sensitivitySelect.value = animeSensitivity;
             this.state[passKey].sceneDetector = 'semantic';
-            this.state[passKey].speechSegmenter = 'whisperseg';
-            this.state[passKey].sensitivity = 'balanced';
+            this.state[passKey].speechSegmenter = animeSegmenter;
+            this.state[passKey].sensitivity = animeSensitivity;
             this.state[passKey].framer = 'vad-grouped';
         } else if (pipelineType === 'cohere') {
             // Cohere runs VAD-only timing by default (ChronosJAV logic):
@@ -1813,19 +2662,24 @@ const EnsembleManager = {
             // probability minima) and CPU-side, leaving VRAM to the ~4GB
             // Cohere model.
             sceneSelect.value = 'semantic';
-            segmenterSelect.value = 'firered';
+            segmenterSelect.value = 'firered-vad';
             sensitivitySelect.value = 'balanced';
             this.state[passKey].sceneDetector = 'semantic';
-            this.state[passKey].speechSegmenter = 'firered';
+            this.state[passKey].speechSegmenter = 'firered-vad';
             this.state[passKey].sensitivity = 'balanced';
             this.state[passKey].framer = 'vad-grouped';
         } else if (pipelineType === 'qwen') {
+            // v1.9.0: qwen on pass 2 pairs with TEN VAD at balanced.
+            // v1.9.5 (owner, 2026-10-12): pass 1 qwen is FireRedVAD at aggressive
+            // (ENSEMBLE_PASS_DEFAULTS, config/segmenter_presets.py).
+            const qwenSegmenter = passKey === 'pass2' ? 'ten' : 'firered-vad';
+            const qwenSensitivity = passKey === 'pass2' ? 'balanced' : 'aggressive';
             sceneSelect.value = 'semantic';
-            segmenterSelect.value = 'whisperseg';
-            sensitivitySelect.value = 'balanced';
+            segmenterSelect.value = qwenSegmenter;
+            sensitivitySelect.value = qwenSensitivity;
             this.state[passKey].sceneDetector = 'semantic';
-            this.state[passKey].speechSegmenter = 'whisperseg';
-            this.state[passKey].sensitivity = 'balanced';
+            this.state[passKey].speechSegmenter = qwenSegmenter;
+            this.state[passKey].sensitivity = qwenSensitivity;
             this.state[passKey].framer = 'vad-grouped';
         } else if (pipelineType === 'sensevoice') {
             // SenseVoice: scene detection drives subtitle granularity; the
@@ -1843,12 +2697,33 @@ const EnsembleManager = {
         } else {
             // Whisper-based pipeline defaults (balanced, faster, fast, fidelity)
             const pipeline = this.state[passKey].pipeline;
-            if (pipeline === 'balanced' || pipeline === 'fidelity') {
-                // v1.8.13: whisperseg + auditok for balanced; whisperseg + semantic for fidelity
-                sceneSelect.value = (pipeline === 'balanced') ? 'auditok' : 'semantic';
-                segmenterSelect.value = 'whisperseg';
-                this.state[passKey].sceneDetector = (pipeline === 'balanced') ? 'auditok' : 'semantic';
-                this.state[passKey].speechSegmenter = 'whisperseg';
+            if (pipeline === 'balanced') {
+                // Balanced defaults to faster-whisper's built-in VAD (fastest; one
+                // transcribe call per scene), the same default as main.py and the
+                // ensemble pass worker. Picking a WhisperJAV segmenter instead
+                // auto-applies the fine-grained grouping (handled in main.py).
+                // v1.9.2: scene detection is SEMANTIC, like every other pipeline and
+                // like DEFAULT_SCENE_DETECTOR on the CLI. This branch used to force
+                // auditok, which silently overrode the new default the moment a user
+                // picked Balanced in the Ensemble tab.
+                // v1.9.2 (S2/S9): balanced offers no external segmenter. The
+                // dropdown becomes the Silero VERSION selector, default 4.0
+                // (S8; 4.0 since 2026-09-12, was 3.1).
+                sceneSelect.value = 'semantic';
+                this.state[passKey].sceneDetector = 'semantic';
+                this.state[passKey].speechSegmenter = 'faster-whisper';
+                this.populateSegmenterOptions(passKey);
+            } else if (pipeline === 'fidelity') {
+                // Owner, 2026-09-12: fidelity's default speech segmenter is
+                // FireRedVAD (was whisperseg since v1.8.13). Same default as
+                // `--mode fidelity` and an --ensemble fidelity pass -- keep in step
+                // with FIDELITY_DEFAULT_SEGMENTER in
+                // whisperjav/config/segmenter_presets.py. The option itself is in
+                // index.html for both passes.
+                sceneSelect.value = 'semantic';
+                segmenterSelect.value = 'firered-vad';
+                this.state[passKey].sceneDetector = 'semantic';
+                this.state[passKey].speechSegmenter = 'firered-vad';
             } else {
                 // faster, fast — runtime has vad=none per LEGACY_PIPELINES, but
                 // dropdown still gets the system-wide default for UI consistency
@@ -1862,13 +2737,29 @@ const EnsembleManager = {
         }
     },
 
+    // v1.9.3: the name of a pipeline as the user sees it in the row ("Balanced"), not the
+    // internal id ("balanced"). Console messages are read by users, so they get the label.
+    pipelineLabel(passKey) {
+        const select = document.getElementById(`${passKey}-pipeline`);
+        const option = select && select.options[select.selectedIndex];
+        // 1.10.0 (item 6): the English name, also when the window shows Chinese.
+        return (option && I18n.englishText(option).trim()) || this.state[passKey].pipeline;
+    },
+
     // Swap model dropdown options based on pipeline type
-    // pipelineType: 'legacy' | 'transformers' | 'qwen' | 'anime-whisper' | 'cohere'
+    // pipelineType: 'legacy' | 'transformers' | 'qwen' | 'anime-whisper' | 'cohere' |
+    //               a CrispASR pipeline (isCrispasrPipeline) | 'xxl'
     swapModelOptions(passKey, pipelineType) {
         const modelSelect = document.getElementById(`${passKey}-model`);
         let models;
+        // true only when a legacy pipeline's compatibility list actually narrowed the
+        // choice -- switching to another family (qwen, transformers, ...) swaps the list
+        // wholesale and is not a "dropped selection" worth reporting.
+        let narrowedByPipeline = false;
 
-        switch (pipelineType) {
+        if (this.isCrispasrPipeline(pipelineType)) {
+            models = this.crispasrModels[pipelineType];
+        } else switch (pipelineType) {
             case 'transformers':
                 models = this.transformersModels;
                 break;
@@ -1884,28 +2775,81 @@ const EnsembleManager = {
             case 'sensevoice':
                 models = this.sensevoiceModels;
                 break;
-            default:
-                models = this.legacyModels;
+            case 'xxl':
+                models = this.xxlModels;
+                break;
+            default: {
+                // v1.9.3: the row now honours the same per-pipeline compatibility the
+                // Customize modal uses. 'legacy' covers four pipelines on two different
+                // engines, and the unfiltered list offered every model to all of them --
+                // so Balanced could be set to 'turbo' (faster-whisper has none) and
+                // Fidelity to the CT2 model (OpenAI Whisper cannot load it). Nothing
+                // validates the pair downstream: main.py and pass_worker.py have no such
+                // guard, so the row was the only thing that could prevent it.
+                const pipeline = this.state[passKey].pipeline;
+                const allowed = this.pipelineModelCompatibility[pipeline];
+                if (allowed) {
+                    models = this.legacyModels.filter(m => allowed.includes(m.value));
+                    narrowedByPipeline = true;
+                } else {
+                    models = this.legacyModels;
+                }
+                break;
+            }
         }
+
+        // Keep the current model if the new pipeline can still run it. Previously this
+        // always reset to the first option, which silently discarded a deliberate choice
+        // whenever the list was rebuilt.
+        // A compatibility list that shares no value with legacyModels would leave this
+        // empty and throw inside a change handler, half-updating the row. Not reachable
+        // today (every compatibility list shares a value with legacyModels),
+        // but fall back to the unfiltered list rather than crash.
+        if (!models.length) {
+            ConsoleManager.log(
+                `Pass ${passKey === 'pass1' ? '1' : '2'}: no model is listed as working ` +
+                `with ${this.pipelineLabel(passKey)}, so all models are being shown.`, 'warn');
+            models = this.legacyModels;
+            narrowedByPipeline = false;
+        }
+
+        const previous = this.state[passKey].model;
+        const previousLabel = (this.legacyModels.find(m => m.value === previous) || {}).label || previous;
+        const kept = models.some(m => m.value === previous) ? previous : null;
+        const chosen = kept || models[0].value;
 
         // Clear existing options
         modelSelect.innerHTML = '';
 
         // Add new options
-        models.forEach((model, index) => {
+        models.forEach(model => {
             const option = document.createElement('option');
             option.value = model.value;
             option.textContent = model.label;
-            if (index === 0) option.selected = true;
+            if (model.value === chosen) option.selected = true;
             modelSelect.appendChild(option);
         });
 
-        // Update state with first option
-        this.state[passKey].model = models[0].value;
+        modelSelect.value = chosen;
+        this.state[passKey].model = chosen;
+
+        // Say so when a selection was dropped, rather than changing it silently
+        // (owner's decision, 2026-09-16). Only when a real previous choice was lost --
+        // not on the first build, and not when switching to an unrelated pipeline family
+        // whose model list never contained it.
+        if (!kept && previous && narrowedByPipeline
+                && this.legacyModels.some(m => m.value === previous)) {
+            const chosenLabel = (models.find(m => m.value === chosen) || {}).label || chosen;
+            ConsoleManager.log(
+                `Pass ${passKey === 'pass1' ? '1' : '2'}: ${this.pipelineLabel(passKey)} ` +
+                `cannot use "${previousLabel}", so "${chosenLabel}" has been selected ` +
+                `instead.`, 'warn');
+        }
     },
 
     // Update row greying based on pipeline type
-    // - XXL (BYOP): Disable ALL controls (external tool, no WhisperJAV config applies)
+    // - XXL (BYOP): Disable every control but the Model column (external tool, no WhisperJAV
+    //   config applies; the model it runs is chosen here since 1.10.0, #449)
     // - Transformers: Disable sensitivity AND segmenter (uses HF internal chunking)
     // - Qwen: Disable sensitivity only, KEEP segmenter (uses post-ASR VAD filter)
     // - Legacy: Enable both
@@ -1931,13 +2875,48 @@ const EnsembleManager = {
             const customizeBtn = document.getElementById(`customize-${passKey}`);
             if (sceneSelect) { sceneSelect.disabled = true; sceneSelect.title = xxlTitle; }
             if (enhancerSelect) { enhancerSelect.disabled = true; enhancerSelect.title = xxlTitle; }
-            if (modelSelect) { modelSelect.disabled = true; modelSelect.title = xxlTitle; }
+            // The model XXL runs reaches XXL as --passN-model (1.10.0, item 5, #449).
+            // Text G1, approved by the owner as drafted (W275).
+            if (modelSelect) {
+                modelSelect.disabled = isPass2Disabled;
+                modelSelect.title = 'The Whisper model XXL runs. XXL downloads it the first time it is used.';
+            }
             if (customizeBtn) { customizeBtn.disabled = true; customizeBtn.title = xxlTitle; }
 
             // Hide guide button and DSP panel
             const guideBtn = document.getElementById(`guide-${passKey}`);
             if (guideBtn) guideBtn.style.display = 'none';
             this.updateDspPanel(passKey);
+            this.updateCrispasrStatus(passKey);
+            return;
+        }
+
+        // A CrispASR pipeline (1.10.0) uses the model, the speech segmenter, the sensitivity (which
+        // picks the segmenter's preset, design 4.5), the source language, and since design 22.9.1
+        // (owner W212 D3, W214 2, W232 8) the scene detector (semantic by default), the speech
+        // enhancer, Enhance for VAD only and Customize (Segmenter, Enhancer, Scene tabs). Nothing is
+        // greyed: "None" as the speech segmenter sends each scene to the model whole (owner W457, W458).
+        const noneSegmenter = segmenterSelect.querySelector('option[value="none"]');
+        if (noneSegmenter) noneSegmenter.disabled = false;
+        if (passState.isCrispasr) {
+            sensitivitySelect.disabled = isPass2Disabled;
+            sensitivitySelect.title = 'Picks the speech segmenter\'s preset: the detection threshold and related settings';
+            segmenterSelect.disabled = isPass2Disabled;
+            segmenterSelect.title = '';
+
+            const sceneSelect = document.getElementById(`${passKey}-scene`);
+            const enhancerSelect = document.getElementById(`${passKey}-enhancer`);
+            const modelSelect = document.getElementById(`${passKey}-model`);
+            const customizeBtn = document.getElementById(`customize-${passKey}`);
+            if (sceneSelect) { sceneSelect.disabled = isPass2Disabled; sceneSelect.title = ''; }
+            if (enhancerSelect) { enhancerSelect.disabled = isPass2Disabled; enhancerSelect.title = ''; }
+            if (modelSelect) { modelSelect.disabled = isPass2Disabled; modelSelect.title = ''; }
+            if (customizeBtn) { customizeBtn.disabled = isPass2Disabled; customizeBtn.title = ''; }
+
+            const guideBtn = document.getElementById(`guide-${passKey}`);
+            if (guideBtn) guideBtn.style.display = 'none';
+            this.updateDspPanel(passKey);
+            this.updateCrispasrStatus(passKey);
             return;
         }
 
@@ -2006,12 +2985,25 @@ const EnsembleManager = {
             // Whisper/Qwen: restore standard segmenter options, then enable.
             this.restoreWhisperSegmenterOptions(segmenterSelect);
             segmenterSelect.disabled = isPass2Disabled;
-            segmenterSelect.title = passState.isQwen ? `Post-ASR VAD filter for ${passState.isAnimeWhisper ? 'Anime-Whisper' : (passState.isCohere ? 'Cohere-Transcribe' : 'Qwen3-ASR')}` : '';
+            if (segmenterSelect.dataset.mode === 'vad-version') {
+                segmenterSelect.title = 'Which version of the internal FW Silero VAD to use. '
+                    + 'Balanced has no external speech segmenter since v1.9.2.';
+            } else {
+                segmenterSelect.title = passState.isQwen ? `Post-ASR VAD filter for ${passState.isAnimeWhisper ? 'Anime-Whisper' : (passState.isCohere ? 'Cohere-Transcribe' : 'Qwen3-ASR')}` : '';
+            }
         }
 
         // Parameter guide button: visible only for Qwen pipelines
         const guideBtn = document.getElementById(`guide-${passKey}`);
         if (guideBtn) guideBtn.style.display = passState.isQwen ? '' : 'none';
+
+        // The two branches above (XXL, CrispASR) refresh the enhancer-dependent
+        // panels before returning; this ordinary path did not, so on a fresh
+        // window Pass 1's DSP panel and both passes' "Enhance for VAD only" row
+        // kept whatever the markup said until something was clicked. This runs at
+        // start-up, on a pipeline change and after a preset is loaded.
+        this.updateDspPanel(passKey);
+        this.updateCrispasrStatus(passKey);
     },
 
     // Replace the segmenter dropdown's options with the SenseVoice VAD toggle
@@ -2045,7 +3037,7 @@ const EnsembleManager = {
 
         if (passState.customized) {
             // Warn user that custom params will be reset
-            if (confirm(`You have custom parameters for ${passKey === 'pass1' ? 'Pass 1' : 'Pass 2'}. Changing the sensitivity will reset them. Continue?`)) {
+            if (confirm(I18n.t(`You have custom parameters for ${passKey === 'pass1' ? 'Pass 1' : 'Pass 2'}. Changing the sensitivity will reset them. Continue?`))) {
                 passState.sensitivity = newValue;
                 passState.customized = false;
                 passState.params = null;
@@ -2095,6 +3087,50 @@ const EnsembleManager = {
         this.updateByopPanel();
     },
 
+    // v1.10.0 (item 3): removed speech enhancers -- see REMOVED_ENHANCERS above.
+    isRemovedEnhancer(value) {
+        const backend = String(value || '').split(':')[0].trim().toLowerCase();
+        return Object.prototype.hasOwnProperty.call(this.REMOVED_ENHANCERS, backend);
+    },
+
+    markRemovedEnhancer(passKey, value) {
+        this.removedEnhancer[passKey] = value;
+        const select = document.getElementById(`${passKey}-enhancer`);
+        if (!select) return;
+        // The list shows the removed name in a disabled entry while the mark stands.
+        // Without it the list would show an ordinary entry (None), and choosing the
+        // entry already shown fires no change event, so the mark could not be cleared.
+        let marker = select.querySelector('option[data-removed-enhancer]');
+        if (!marker) {
+            marker = document.createElement('option');
+            marker.value = '';
+            marker.disabled = true;
+            marker.dataset.removedEnhancer = '1';
+            select.insertBefore(marker, select.firstChild);
+        }
+        const backend = String(value).split(':')[0].trim().toLowerCase();
+        marker.textContent = `${this.REMOVED_ENHANCERS[backend]} (no longer included)`;
+        marker.selected = true;
+        this.updateDspPanel(passKey);
+    },
+
+    clearRemovedEnhancer(passKey) {
+        this.removedEnhancer[passKey] = null;
+        const marker = document.getElementById(`${passKey}-enhancer`)
+            ?.querySelector('option[data-removed-enhancer]');
+        if (marker) marker.remove();
+    },
+
+    // The passes that will run with a removed enhancer still marked. A pass whose
+    // enhancer list does not apply (pass 2 off, XXL) is not counted: its list cannot be
+    // used, so the user could not clear the mark. A CrispASR pass uses its enhancer
+    // since design 22.9.1, so it counts.
+    passesWithRemovedEnhancer() {
+        return ['pass1', 'pass2'].filter(k => this.removedEnhancer[k]
+            && (k === 'pass1' || this.state.pass2.enabled)
+            && !this.state[k].isXxl);
+    },
+
     // DSP Effects Panel Management
     updateDspPanel(passId) {
         const panel = document.getElementById(`${passId}-dsp-panel`);
@@ -2103,14 +3139,22 @@ const EnsembleManager = {
 
         if (panel) {
             // Show panel only when FFmpeg DSP is selected and pass is enabled
-            // Also hide when XXL is selected (external tool, no DSP)
-            const isXxl = passId === 'pass2' && this.state.pass2.isXxl;
+            // Also hide when XXL is selected (external tool, no DSP) -- in either pass
+            const isXxl = !!this.state[passId]?.isXxl;
             if (enhancer === 'ffmpeg-dsp' && isEnabled && !isXxl) {
                 panel.style.display = 'block';
             } else {
                 panel.style.display = 'none';
             }
         }
+
+        // "Enhance for VAD only" depends on exactly the same thing this does --
+        // which enhancer the pass has selected -- so it is refreshed here rather
+        // than only from the enhancer dropdown's change handler. Before v1.9.3 it
+        // was refreshed nowhere else, so a pass that already had an enhancer when
+        // the window opened, or that got one from a preset, kept the checkbox
+        // hidden until the user re-picked the enhancer by hand.
+        this.updateEnhanceForVadCheckbox(passId);
     },
 
     // Enhance-for-VAD checkbox visibility
@@ -2119,9 +3163,28 @@ const EnsembleManager = {
         if (!row) return;
         const enhancer = document.getElementById(`${passId}-enhancer`)?.value || 'none';
         const isEnabled = passId === 'pass1' || this.state.pass2.enabled;
-        const isXxl = passId === 'pass2' && this.state.pass2.isXxl;
+        const isXxl = !!this.state[passId]?.isXxl;
+        // Owner, 2026-09-17: "balanced shall not have the VAD only enhancement."
+        // Balanced detects speech inside faster-whisper's own call, on the audio
+        // it recognises, so there is no second track to feed. Offering the box
+        // there would promise something the pipeline cannot do.
+        const isBalanced = this.state[passId]?.pipeline === 'balanced';
         // Show when a real enhancer is selected (not none) and pass is enabled
-        row.style.display = (enhancer !== 'none' && enhancer !== '' && isEnabled && !isXxl) ? 'block' : 'none';
+        row.style.display = (enhancer !== 'none' && enhancer !== '' && isEnabled
+                             && !isXxl && !isBalanced) ? 'block' : 'none';
+        if (isBalanced && this.state[passId]) {
+            // Clear it too, so a value left over from another pipeline is not
+            // carried into the run by a control the user can no longer see.
+            this.state[passId].enhanceForVad = false;
+        }
+        // The tick box and the stored value are two separate things, and until
+        // now only the balanced rule above ever wrote the box. Anything else
+        // that set the value -- ticking it inside the Customize window, or
+        // loading a preset saved with it on -- left the row showing unticked
+        // while the run still sent the flag: the user saw "off" and got the
+        // dual track. Repainting the row now always shows what will run.
+        const box = document.getElementById(`${passId}-enhance-for-vad`);
+        if (box) box.checked = !!this.state[passId]?.enhanceForVad;
     },
 
     // BYOP Settings Panel Management
@@ -2129,18 +3192,19 @@ const EnsembleManager = {
         const panel = document.getElementById('byop-settings-panel');
         if (!panel) return;
 
-        const showByop = this.state.pass2.enabled && this.state.pass2.isXxl;
+        // Shown when either pass is XXL (pass 1 since 1.10.0, item 5); one panel for both.
+        const showByop = this.state.pass1.isXxl || (this.state.pass2.enabled && this.state.pass2.isXxl);
         panel.style.display = showByop ? 'block' : 'none';
 
         // Sync input fields from state
         if (showByop) {
             const pathInput = document.getElementById('xxl-exe-path');
             const argsInput = document.getElementById('xxl-extra-args');
-            if (pathInput && !pathInput.value && this.state.pass2.xxlExePath) {
-                pathInput.value = this.state.pass2.xxlExePath;
+            if (pathInput && !pathInput.value && this.state.xxl.exePath) {
+                pathInput.value = this.state.xxl.exePath;
             }
-            if (argsInput && !argsInput.value && this.state.pass2.xxlExtraArgs) {
-                argsInput.value = this.state.pass2.xxlExtraArgs;
+            if (argsInput && !argsInput.value && this.state.xxl.extraArgs) {
+                argsInput.value = this.state.xxl.extraArgs;
             }
         }
     },
@@ -2181,6 +3245,8 @@ const EnsembleManager = {
             const btn = document.getElementById(`customize-${passKey}`);
             const passState = this.state[passKey];
             if (!badge) return;
+            // 1.10.0 (item 6): a preset's name is the user's own text, never translated.
+            badge.toggleAttribute('data-i18n-skip', !!passState.presetName);
 
             if (passState.presetName) {
                 // Preset loaded — show truncated name
@@ -2230,11 +3296,6 @@ const EnsembleManager = {
         vad: [
             'threshold', 'min_speech_duration_ms',
             'max_speech_duration_s', 'min_silence_duration_ms', 'speech_pad_ms'
-        ],
-        // Internal VAD parameters for kotoba-faster-whisper pipeline
-        internalVad: [
-            'vad_filter', 'vad_threshold', 'min_speech_duration_ms',
-            'max_speech_duration_s', 'min_silence_duration_ms', 'speech_pad_ms'
         ]
         // Engine options = everything else (varies by pipeline backend)
     },
@@ -2260,8 +3321,7 @@ const EnsembleManager = {
         // === External VAD parameters (Silero VAD for balanced/fidelity) ===
         threshold: { type: 'float', ge: 0.0, le: 1.0, step: 0.01 },
 
-        // === Internal VAD parameters (kotoba-faster-whisper) ===
-        // Also applies to external Silero VAD - use larger ranges to cover both
+        // === VAD parameters (faster-whisper's built-in VAD and external Silero VAD) ===
         vad_filter: { type: 'boolean', default: true },
         vad_threshold: { type: 'float', ge: 0.0, le: 1.0, step: 0.01 },
         min_speech_duration_ms: { type: 'int', ge: 0, le: 5000, step: 10 },        // Fixed: was 1000, backend allows 5000
@@ -2270,8 +3330,8 @@ const EnsembleManager = {
         speech_pad_ms: { type: 'int', ge: 0, le: 2000, step: 10 },                 // Fixed: was 500, backend allows 2000
 
         // === Engine parameters (NEW - were missing) ===
-        repetition_penalty: { type: 'float', ge: 1.0, le: 3.0, step: 0.1 },          // Added: for faster_whisper/kotoba
-        no_repeat_ngram_size: { type: 'int', ge: 0, le: 10, step: 1 },             // Added: for faster_whisper/kotoba
+        repetition_penalty: { type: 'float', ge: 1.0, le: 3.0, step: 0.1 },          // Added: for faster_whisper
+        no_repeat_ngram_size: { type: 'int', ge: 0, le: 10, step: 1 },             // Added: for faster_whisper
         chunk_length: { type: 'int', ge: 1, le: 30, step: 1 },                     // Added: for faster_whisper
 
         // === Boolean parameters (explicit type for robustness) ===
@@ -2287,13 +3347,21 @@ const EnsembleManager = {
         vad: { type: 'boolean', default: true }
     },
 
-    // Model compatibility per pipeline (faster-whisper doesn't support turbo)
+    // Model compatibility per pipeline. This is the ONLY place the engine constraint is
+    // written down, and as of v1.9.3 both the Ensemble row and the Customize modal read
+    // it (see swapModelOptions) -- before, only the modal did, so the row offered
+    // combinations that cannot run and nothing validates them downstream.
+    //
+    // balanced / fast / faster run CTranslate2 via faster-whisper, which has no 'turbo'.
+    // fidelity runs OpenAI Whisper, which has turbo but cannot load a CTranslate2
+    // checkpoint. whisper-ja-1.5B-ct2 is CT2, so it is Balanced only by the owner's
+    // decision of 2026-09-16 -- fast/faster share the engine and could run it, but it
+    // ships as Balanced-only and stays that way until he says otherwise.
     pipelineModelCompatibility: {
-        balanced: ['large-v2', 'large-v3'],
+        balanced: ['large-v2', 'large-v3', 'TransWithAI/whisper-ja-1.5B-ct2'],
         faster: ['large-v2', 'large-v3'],
         fast: ['large-v2', 'large-v3'],
         fidelity: ['large-v2', 'large-v3', 'turbo'],
-        'kotoba-faster-whisper': ['kotoba-tech/kotoba-whisper-v2.0-faster', 'RoachLin/kotoba-whisper-v2.2-faster']
     },
 
     async openCustomize(passKey) {
@@ -2302,6 +3370,10 @@ const EnsembleManager = {
         if (btn) btn.classList.add('loading');
         try {
         const passState = this.state[passKey];
+
+        // The Timing tab is a CrispASR pass's only (1.10.1): hidden here for every pipeline, and shown again
+        // by openCrispasrCustomize. Every opener comes through this function.
+        this.showTimingTab(false);
 
         // Route to pipeline-specific handler if applicable
         if (passState.isTransformers) {
@@ -2323,6 +3395,10 @@ const EnsembleManager = {
             await this.openSenseVoiceCustomize(passKey);
             return;
         }
+        if (passState.isCrispasr) {
+            await this.openCrispasrCustomize(passKey);
+            return;
+        }
 
         // Legacy pipeline customize flow
         this.state.currentCustomize = passKey;
@@ -2330,8 +3406,14 @@ const EnsembleManager = {
         const sensitivity = passState.sensitivity;
 
         try {
-            // Get resolved pipeline parameters
-            const result = await pywebview.api.get_pipeline_defaults(pipeline, sensitivity);
+            // Get resolved pipeline parameters. v1.9.0: pass the pass's segmenter so
+            // the panel reflects the actual balanced VAD defaults (native
+            // faster_whisper_vad preset, or Test-D grouping for an external segmenter).
+            // v1.9.2: also pass the pass's scene detector, so the panel shows that
+            // backend's own scene parameters rather than auditok's names for every pass.
+            const result = await pywebview.api.get_pipeline_defaults(
+                pipeline, sensitivity, passState.speechSegmenter || '', passState.sceneDetector || ''
+            );
 
             if (!result.success) {
                 ErrorHandler.show('Error', 'Failed to load pipeline parameters: ' + result.error);
@@ -2344,7 +3426,13 @@ const EnsembleManager = {
                 decoder: {},
                 engine: {},
                 vad: {},
-                scene: { scene_detection_method: passState.sceneDetector || 'auditok' }
+                // v1.9.2: seed the Scene tab from the RESOLVED scene parameters, not from
+                // the tool YAML's defaults — otherwise saving a customised pass writes the
+                // YAML values back over the pipeline's own (Balanced resolves 28 s / 240 s).
+                scene: {
+                    scene_detection_method: passState.sceneDetector || 'semantic',
+                    ...(result.scene_params || {})
+                }
             };
 
             // Categorize decoder params (from API's decoder section)
@@ -2425,13 +3513,51 @@ const EnsembleManager = {
             const contextPanel = document.getElementById('tab-context');
             if (contextPanel) contextPanel.innerHTML = '';
 
-            // Get current model settings
-            const currentModel = passState.customized && passState.params.model_name
+            // Get current model settings.
+            // v1.9.3: seed from the row when there is no customized value. `result.model`
+            // is NOT a model name for the standard pipelines -- get_pipeline_defaults
+            // returns the whole model *section* there (a dict; api.py, the standard-
+            // pipeline return), and only the kotoba/V3 branch returns a string. A dict
+            // never matches an entry in allowedModels, so generateModelTab fell back to
+            // allowedModels[0] and the Model tab opened on 'large-v2' for every legacy
+            // pass regardless of what the row said.
+            const rowModel = passState.model;
+            const resultModel = (result.model && typeof result.model === 'object')
+                ? result.model.model_name
+                : result.model;
+            const currentModel = (passState.customized && passState.params && passState.params.model_name)
                 ? passState.params.model_name
-                : result.model || 'large-v2';
+                : (rowModel || resultModel || 'large-v2');
+            // T58 (design 22.3.1, owner W237 1): Auto by default -- as this install is made for.
             const currentDevice = passState.customized && passState.params.device
                 ? passState.params.device
-                : 'cuda';
+                : 'auto';
+
+            // v1.9.3: restore this modal's own tab labels before filling the panels.
+            // The modal has ONE set of tab buttons shared by every pipeline, and
+            // generateTransformersTabs() and generateQwenTabs() rename them in place
+            // (e.g. Qwen turns Segmenter into "Generation" and hides Context). Nothing
+            // renamed them back, so opening a legacy pass's Customize after a
+            // Transformers or Qwen one showed the previous pipeline's labels over this
+            // pipeline's content -- the Segmenter tab appeared to have vanished when it
+            // had only been relabelled. These are the labels index.html ships with.
+            const legacyTabLabels = {
+                'model': 'Model',
+                'quality': 'Quality',
+                'segmenter': 'Segmenter',
+                'enhancer': 'Enhancer',
+                'scene': 'Scene',
+                'context': 'Context'
+            };
+            Object.entries(legacyTabLabels).forEach(([tab, label]) => {
+                const tabBtn = document.querySelector(`[data-tab="${tab}"]`);
+                if (tabBtn) {
+                    tabBtn.textContent = label;
+                    // Context is unused by the legacy pipelines and hidden by default;
+                    // the others must be visible again after Qwen hid Context.
+                    tabBtn.style.display = tab === 'context' ? 'none' : '';
+                }
+            });
 
             // Generate Model tab
             this.generateModelTab('tab-model', currentModel, currentDevice, pipeline);
@@ -2442,9 +3568,7 @@ const EnsembleManager = {
                 ...allDefaults.decoder,
                 ...allDefaults.engine
             };
-            // Determine if this is kotoba pipeline (uses internal VAD)
-            const isKotobaPipeline = pipeline === 'kotoba-faster-whisper';
-            await this.generateQualityTab('tab-quality', qualityParams, currentValues, isKotobaPipeline, allDefaults.engine);
+            await this.generateQualityTab('tab-quality', qualityParams, currentValues, allDefaults.engine);
 
             // Generate Segmenter tab (backend-specific parameters)
             const segmenterBackend = passState.speechSegmenter || 'silero';
@@ -2455,7 +3579,7 @@ const EnsembleManager = {
             await this.generateEnhancerTab('tab-enhancer', enhancerBackend, passState.dspEffects || ['loudnorm']);
 
             // Generate Scene tab (backend-specific parameters)
-            const sceneBackend = passState.sceneDetector || 'auditok';
+            const sceneBackend = passState.sceneDetector || 'semantic';
             await this.generateSceneTab('tab-scene', sceneBackend, currentValues);
 
             // Reset to first tab
@@ -2473,6 +3597,126 @@ const EnsembleManager = {
         } finally {
             if (btn) btn.classList.remove('loading');
         }
+    },
+
+    // Customize for a GGUF (CrispASR) pass (design 22.9.1; owner W214 2, W232 8): three tabs --
+    // Segmenter, Enhancer, Scene -- seeded with the values the pass runs with. No Model or Quality
+    // tab: no Device control (W217 14; --device governs the pass) and no ASR model or decoder
+    // setting; the two pause values stay in the code until tuning (W211 3, W217 20).
+    async openCrispasrCustomize(passKey) {
+        const passState = this.state[passKey];
+        this.state.currentCustomize = passKey;
+        const sensitivity = passState.sensitivity || 'balanced';
+        const sceneBackend = passState.sceneDetector || this.crispasrDefaultScene(passState.pipeline);
+        const result = await pywebview.api.get_crispasr_customize_defaults(
+            passState.pipeline, sensitivity, passState.speechSegmenter || '', sceneBackend);
+        if (!result || !result.success) {
+            ErrorHandler.show('Error', 'Failed to load the pass settings: ' + (result ? result.error : ''));
+            return;
+        }
+        // The model's own tab (1.10.1): MOSS-CrispASR's MOSS settings (crispasr/moss_prompt.py); null otherwise.
+        const modelTab = result.model || null;
+        const modelDefaults = modelTab ? modelTab.defaults : {};
+        const defaults = { ...result.segmenter, scene_detection_method: sceneBackend, ...result.scene, ...modelDefaults };
+        this._currentDefaults = { transcriber: {}, decoder: {}, engine: { ...modelDefaults }, vad: result.segmenter,
+                                  scene: { scene_detection_method: sceneBackend, ...result.scene } };
+        const currentValues = (passState.customized && passState.params)
+            ? { ...defaults, ...passState.params } : defaults;
+
+        const passLabel = passKey === 'pass1' ? 'Pass 1' : 'Pass 2';
+        document.getElementById('customizeModalTitle').textContent =
+            `${passLabel} Settings (${this.pipelineLabel(passKey)} / ${sensitivity})` +
+            (passState.customized ? ' [Custom]' : ' [Default]');
+        ['model', 'quality', 'segmenter', 'enhancer', 'scene', 'context'].forEach(tab => {
+            const panel = document.getElementById(`tab-${tab}`);
+            if (panel) panel.innerHTML = '';
+            const tabBtn = document.querySelector(`[data-tab="${tab}"]`);
+            if (tabBtn) {
+                tabBtn.textContent = tab.charAt(0).toUpperCase() + tab.slice(1);
+                tabBtn.style.display = ['segmenter', 'enhancer', 'scene'].includes(tab) ? '' : 'none';
+            }
+        });
+        await this.generateSegmenterTab('tab-segmenter', result.segmenter_backend, currentValues, true, sensitivity);
+        await this.generateEnhancerTab('tab-enhancer', passState.speechEnhancer || 'none', passState.dspEffects || ['loudnorm']);
+        await this.generateSceneTab('tab-scene', sceneBackend, currentValues);
+        if (modelTab) this.generateCrispasrModelTab(modelTab, currentValues);
+        this.generateCrispasrTimingTab(passKey);
+        this.showTimingTab(true);
+        this.switchModalTab('segmenter');
+        await this.refreshPresetList();
+        document.getElementById('customizeModal').classList.add('active');
+    },
+
+    // The model's own tab of a CrispASR pass (1.10.1): MOSS-CrispASR's MOSS settings, from the owner's reference
+    // command (W428 I1 4; crispasr/moss_prompt.py GUI_SCHEMA). Drawn in the Context panel, which the CrispASR window
+    // does not otherwise use, under the tab name the back end gives ("MOSS"). Its values are --passN-params keys,
+    // collected by applyCustomization with the other tabs'.
+    generateCrispasrModelTab(modelTab, currentValues) {
+        const container = document.getElementById('tab-context');
+        const tabBtn = document.querySelector('[data-tab="context"]');
+        if (!container || !tabBtn) return;
+        container.innerHTML = '';
+        tabBtn.textContent = modelTab.title;
+        tabBtn.style.display = '';
+        const group = document.createElement('div');
+        group.className = 'param-group';
+        for (const [paramName, schema] of Object.entries(modelTab.schema || {})) {
+            const defaultValue = (modelTab.defaults || {})[paramName];
+            const value = currentValues[paramName] !== undefined && currentValues[paramName] !== null
+                ? currentValues[paramName] : defaultValue;
+            group.appendChild(this.generateSchemaControl(paramName, schema, value, defaultValue));
+        }
+        container.appendChild(group);
+    },
+
+    // The Timing tab of a CrispASR pass (1.10.1; owner W411-W414, texts W413 2): where the pass's subtitle times
+    // come from, in one dropdown with the pipeline's default (crispasrDefaults) marked. Not a --passN-params
+    // value: Apply stores it in passState.wordTimestamps, sent as --passN-word-timestamps (api._crispasr_pass_args).
+    CRISPASR_WORD_TIMESTAMP_OPTIONS: {
+        model: { text: 'From the model', defaultText: 'From the model (default)' },
+        aligner: { text: 'From the aligner (wav2vec2-ja)', defaultText: 'From the aligner (wav2vec2-ja) (default)' }
+    },
+
+    crispasrDefaultWordTimestamps(pipeline) {
+        const defaults = this.crispasrDefaults[pipeline];
+        return defaults ? defaults.wordTimestamps : null;   // null: not a CrispASR pipeline
+    },
+
+    // Shown only while a CrispASR pass's Customize window is open; openCustomize and closeModal hide it.
+    showTimingTab(show) {
+        const tabBtn = document.querySelector('[data-tab="timing"]');
+        if (tabBtn) tabBtn.style.display = show ? '' : 'none';
+        if (!show) {
+            const panel = document.getElementById('tab-timing');
+            if (panel) panel.innerHTML = '';
+        }
+    },
+
+    generateCrispasrTimingTab(passKey) {
+        const passState = this.state[passKey];
+        const container = document.getElementById('tab-timing');
+        if (!container) return;
+        container.innerHTML = '';
+        const pipelineDefault = this.crispasrDefaultWordTimestamps(passState.pipeline);
+        const current = passState.wordTimestamps || pipelineDefault;
+        const control = document.createElement('div');
+        control.className = 'param-control';
+        const label = document.createElement('label');
+        label.textContent = 'Word timestamps';
+        label.htmlFor = 'crispasrWordTimestamps';
+        control.appendChild(label);
+        const select = document.createElement('select');
+        select.id = 'crispasrWordTimestamps';
+        select.className = 'form-select';
+        for (const [value, texts] of Object.entries(this.CRISPASR_WORD_TIMESTAMP_OPTIONS)) {
+            const option = document.createElement('option');
+            option.value = value;
+            option.textContent = value === pipelineDefault ? texts.defaultText : texts.text;
+            option.selected = value === current;
+            select.appendChild(option);
+        }
+        control.appendChild(select);
+        container.appendChild(control);
     },
 
     generateTabControls(tabId, params, currentValues) {
@@ -2536,62 +3780,12 @@ const EnsembleManager = {
         container.appendChild(control);
     },
 
-    generateInternalVadTab(tabId, engineParams, currentValues) {
-        const container = document.getElementById(tabId);
-
-        // Internal VAD parameters for kotoba pipeline
-        const internalVadParams = {
-            vad_filter: engineParams.vad_filter !== undefined ? engineParams.vad_filter : true,
-            vad_threshold: engineParams.vad_threshold !== undefined ? engineParams.vad_threshold : 0.01,
-            min_speech_duration_ms: engineParams.min_speech_duration_ms || 90,
-            max_speech_duration_s: engineParams.max_speech_duration_s || 28.0,
-            min_silence_duration_ms: engineParams.min_silence_duration_ms || 150,
-            speech_pad_ms: engineParams.speech_pad_ms || 400
-        };
-
-        // Add description header
-        const descDiv = document.createElement('div');
-        descDiv.className = 'tab-description';
-        descDiv.innerHTML = `
-            <p><strong>Internal VAD (faster-whisper built-in)</strong></p>
-            <p>Kotoba pipeline uses faster-whisper's internal Silero VAD for speech detection within each scene.</p>
-        `;
-        container.appendChild(descDiv);
-
-        // Generate controls for each internal VAD parameter
-        for (const [paramName, defaultValue] of Object.entries(internalVadParams)) {
-            const currentValue = currentValues[paramName] !== undefined ? currentValues[paramName] : defaultValue;
-            const metadata = this.parameterMetadata[paramName] || {};
-            const param = {
-                name: paramName,
-                // AUDIT FIX: Pass paramName to inferType for metadata-based type detection
-                type: this.inferType(defaultValue, paramName),
-                description: this.getInternalVadDescription(paramName),
-                constraints: metadata
-            };
-            container.innerHTML += this.generateParamControl(param, currentValue);
-        }
-    },
-
-    getInternalVadDescription(paramName) {
-        const descriptions = {
-            vad_filter: 'Enable/disable internal VAD filtering (recommended: ON)',
-            vad_threshold: 'Speech detection threshold (lower = more sensitive, 0.01 default)',
-            min_speech_duration_ms: 'Minimum speech segment duration in milliseconds',
-            max_speech_duration_s: 'Maximum speech segment duration before splitting',
-            min_silence_duration_ms: 'Minimum silence duration to trigger split',
-            speech_pad_ms: 'Padding added around detected speech segments'
-        };
-        return descriptions[paramName] || '';
-    },
-
     // ========== New Tab Generation Methods (Phase 2) ==========
 
     /**
      * Generate Quality tab - combines transcriber, decoder, and engine params.
-     * For kotoba pipeline, also includes internal VAD params in a separate section.
      */
-    async generateQualityTab(tabId, qualityParams, currentValues, isKotobaPipeline, engineParams) {
+    async generateQualityTab(tabId, qualityParams, currentValues, engineParams) {
         const container = document.getElementById(tabId);
         if (!container) return;
 
@@ -2615,16 +3809,6 @@ const EnsembleManager = {
                 params: ['word_timestamps', 'repetition_penalty', 'no_repeat_ngram_size', 'chunk_length', 'max_initial_timestamp']  // M2 fix: added chunk_length
             }
         };
-
-        // Add kotoba internal VAD section if applicable
-        if (isKotobaPipeline && engineParams) {
-            groups.internalVad = {
-                label: 'Internal VAD (Kotoba)',
-                description: 'Built-in speech detection for kotoba-faster-whisper',
-                params: ['vad_filter', 'vad_threshold', 'min_speech_duration_ms',
-                         'max_speech_duration_s', 'min_silence_duration_ms', 'speech_pad_ms']
-            };
-        }
 
         // Generate each group
         for (const [groupKey, group] of Object.entries(groups)) {
@@ -2940,6 +4124,12 @@ const EnsembleManager = {
                 { value: 'semantic', label: 'Semantic (Texture Clustering)' },
                 { value: 'none', label: 'None (Skip Scene Detection)' }
             ];
+            // R-SCN (1.10.1; owner W448-W455): offered only for a pass whose pipeline accepts it (rscnPipelines; MOSS
+            // in this build), as the row's dropdown does, because main.py refuses it for any other pipeline (exit 2).
+            const customizePass = this.state[this.state.currentCustomize];
+            if (customizePass && this.offersRscn(customizePass.pipeline)) {
+                methodOptions.splice(3, 0, { value: 'rscn', label: 'R-SCN (changes in the sound, picture breaks)' });
+            }
 
             methodOptions.forEach(opt => {
                 const option = document.createElement('option');
@@ -2977,7 +4167,9 @@ const EnsembleManager = {
     async _renderSceneBackendContent(contentDiv, backend, currentValues) {
         contentDiv.innerHTML = '';
 
-        const result = await pywebview.api.get_scene_detector_schema(backend);
+        // The pass's pipeline chooses the rscn preset the tab shows (api.get_scene_detector_schema, 1.10.1).
+        const customizePass = this.state[this.state.currentCustomize];
+        const result = await pywebview.api.get_scene_detector_schema(backend, customizePass ? customizePass.pipeline : '');
 
         if (!result.success) {
             contentDiv.innerHTML = `<p class="tab-error">Failed to load scene detector schema: ${result.error}</p>`;
@@ -3428,7 +4620,7 @@ const EnsembleManager = {
         aligner_backend: 'qwen3', // D7: ForcedAligner ON by default (no native timestamps)
         // Audio tab (qwen-shell framing/VAD — same plumbing as Anime-Whisper).
         // vad_threshold/vad_padding become threshold/speech_pad_ms overrides on
-        // the segmenter selected on the pass row (whisperseg, firered, ...).
+        // the segmenter selected on the pass row (whisperseg, firered-vad, ...).
         framer: 'vad-grouped',
         safe_chunking: true,
         scene_min_duration: 12,
@@ -3472,7 +4664,7 @@ const EnsembleManager = {
         // tab reuses generateQwenAudioTab: framing, scene bounds, VAD grouping
         // and the VAD threshold/padding sliders all ride the same qwen-shell
         // plumbing (prepare_qwen_params), and the VAD sliders override the
-        // segmenter selected on the pass row (whisperseg, firered, silero...).
+        // segmenter selected on the pass row (whisperseg, firered-vad, silero...).
         // Scene/context stay hidden — scene detector and enhancer are chosen
         // on the main Ensemble row.
         const tabMap = { model: 'Model', quality: 'Audio', segmenter: 'Generation', enhancer: 'Alignment' };
@@ -3863,8 +5055,14 @@ const EnsembleManager = {
         const passState = this.state[passKey];
 
         try {
-            // Get Qwen parameter schema from API
-            const result = await pywebview.api.get_qwen_schema();
+            // Get Qwen parameter schema from API. Pass sensitivity, backend AND the
+            // pass's speech segmenter: Python resolves the values the run will use
+            // (v1.9.4, config/chronosjav_vad.py), so Apply sends back what runs.
+            const qwenBackend = passState.isAnimeWhisper ? 'anime-whisper'
+                : (passState.isCohere ? 'cohere' : 'qwen3');
+            const result = await pywebview.api.get_qwen_schema(
+                passState.sensitivity || 'balanced', qwenBackend,
+                passState.speechSegmenter || 'whisperseg');
 
             if (!result.success) {
                 ErrorHandler.show('Error', 'Failed to load Qwen3-ASR parameters: ' + (result.error || 'Unknown error'));
@@ -3888,16 +5086,21 @@ const EnsembleManager = {
                 ? { ...passState.params }
                 : { ...QwenManager.defaults };
 
-            // Override defaults for anime-whisper when not customized
+            // v1.9.4: when not customized, every segmenter-dependent value comes from
+            // the schema, which Python resolved for this pass's model, sensitivity and
+            // segmenter (what the run will use). A control the segmenter does not have
+            // is absent from the schema and is dropped here, so Apply never sends it.
+            if (!passState.customized) {
+                QwenManager.applySegmenterDefaults(currentValues, result.schema);
+            }
+
+            // Override defaults for anime-whisper when not customized.
+            // 1.10.0: anime-whisper takes the aligner and timing model like Qwen3-ASR.
             if (passState.isAnimeWhisper && !passState.customized) {
                 currentValues.model_id = 'litagin/anime-whisper';
                 currentValues.repetition_penalty = 1.0;
                 currentValues.context = '';
-                currentValues.timestamp_mode = 'vad_only';
                 currentValues.assembly_cleaner = 'passthrough';
-                currentValues.stepdown = false;
-                currentValues.chunk_threshold = 0.5;
-                currentValues.max_group_duration = 5;
             }
 
             // Override defaults for cohere when not customized (v1.8.14 D2/D3/D7).
@@ -3913,10 +5116,10 @@ const EnsembleManager = {
                 currentValues.max_new_tokens = 512;                  // D2
                 currentValues.timestamp_mode = 'aligner_vad_fallback'; // D7: aligner ON
                 currentValues.assembly_cleaner = 'passthrough';      // D3
-                currentValues.stepdown = true;
-                currentValues.chunk_threshold = 1.0;
+                currentValues.stepdown = false;                      // 1.10.0, owner W266 1
+                currentValues.chunk_threshold_ms = 1000;
                 currentValues.max_group_duration = 6;
-                currentValues.aligner_backend = 'qwen3';             // D7 default
+                currentValues.aligner_backend = 'crispasr';          // D7; 1.10.0: CrispASR aligner
                 currentValues.language = 'Japanese';
             }
 
@@ -3999,10 +5202,22 @@ const EnsembleManager = {
             ];
             modelDefault = 'CohereLabs/cohere-transcribe-03-2026';
         }
+        // v1.9.3 (owner, 2026-09-17): the window shows the model the ROW has, so
+        // there is one answer and it is the one that runs. Before this the window
+        // showed its own value while pass_worker took the row's, so a model chosen
+        // here was displayed as accepted and then quietly discarded.
+        const rowModel = passState && passState.model;
+        if (rowModel && !modelOptions.some(o => o.value === rowModel)) {
+            // The row offers a few models this window's list does not. Show it
+            // rather than silently substituting one of ours, which is how the two
+            // came to disagree in the first place.
+            modelOptions = modelOptions.concat([{ value: rowModel, label: rowModel }]);
+        }
+
         container.appendChild(this.createTransformersDropdown(
             'model_id', modelDef.label,
             modelOptions,
-            currentValues.model_id || modelDefault,
+            rowModel || currentValues.model_id || modelDefault,
             modelDef.description
         ));
 
@@ -4189,6 +5404,17 @@ const EnsembleManager = {
             maxDef.description
         ));
 
+        // v1.9.2 (CFF2): semantic clustering threshold (scene-change sensitivity)
+        const clusterDef = schemaSection.scene_clustering_threshold;
+        if (clusterDef) {
+            boundsContainer.appendChild(this.createTransformersSlider(
+                'scene_clustering_threshold', clusterDef.label,
+                clusterDef.min, clusterDef.max, clusterDef.step,
+                currentValues.scene_clustering_threshold ?? clusterDef.default,
+                clusterDef.description
+            ));
+        }
+
         boundsDetails.appendChild(boundsContainer);
         container.appendChild(boundsDetails);
 
@@ -4198,13 +5424,14 @@ const EnsembleManager = {
         vadHeader.textContent = 'VAD Grouping';
         container.appendChild(vadHeader);
 
-        // Frame Gap Threshold slider (O2: chunk_threshold_s)
-        const chunkDef = schemaSection.chunk_threshold;
+        // Frame Gap Threshold slider — GUI in ms (chunk_threshold_ms); converted to
+        // chunk_threshold (seconds) at pack time in api.py.
+        const chunkDef = schemaSection.chunk_threshold_ms;
         if (chunkDef) {
             container.appendChild(this.createTransformersSlider(
-                'chunk_threshold', chunkDef.label,
+                'chunk_threshold_ms', chunkDef.label,
                 chunkDef.min, chunkDef.max, chunkDef.step,
-                currentValues.chunk_threshold ?? chunkDef.default,
+                currentValues.chunk_threshold_ms ?? chunkDef.default,
                 chunkDef.description
             ));
         }
@@ -4229,20 +5456,79 @@ const EnsembleManager = {
         vadContainer.className = 'details-content';
 
         const thrDef = schemaSection.vad_threshold;
-        vadContainer.appendChild(this.createTransformersSlider(
-            'vad_threshold', thrDef.label,
-            thrDef.min, thrDef.max, thrDef.step,
-            currentValues.vad_threshold ?? thrDef.default,
-            thrDef.description
-        ));
+        if (thrDef) {  // absent when the pass has no speech segmenter (None)
+            vadContainer.appendChild(this.createTransformersSlider(
+                'vad_threshold', thrDef.label,
+                thrDef.min, thrDef.max, thrDef.step,
+                currentValues.vad_threshold ?? thrDef.default,
+                thrDef.description
+            ));
+        }
 
-        const padDef = schemaSection.vad_padding;
-        vadContainer.appendChild(this.createTransformersSlider(
-            'vad_padding', padDef.label,
-            padDef.min, padDef.max, padDef.step,
-            currentValues.vad_padding ?? padDef.default,
-            padDef.description
-        ));
+        const startPadDef = schemaSection.vad_start_pad;
+        if (startPadDef) {
+            vadContainer.appendChild(this.createTransformersSlider(
+                'vad_start_pad', startPadDef.label,
+                startPadDef.min, startPadDef.max, startPadDef.step,
+                currentValues.vad_start_pad ?? startPadDef.default,
+                startPadDef.description
+            ));
+        }
+        const endPadDef = schemaSection.vad_end_pad;
+        if (endPadDef) {
+            vadContainer.appendChild(this.createTransformersSlider(
+                'vad_end_pad', endPadDef.label,
+                endPadDef.min, endPadDef.max, endPadDef.step,
+                currentValues.vad_end_pad ?? endPadDef.default,
+                endPadDef.description
+            ));
+        }
+
+        // v1.9.0 offline-decoder levers (code-review fix): these four fields
+        // were schema-declared (api.py) and mapped end-to-end in pass_worker,
+        // but no controls were ever rendered — the GUI tuning path did not
+        // exist. Rendered here inside VAD Settings; collection is generic
+        // over .param-control elements, so no collector changes are needed.
+        const decDef = schemaSection.vad_decoder;
+        if (decDef) {
+            const decControl = document.createElement('div');
+            decControl.className = 'param-control';
+            decControl.dataset.param = 'vad_decoder';
+
+            const decLabel = document.createElement('label');
+            decLabel.textContent = decDef.label;
+            decControl.appendChild(decLabel);
+
+            const decSelect = document.createElement('select');
+            decSelect.className = 'param-select';
+            // Fallback = WhisperSeg's own default (hysteresis); the schema normally supplies it.
+            const currentDec = currentValues.vad_decoder || decDef.default || 'hysteresis';
+            decDef.options.forEach(opt => {
+                const option = document.createElement('option');
+                option.value = opt.value;
+                option.textContent = opt.label;
+                if (opt.value === currentDec) option.selected = true;
+                decSelect.appendChild(option);
+            });
+            decControl.appendChild(decSelect);
+
+            const decDesc = document.createElement('p');
+            decDesc.className = 'param-description';
+            decDesc.textContent = decDef.description;
+            decControl.appendChild(decDesc);
+            vadContainer.appendChild(decControl);
+        }
+        for (const leverKey of ['vad_grow_floor', 'vad_gap_merge_ms', 'max_speech_duration']) {
+            const leverDef = schemaSection[leverKey];
+            if (leverDef) {
+                vadContainer.appendChild(this.createTransformersSlider(
+                    leverKey, leverDef.label,
+                    leverDef.min, leverDef.max, leverDef.step,
+                    currentValues[leverKey] ?? leverDef.default,
+                    leverDef.description
+                ));
+            }
+        }
 
         vadDetails.appendChild(vadContainer);
         container.appendChild(vadDetails);
@@ -4284,7 +5570,7 @@ const EnsembleManager = {
                 'Enhanced audio drives VAD segment boundaries; original (non-enhanced) ' +
                 'audio is fed to the ASR model. Prevents enhancement artifacts from ' +
                 'degrading transcription while still benefiting from cleaner VAD. ' +
-                'Requires a non-passthrough speech enhancer (e.g. clearvoice, bs-roformer).';
+                'Requires a non-passthrough speech enhancer (e.g. zipenhancer, htdemucs).';
             efvControl.appendChild(efvDesc);
             container.appendChild(efvControl);
         }
@@ -4317,6 +5603,17 @@ const EnsembleManager = {
             currentValues.max_new_tokens ?? tokensDef.default,
             tokensDef.description
         ));
+
+        // v1.9.4: anime-whisper only (the schema carries it only for that backend)
+        const lsDef = schemaSection.leading_silence_ms;
+        if (lsDef) {
+            container.appendChild(this.createTransformersSlider(
+                'leading_silence_ms', lsDef.label,
+                lsDef.min, lsDef.max, lsDef.step,
+                currentValues.leading_silence_ms ?? lsDef.default,
+                lsDef.description
+            ));
+        }
 
         // Generation Safety (collapsed <details>)
         const safetyDetails = document.createElement('details');
@@ -4367,21 +5664,49 @@ const EnsembleManager = {
             abDef.description
         ));
 
-        // Aligner model dropdown
+        // Aligner model dropdown: the models of the chosen backend (1.10.0: each option
+        // names its backend, "crispasr" or "qwen3"; the list is rebuilt when the backend changes).
         const aiDef = schemaSection.aligner_id;
+        const backendOf = (value) => {
+            const opt = aiDef.options.find(o => o.value === value);
+            return opt ? opt.backend : null;
+        };
+        const startBackend = currentValues.aligner_backend || abDef.default;
+        let startAligner = currentValues.aligner_id || aiDef.default;
+        if (backendOf(startAligner) !== startBackend) {
+            const first = aiDef.options.find(o => o.backend === startBackend);
+            startAligner = first ? first.value : aiDef.default;
+        }
         container.appendChild(this.createTransformersDropdown(
             'aligner_id', aiDef.label,
             aiDef.options,
-            currentValues.aligner_id || aiDef.default,
-            'ForcedAligner model for word-level timestamps'
+            startAligner,
+            'Aligner model for word-level timestamps'
         ));
 
-        // 3-minute limit note
+        // 3-minute limit note (the PyTorch Qwen3 ForcedAligner only)
         const noteDiv = document.createElement('div');
         noteDiv.className = 'param-note';
         noteDiv.innerHTML = 'ForcedAligner has a <strong>3-minute segment limit</strong>. ' +
             'Enable Safe Chunking (Audio tab) to enforce scene boundaries.';
         container.appendChild(noteDiv);
+
+        const abSelect = container.querySelector('[data-param="aligner_backend"] .param-select');
+        const aiSelect = container.querySelector('[data-param="aligner_id"] .param-select');
+        const fillAlignerModels = () => {
+            if (!abSelect || !aiSelect) return;
+            const backend = abSelect.value;
+            const keep = aiSelect.value;
+            const options = aiDef.options.filter(o => o.backend === backend);
+            aiSelect.replaceChildren(...options.map(o => {
+                const option = document.createElement('option');
+                option.value = o.value;
+                option.textContent = o.label;
+                return option;
+            }));
+            if (options.some(o => o.value === keep)) aiSelect.value = keep;
+        };
+        fillAlignerModels();
 
         // ─ Text Cleaner section ─
         const cleanerHeader = document.createElement('div');
@@ -4410,6 +5735,22 @@ const EnsembleManager = {
             currentValues.timestamp_mode || tsDef.default,
             tsDef.description
         ));
+
+        // ─ Timing Model section (1.10.0, item 12) ─ shown in every timestamp mode: without
+        // an aligner it still moves each subtitle's start to where the speech starts.
+        const tmDef = schemaSection.timing_model;
+        if (tmDef) {
+            const tmHeader = document.createElement('div');
+            tmHeader.className = 'param-group-header';
+            tmHeader.textContent = 'Timing Model';
+            container.appendChild(tmHeader);
+            container.appendChild(this.createTransformersDropdown(
+                'timing_model', tmDef.label,
+                tmDef.options,
+                currentValues.timing_model || tmDef.default,
+                tmDef.description
+            ));
+        }
 
         // ─ Step-Down Retry section ─
         const sdHeader = document.createElement('div');
@@ -4489,6 +5830,11 @@ const EnsembleManager = {
 
             alignerElements.forEach(el => { if (el) el.style.display = hideAligner ? 'none' : ''; });
             stepdownElements.forEach(el => { if (el) el.style.display = hideStepdown ? 'none' : ''; });
+            // No model list for "None"; the 3-minute note is the PyTorch ForcedAligner's.
+            const backendVal = abSelect ? abSelect.value : '';
+            const aiControl = container.querySelector('[data-param="aligner_id"]');
+            if (!hideAligner && aiControl) aiControl.style.display = backendVal === 'none' ? 'none' : '';
+            if (!hideAligner) noteDiv.style.display = backendVal === 'qwen3' ? '' : 'none';
 
             // Also hide step-down for fixed-boundary framers (srt-source, manual)
             if (!hideStepdown && passKey) {
@@ -4504,6 +5850,10 @@ const EnsembleManager = {
         const tsDropdown = container.querySelector('[data-param="timestamp_mode"] .param-select');
         if (tsDropdown) {
             tsDropdown.addEventListener('change', updateVisibility);
+        }
+        // And for the aligner backend: its model list, then what is shown
+        if (abSelect) {
+            abSelect.addEventListener('change', () => { fillAlignerModels(); updateVisibility(); });
         }
 
         // Initial visibility
@@ -4560,10 +5910,18 @@ const EnsembleManager = {
         modelSelect.className = 'param-select form-select';
         modelSelect.id = 'model-select';
 
+        // Must contain every value any pipeline's pipelineModelCompatibility list can
+        // name. This table is filtered by that list a few lines below, so a model present
+        // in the compatibility list but missing HERE cannot be shown -- and because
+        // generateModelTab then falls back to allowedModels[0], the dialog would silently
+        // offer large-v2 in its place and applyCustomization would sync that back over the
+        // row. That is exactly what happened to whisper-ja-1.5B-ct2 when it was added to
+        // pipelineModelCompatibility.balanced without being added here.
         const allModelOptions = [
             { value: 'turbo', label: 'Turbo (Fastest)' },
             { value: 'large-v2', label: 'Large-v2 (Balanced)' },
             { value: 'large-v3', label: 'Large-v3 (Latest)' },
+            { value: 'TransWithAI/whisper-ja-1.5B-ct2', label: 'whisper-ja-1.5B (CT2, JA)' },
             { value: 'kotoba-tech/kotoba-whisper-v2.0-faster', label: 'Kotoba-faster-2.0 (Japanese)' },
             { value: 'RoachLin/kotoba-whisper-v2.2-faster', label: 'Kotoba-faster-2.2 (Japanese)' }
         ];
@@ -4612,8 +5970,9 @@ const EnsembleManager = {
         deviceSelect.id = 'device-select';
 
         const deviceOptions = [
-            { value: 'cuda', label: 'CUDA (GPU)' },
-            { value: 'cpu', label: 'CPU' }
+            { value: 'auto', label: 'Auto (the GPU when one can be used, else the CPU)' },
+            { value: 'cuda', label: 'NVIDIA GPU (CUDA)' },
+            { value: 'cpu', label: 'CPU (not accelerated)' }
         ];
 
         deviceOptions.forEach(opt => {
@@ -4628,7 +5987,7 @@ const EnsembleManager = {
 
         const deviceDesc = document.createElement('p');
         deviceDesc.className = 'param-description';
-        deviceDesc.textContent = 'Processing device. CUDA (GPU) is much faster if available.';
+        deviceDesc.textContent = 'Where this runs. An NVIDIA GPU (CUDA) is much faster than the CPU (not accelerated).';
         deviceControl.appendChild(deviceDesc);
 
         container.appendChild(deviceControl);
@@ -4908,7 +6267,7 @@ const EnsembleManager = {
 
         // Collect values from all tab panels (includes context tab for Qwen).
         // Enhancer tab params are routed to a separate dict because neural
-        // enhancer backends (zipenhancer, clearvoice, bs-roformer) expose
+        // enhancer backends (zipenhancer, bs-roformer, htdemucs) expose
         // "device" and "model" keys that collide with the ASR model tab's
         // identically-named keys. The enhancer backend receives its config
         // via --passN-speech-enhancer, not via --passN-params.
@@ -4917,7 +6276,10 @@ const EnsembleManager = {
             const panel = document.getElementById(`tab-${tab}`);
             if (!panel) return;
 
-            const target = (tab === 'enhancer') ? enhancerParams : fullParams;
+            // A ChronosJAV (Qwen-family) window puts its Alignment tab in the 'enhancer' panel
+            // (generateQwenTabs): those are pass settings, not enhancer settings, so they go
+            // with the rest. Before 1.10.0 they were set aside here and never reached the run.
+            const target = (tab === 'enhancer' && !passState.isQwen) ? enhancerParams : fullParams;
 
             // Collect standard param-control values
             panel.querySelectorAll('.param-control').forEach(control => {
@@ -5070,6 +6432,73 @@ const EnsembleManager = {
             if (dropdown) dropdown.value = fullParams.scene_detection_method;
         }
 
+        // v1.9.3: sync model_name to the row, the same bidirectional sync the scene
+        // detector gets above. For the legacy pipelines the MODAL wins at run time --
+        // pass_worker applies the row's --passN-model via _apply_gui_overrides and THEN
+        // the modal's params via apply_custom_params, whose MODEL_PARAMS includes
+        // model_name -- so without this the row displayed a model the run would not use.
+        //
+        // Only for legacy, because those modals use the param name 'model_name'.
+        // The Transformers and Qwen modals use 'model_id' and so never reach this
+        // branch. For them pass_worker sets hf_model_id / qwen_model_id from
+        // pass_config["model"] -- the ROW -- so the row is what runs. The Qwen
+        // family is handled in its own branch below (v1.9.3), which writes the
+        // window's choice onto the row so the two cannot disagree. Transformers
+        // still has the older behaviour: its window shows its own model while the
+        // row is what runs. Same shape, not yet done.
+        //
+        // The guard matters. Both sides filter by pipelineModelCompatibility, but the
+        // modal filters a SECOND table (allModelOptions in generateModelTab) that the row
+        // does not, so the two can still diverge if a model is added to one and not the
+        // other. When they diverge the modal shows allowedModels[0] instead, and without
+        // this guard that substitute would be written silently over the user's row choice.
+        // Assigning an absent value to a <select> is ignored, so syncing unconditionally
+        // would also leave the row and the state disagreeing.
+        if (fullParams.model_name && !passState.isTransformers && !passState.isQwen) {
+            const modelDropdown = document.getElementById(`${passKey}-model`);
+            if (modelDropdown) {
+                const offered = Array.from(modelDropdown.options)
+                    .some(o => o.value === fullParams.model_name);
+                if (offered) {
+                    modelDropdown.value = fullParams.model_name;
+                    this.state[passKey].model = fullParams.model_name;
+                } else {
+                    ConsoleManager.log(
+                        `Pass ${passKey === 'pass1' ? '1' : '2'}: the settings window chose ` +
+                        `the model "${fullParams.model_name}", which is not in the list for ` +
+                        `${this.pipelineLabel(passKey)}. The list still shows ` +
+                        `"${modelDropdown.value}", but the run will use ` +
+                        `"${fullParams.model_name}".`, 'warn');
+                }
+            }
+        }
+
+        // v1.9.3 (owner, 2026-09-17): the Qwen family's window uses the param name
+        // 'model_id', so it never reached the branch above and a model chosen there
+        // was shown as accepted and then discarded -- pass_worker sets qwen_model_id
+        // from the ROW. Now the window writes back to the row, so the row stays the
+        // single answer and the user's choice is the one that runs. Same guard as
+        // above: a value the row does not offer is reported rather than lost, since
+        // assigning an absent value to a <select> does nothing.
+        if (fullParams.model_id && passState.isQwen) {
+            const modelDropdown = document.getElementById(`${passKey}-model`);
+            if (modelDropdown) {
+                const offered = Array.from(modelDropdown.options)
+                    .some(o => o.value === fullParams.model_id);
+                if (offered) {
+                    modelDropdown.value = fullParams.model_id;
+                    this.state[passKey].model = fullParams.model_id;
+                } else {
+                    ConsoleManager.log(
+                        `Pass ${passKey === 'pass1' ? '1' : '2'}: the settings window chose ` +
+                        `the model "${fullParams.model_id}", which is not in the list for ` +
+                        `${this.pipelineLabel(passKey)}, so the list still shows ` +
+                        `"${modelDropdown.value}" and that is what will run. Pick the ` +
+                        `model in the row instead.`, 'warn');
+                }
+            }
+        }
+
         // Sync framer from modal to state (Qwen only)
         if (fullParams.framer && this.state[passKey].isQwen) {
             this.state[passKey].framer = fullParams.framer;
@@ -5079,6 +6508,28 @@ const EnsembleManager = {
         const efvCheck = document.getElementById('modal-enhance-for-vad');
         if (efvCheck !== null) {
             this.state[passKey].enhanceForVad = efvCheck.checked;
+        }
+
+        // Repaint the row so its tick box shows what was just applied. Writing
+        // the state is not enough: the row is only redrawn when something asks
+        // it to, so without this the window said "on", the row said "off", and
+        // the run used the value from the window (owner's GUI test A4).
+        this.updateEnhanceForVadCheckbox(passKey);
+
+        // A ChronosJAV pass's aligner and timing model may have changed (1.10.0).
+        if (passState.isQwen) this.updateCrispasrStatus(passKey);
+
+        // A CrispASR pass's Timing tab (1.10.1; owner W413 2): kept apart from the params (it is sent as
+        // --passN-word-timestamps); null when it names the pipeline's default. The status panel then shows
+        // the aligner line when the aligner is chosen.
+        if (passState.isCrispasr) {
+            const wordTimestamps = document.getElementById('crispasrWordTimestamps');
+            if (wordTimestamps) {
+                passState.wordTimestamps =
+                    wordTimestamps.value === this.crispasrDefaultWordTimestamps(passState.pipeline)
+                        ? null : wordTimestamps.value;
+            }
+            this.updateCrispasrStatus(passKey);
         }
 
         const paramCount = Object.keys(fullParams).length;
@@ -5218,7 +6669,7 @@ const EnsembleManager = {
         if (!applyBtn) return;
 
         // Store original state
-        const originalText = applyBtn.textContent;
+        const originalText = I18n.englishText(applyBtn);  // put back in whatever language is on then
         const originalClass = applyBtn.className;
 
         // Show success state
@@ -5286,7 +6737,7 @@ const EnsembleManager = {
         // Flatten all defaults including model
         const defaults = {
             model_name: this._currentDefaults.model || 'large-v2',
-            device: 'cuda',
+            device: 'auto',
             ...this._currentDefaults.transcriber,
             ...this._currentDefaults.decoder,
             ...this._currentDefaults.engine,
@@ -5294,8 +6745,9 @@ const EnsembleManager = {
             ...this._currentDefaults.scene
         };
 
-        // Reset all controls in all tabs (new structure: model, quality, segmenter, enhancer, scene)
-        const tabs = ['model', 'quality', 'segmenter', 'enhancer', 'scene'];
+        // Reset all controls in all tabs (new structure: model, quality, segmenter, enhancer, scene; context holds
+        // a MOSS-CrispASR pass's MOSS tab, 1.10.1)
+        const tabs = ['model', 'quality', 'segmenter', 'enhancer', 'scene', 'context'];
         tabs.forEach(tab => {
             const panel = document.getElementById(`tab-${tab}`);
             if (!panel) return;
@@ -5314,8 +6766,11 @@ const EnsembleManager = {
                 if (checkbox) {
                     checkbox.checked = defaultValue;
                 } else if (slider) {
+                    // A schema slider (Segmenter, Scene) has no number box beside it, only its value label.
                     slider.value = defaultValue;
-                    control.querySelector('.param-number').value = defaultValue;
+                    if (number) number.value = defaultValue;
+                    const valueDisplay = control.querySelector('.slider-value');
+                    if (valueDisplay) valueDisplay.textContent = slider.value;
                 } else if (number) {
                     number.value = defaultValue;
                 } else if (text) {
@@ -5347,6 +6802,13 @@ const EnsembleManager = {
         passState.params = null;
         passState.customized = false;
         passState.presetName = null;
+
+        // A CrispASR pass's Timing tab (1.10.1): back to the pipeline's own word timestamps.
+        if (passState.isCrispasr) {
+            passState.wordTimestamps = null;
+            this.generateCrispasrTimingTab(passKey);
+            this.updateCrispasrStatus(passKey);
+        }
 
         const passLabel = passKey === 'pass1' ? 'Pass 1' : 'Pass 2';
         ConsoleManager.log(`Reset ${passLabel} to defaults`, 'info');
@@ -5425,15 +6887,19 @@ const EnsembleManager = {
         // Reset Qwen controls using QwenManager defaults
         const passState = this.state[passKey];
         const defaults = { ...(QwenManager.defaults || {}) };
+        // v1.9.4: the segmenter-dependent values come from the schema the dialog
+        // was opened with (resolved in Python for this pass), not from the fixed
+        // list above, which was wrong for anime-whisper and for non-WhisperSeg passes.
+        if (this._qwenSchema) {
+            QwenManager.applySegmenterDefaults(defaults, this._qwenSchema);
+            const ls = this._qwenSchema.generation && this._qwenSchema.generation.leading_silence_ms;
+            if (ls) defaults.leading_silence_ms = ls.default;   // v1.9.4 anime-whisper lead-in
+        }
         if (passState.isAnimeWhisper) {
             defaults.model_id = 'litagin/anime-whisper';
             defaults.repetition_penalty = 1.0;
             defaults.context = '';
-            defaults.timestamp_mode = 'vad_only';
             defaults.assembly_cleaner = 'passthrough';
-            defaults.stepdown = false;
-            defaults.chunk_threshold = 0.5;
-            defaults.max_group_duration = 5;
         } else if (passState.isCohere) {
             // Cohere defaults — mirror the openCustomize override (D2/D3/D7).
             defaults.model_id = 'CohereLabs/cohere-transcribe-03-2026';
@@ -5441,10 +6907,10 @@ const EnsembleManager = {
             defaults.max_new_tokens = 512;
             defaults.timestamp_mode = 'aligner_vad_fallback';
             defaults.assembly_cleaner = 'passthrough';
-            defaults.stepdown = true;
-            defaults.chunk_threshold = 1.0;
+            defaults.stepdown = false;   // 1.10.0, owner W266 1
+            defaults.chunk_threshold_ms = 1000;
             defaults.max_group_duration = 6;
-            defaults.aligner_backend = 'qwen3';
+            defaults.aligner_backend = 'crispasr';
             defaults.language = 'Japanese';
         }
 
@@ -5482,10 +6948,21 @@ const EnsembleManager = {
             });
         });
 
+        // Alignment tab (1.10.0): the aligner model list follows the backend, so rebuild it for the
+        // default backend, then pick the default model, then refresh what is shown.
+        const alignTab = document.getElementById('tab-enhancer');
+        const abReset = alignTab && alignTab.querySelector('[data-param="aligner_backend"] .param-select');
+        const aiReset = alignTab && alignTab.querySelector('[data-param="aligner_id"] .param-select');
+        if (abReset) abReset.dispatchEvent(new Event('change'));
+        if (aiReset && defaults.aligner_id !== undefined) aiReset.value = defaults.aligner_id;
+        const tsReset = alignTab && alignTab.querySelector('[data-param="timestamp_mode"] .param-select');
+        if (tsReset) tsReset.dispatchEvent(new Event('change'));
+
         // Clear customized state
         this.state[passKey].params = null;
         this.state[passKey].customized = false;
         this.state[passKey].presetName = null;
+        this.updateCrispasrStatus(passKey);
 
         const passLabel = passKey === 'pass1' ? 'Pass 1' : 'Pass 2';
         const pipelineName = passState.isAnimeWhisper
@@ -5502,6 +6979,7 @@ const EnsembleManager = {
             if (modal) {
                 modal.classList.remove('active');
             }
+            this.showTimingTab(false);
             this.state.currentCustomize = null;
         } catch (error) {
             ConsoleManager.log(`Close modal failed: ${error.message}`, 'error');
@@ -5568,12 +7046,13 @@ const EnsembleManager = {
         // Collect custom params from the modal form (same logic as applyCustomization).
         // Enhancer tab is excluded — its params (device, model) collide with ASR keys
         // and the enhancer backend receives config via --passN-speech-enhancer, not params.
+        // A ChronosJAV window's 'enhancer' panel is its Alignment tab: kept (1.10.0).
         const params = {};
         const tabs = ['model', 'quality', 'segmenter', 'enhancer', 'scene', 'context'];
         tabs.forEach(tab => {
             const panel = document.getElementById(`tab-${tab}`);
             if (!panel) return;
-            if (tab === 'enhancer') return;  // Skip — same isolation as applyCustomization()
+            if (tab === 'enhancer' && !passState.isQwen) return;  // same isolation as applyCustomization()
             panel.querySelectorAll('.param-control').forEach(control => {
                 const paramName = control.dataset.param;
                 if (!paramName) return;
@@ -5606,6 +7085,7 @@ const EnsembleManager = {
             sceneDetector: passState.sceneDetector,
             speechEnhancer: passState.speechEnhancer,
             speechSegmenter: passState.speechSegmenter,
+            vadVersion: passState.vadVersion || this.defaultVadVersion,
             model: passState.model,
             customized: true,
             params: params,
@@ -5617,7 +7097,16 @@ const EnsembleManager = {
             framer: passState.isQwen ? (passState.framer || 'vad-grouped') : null,
             dspEffects: passState.dspEffects || null,
             enhanceForVad: passState.enhanceForVad || false,
+            // A CrispASR pass's Timing tab as the window shows it (1.10.1; owner W418 3); null = the pipeline's default.
+            wordTimestamps: this._timingForPreset(passState),
         };
+    },
+
+    _timingForPreset(passState) {
+        if (!passState.isCrispasr) return null;
+        const select = document.getElementById('crispasrWordTimestamps');
+        const value = select ? select.value : passState.wordTimestamps;
+        return (value && value !== this.crispasrDefaultWordTimestamps(passState.pipeline)) ? value : null;
     },
 
     /** Prompt user for a name and save current modal params as a preset. */
@@ -5632,7 +7121,7 @@ const EnsembleManager = {
                     : (passState.isQwen ? 'Qwen' : (passState.isTransformers ? 'Transformers'
                         : passState.pipeline.charAt(0).toUpperCase() + passState.pipeline.slice(1)))))
             : 'Unknown';
-        const name = prompt(`Save preset for ${pipelineLabel} pipeline.\nPreset name:`);
+        const name = prompt(I18n.t(`Save preset for ${pipelineLabel} pipeline.\nPreset name:`));
         if (!name || !name.trim()) return;
 
         const data = this._collectPresetData();
@@ -5698,8 +7187,14 @@ const EnsembleManager = {
             if (preset.pipeline) passState.pipeline = preset.pipeline;
             if (preset.sensitivity) passState.sensitivity = preset.sensitivity;
             if (preset.sceneDetector) passState.sceneDetector = preset.sceneDetector;
-            if (preset.speechEnhancer !== undefined) passState.speechEnhancer = preset.speechEnhancer;
+            // v1.10.0 (item 3): a removed enhancer (ClearVoice) is not taken into the
+            // state; the pass is marked below instead.
+            const presetEnhancerRemoved = this.isRemovedEnhancer(preset.speechEnhancer);
+            if (preset.speechEnhancer !== undefined && !presetEnhancerRemoved) {
+                passState.speechEnhancer = preset.speechEnhancer;
+            }
             if (preset.speechSegmenter) passState.speechSegmenter = preset.speechSegmenter;
+            if (preset.vadVersion) passState.vadVersion = preset.vadVersion;
             if (preset.model) passState.model = preset.model;
             if (preset.framer) passState.framer = preset.framer;
             if (preset.dspEffects) passState.dspEffects = preset.dspEffects;
@@ -5712,17 +7207,69 @@ const EnsembleManager = {
             passState.customized = true;
             passState.params = preset.params || null;
             passState.presetName = name;
+            // 1.10.1: the CrispASR mark and the Timing tab follow the preset's pipeline. A CrispASR preset brings its
+            // Timing value (owner W418 3); any other preset, or one saved without the value, starts on the
+            // pipeline's own word timestamps.
+            passState.isCrispasr = this.isCrispasrPipeline(passState.pipeline);
+            const savedTiming = preset.wordTimestamps;
+            passState.wordTimestamps = (passState.isCrispasr && (savedTiming === 'model' || savedTiming === 'aligner'))
+                ? savedTiming : null;
+            if (passState.isCrispasr) {
+                this.generateCrispasrTimingTab(passKey);
+                this.showTimingTab(true);
+            } else {
+                this.showTimingTab(false);
+            }
+            this.updateCrispasrStatus(passKey);   // the aligner line follows the loaded value
 
             // Update pass row dropdowns silently (no dispatchEvent to avoid confirm dialogs)
+            // v1.9.3: verify the assignment took. Assigning a value a <select> does not
+            // offer sets selectedIndex to -1 and value to '', leaving the control BLANK
+            // while passState still holds the preset's value -- the row and the state then
+            // disagree and collectConfig sends the state. A preset saved on one pipeline
+            // and loaded onto another can carry exactly such a value.
             const setSilent = (id, val) => {
                 const el = document.getElementById(id);
-                if (el && val !== undefined && val !== null) el.value = val;
+                if (!el || val === undefined || val === null) return;
+                const before = el.value;
+                el.value = val;
+                if (el.tagName === 'SELECT' && el.value !== String(val)) {
+                    // The assignment already blanked the control -- put back what was
+                    // there. Without this the dropdown is left empty while passState
+                    // still holds the preset's value, collectConfig sends the state, and
+                    // collectAll later writes the blank to the settings file.
+                    el.value = before;
+                    ConsoleManager.log(
+                        `Preset "${name}": "${val}" is not available for ` +
+                        `${EnsembleManager.pipelineLabel(passKey)}, so ` +
+                        `"${el.value || 'nothing'}" has been kept instead.`, 'warn');
+                }
             };
             setSilent(`${prefix}-pipeline`, preset.pipeline);
             setSilent(`${prefix}-sensitivity`, preset.sensitivity);
             setSilent(`${prefix}-scene`, preset.sceneDetector);
+            this.updateRscnOption(passKey);   // a preset's rscn is kept only where the pipeline offers it (1.10.1)
+            // The list no longer offers a removed enhancer, so setSilent keeps the
+            // current entry and logs its warning naming the preset's value; the pass is
+            // then marked. A preset that sets an enhancer the list offers is a choice,
+            // so it clears an earlier mark.
             setSilent(`${prefix}-enhancer`, preset.speechEnhancer);
-            setSilent(`${prefix}-segmenter`, preset.speechSegmenter);
+            if (presetEnhancerRemoved) {
+                this.markRemovedEnhancer(passKey, preset.speechEnhancer);
+            } else if (preset.speechEnhancer !== undefined && preset.speechEnhancer !== null
+                    && document.getElementById(`${prefix}-enhancer`)?.value === String(preset.speechEnhancer)) {
+                this.clearRemovedEnhancer(passKey);
+            }
+            // v1.9.2: a preset saved before this release can hold an external
+            // segmenter for a balanced pass. That combination no longer exists, so
+            // rebuild the dropdown for the preset's pipeline and show the VAD
+            // version instead of writing a value the list no longer contains.
+            this.populateSegmenterOptions(passKey);
+            if (passState.pipeline === 'balanced') {
+                setSilent(`${prefix}-segmenter`, passState.vadVersion || this.defaultVadVersion);
+            } else {
+                setSilent(`${prefix}-segmenter`, preset.speechSegmenter);
+            }
 
             if (oldType !== newType) {
                 // Pipeline type changed — swap model options first, then set model
@@ -5738,6 +7285,13 @@ const EnsembleManager = {
                 // openCustomize reads passState.customized && passState.params to populate
                 await this.openCustomize(passKey);
             } else {
+                // v1.9.3: rebuild the model list first for a legacy->legacy change. All
+                // four legacy pipelines share the type 'legacy', so oldType === newType
+                // here even when the preset moves the pass from (say) Fidelity to
+                // Balanced, and the row would keep the previous pipeline's model list.
+                if (newType === 'legacy') {
+                    this.swapModelOptions(passKey, newType);
+                }
                 // Same pipeline type — set model and apply params inline
                 setSilent(`${prefix}-model`, preset.model);
 
@@ -5785,7 +7339,7 @@ const EnsembleManager = {
         const name = selector ? selector.value : '';
         if (!name) return;
 
-        if (!confirm(`Delete preset "${name}"?`)) return;
+        if (!confirm(I18n.t(`Delete preset "${name}"?`))) return;
 
         try {
             const result = await pywebview.api.delete_preset(name);
@@ -5809,6 +7363,7 @@ const EnsembleManager = {
         // Helpers for pipeline-specific null handling:
         // - Sensitivity: null only for Transformers (Qwen now uses sensitivity presets)
         // - Segmenter: null for Transformers only (Qwen uses segmenter as post-ASR VAD filter)
+        // The CrispASR pipelines send both: they use the speech segmenter and its sensitivity.
         const disableSensitivity = (passState) => passState.isTransformers || passState.isSenseVoice;
         const disableSegmenter = (passState) => passState.isTransformers || passState.isSenseVoice;  // NOT Qwen!
 
@@ -5821,7 +7376,10 @@ const EnsembleManager = {
                 sceneDetector: this.state.pass1.sceneDetector,
                 speechEnhancer: this.state.pass1.speechEnhancer,
                 dspEffects: this.state.pass1.speechEnhancer === 'ffmpeg-dsp' ? this.state.pass1.dspEffects : null,
-                speechSegmenter: disableSegmenter(this.state.pass1) ? null : this.state.pass1.speechSegmenter,
+                // v1.9.2 (S2): a balanced pass sends NO segmenter -- the CLI rejects
+                // --pass1-speech-segmenter there -- and sends the VAD version instead.
+                speechSegmenter: (disableSegmenter(this.state.pass1) || this.state.pass1.pipeline === 'balanced') ? null : this.state.pass1.speechSegmenter,
+                vadVersion: this.state.pass1.pipeline === 'balanced' ? (this.state.pass1.vadVersion || this.defaultVadVersion) : null,
                 model: this.state.pass1.model,
                 customized: this.state.pass1.customized,
                 params: this.state.pass1.customized ? this.state.pass1.params : null,
@@ -5830,8 +7388,15 @@ const EnsembleManager = {
                 isAnimeWhisper: this.state.pass1.isAnimeWhisper,
                 isCohere: this.state.pass1.isCohere || false,
                 isSenseVoice: this.state.pass1.isSenseVoice || false,
+                isCrispasr: this.state.pass1.isCrispasr || false,
+                isXxl: this.state.pass1.isXxl || false,
                 framer: this.state.pass1.isQwen ? this.state.pass1.framer : null,
-                enhanceForVad: this.state.pass1.enhanceForVad || false
+                enhanceForVad: this.state.pass1.enhanceForVad || false,
+                // A CrispASR pass's word timestamps (1.10.1); null = the pipeline's default, nothing sent
+                wordTimestamps: this.state.pass1.isCrispasr ? (this.state.pass1.wordTimestamps || null) : null,
+                // BYOP fields (only meaningful when pipeline is 'xxl'; pass 1 since 1.10.0, item 5)
+                xxlExe: this.state.pass1.isXxl ? this.state.xxl.exePath : null,
+                xxlArgs: this.state.pass1.isXxl ? this.state.xxl.extraArgs : null
             },
             pass2: {
                 enabled: this.state.pass2.enabled,
@@ -5840,7 +7405,10 @@ const EnsembleManager = {
                 sceneDetector: this.state.pass2.sceneDetector,
                 speechEnhancer: this.state.pass2.speechEnhancer,
                 dspEffects: this.state.pass2.speechEnhancer === 'ffmpeg-dsp' ? this.state.pass2.dspEffects : null,
-                speechSegmenter: disableSegmenter(this.state.pass2) ? null : this.state.pass2.speechSegmenter,
+                // v1.9.2 (S2): a balanced pass sends NO segmenter -- the CLI rejects
+                // --pass2-speech-segmenter there -- and sends the VAD version instead.
+                speechSegmenter: (disableSegmenter(this.state.pass2) || this.state.pass2.pipeline === 'balanced') ? null : this.state.pass2.speechSegmenter,
+                vadVersion: this.state.pass2.pipeline === 'balanced' ? (this.state.pass2.vadVersion || this.defaultVadVersion) : null,
                 model: this.state.pass2.model,
                 customized: this.state.pass2.customized,
                 params: this.state.pass2.customized ? this.state.pass2.params : null,
@@ -5849,12 +7417,15 @@ const EnsembleManager = {
                 isAnimeWhisper: this.state.pass2.isAnimeWhisper,
                 isCohere: this.state.pass2.isCohere || false,
                 isSenseVoice: this.state.pass2.isSenseVoice || false,
+                isCrispasr: this.state.pass2.isCrispasr || false,
                 isXxl: this.state.pass2.isXxl,
                 framer: this.state.pass2.isQwen ? this.state.pass2.framer : null,
                 enhanceForVad: this.state.pass2.enhanceForVad || false,
+                // A CrispASR pass's word timestamps (1.10.1); null = the pipeline's default, nothing sent
+                wordTimestamps: this.state.pass2.isCrispasr ? (this.state.pass2.wordTimestamps || null) : null,
                 // BYOP fields (only meaningful when pipeline is 'xxl')
-                xxlExe: this.state.pass2.isXxl ? this.state.pass2.xxlExePath : null,
-                xxlArgs: this.state.pass2.isXxl ? this.state.pass2.xxlExtraArgs : null
+                xxlExe: this.state.pass2.isXxl ? this.state.xxl.exePath : null,
+                xxlArgs: this.state.pass2.isXxl ? this.state.xxl.extraArgs : null
             },
             merge_strategy: this.state.mergeStrategy,
             serial_mode: this.state.serialMode,
@@ -5862,6 +7433,14 @@ const EnsembleManager = {
             subs_language: document.getElementById('language').value,
             debug: document.getElementById('debugLogging').checked,
             keep_temp: document.getElementById('keepTemp').checked,
+            skip_existing: document.getElementById('skipExisting').checked,
+            fail_on_empty: document.getElementById('failOnEmpty').checked,
+            fail_on_suspect: document.getElementById('failOnSuspect').checked,
+            asr_telemetry: document.getElementById('asrTelemetry').checked,
+            // #415: shared Advanced-options checkbox (Transcription tab), like asrTelemetry
+            offline_mode: document.getElementById('offlineMode').checked,
+            // v1.9.2 (CFF1): shared Advanced-options field (Transcription tab), like source-language
+            model_refresh_audio_minutes: document.getElementById('modelRefreshAudioMinutes').value,
             temp_dir: document.getElementById('tempDir').value.trim(),
             output_format: document.getElementById('outputFormat').value,
         };
@@ -5870,13 +7449,15 @@ const EnsembleManager = {
         if (TranslateIntegrationManager.isEnabled()) {
             const translateSettings = TranslateIntegrationManager.getSettings();
             config.translate = true;
-            config.translate_provider = translateSettings.provider || 'local';
+            config.translate_provider = translateSettings.provider || 'ollama';
             config.translate_target = translateSettings.target || 'english';
             config.translate_tone = translateSettings.tone || 'standard';
             // Use model override if provided, otherwise use selected model
             config.translate_model = translateSettings.modelOverride || translateSettings.model || null;
-            // Local/custom providers don't require API key (custom: optional via --translate-api-key)
-            config.translate_api_key = (translateSettings.provider === 'local' || translateSettings.provider === 'custom') ? null : (translateSettings.apiKey || null);
+            // A custom endpoint may need an API key (#420: a local proxy answered 401
+            // "Missing API key" because the key was dropped here, while the AI SRT
+            // Translate tab sends it), so it is sent when entered.
+            config.translate_api_key = translateSettings.apiKey || null;
             config.translate_title = translateSettings.movieTitle || null;
             config.translate_actress = translateSettings.actress || null;
             config.translate_plot = translateSettings.plot || null;
@@ -5893,14 +7474,33 @@ const EnsembleManager = {
             return;
         }
 
+        // v1.10.0 (item 3, owner W75): a pass still marked with a removed enhancer
+        // (ClearVoice) does not start. Text M2 (owner, W79).
+        const marked = this.passesWithRemovedEnhancer();
+        if (marked.length) {
+            const which = marked.length === 2 ? 'Pass 1 and Pass 2'
+                : (marked[0] === 'pass1' ? 'Pass 1' : 'Pass 2');
+            // 1.10.0 (item 6): each first sentence whole, so it has one Chinese text; same English.
+            const first = marked.length === 2
+                ? 'Pass 1 and Pass 2 use ClearVoice in your saved settings.'
+                : `${which} uses ClearVoice in your saved settings.`;
+            ErrorHandler.show('ClearVoice is no longer included',
+                `${first} ` +
+                `ClearVoice is no longer included in WhisperJAV 1.10. ` +
+                `Choose another speech enhancer for ${which}, then press Start again.`);
+            return;
+        }
+
         try {
             const config = this.collectConfig();
 
             // Persist BYOP preferences so the XXL path is remembered across sessions
-            if (this.state.pass2.isXxl && this.state.pass2.xxlExePath) {
+            // (either pass may be XXL since 1.10.0, item 5)
+            const xxlUsed = this.state.pass1.isXxl || (this.state.pass2.enabled && this.state.pass2.isXxl);
+            if (xxlUsed && this.state.xxl.exePath) {
                 pywebview.api.save_byop_preferences({
-                    xxl_exe_path: this.state.pass2.xxlExePath,
-                    xxl_extra_args: this.state.pass2.xxlExtraArgs || ''
+                    xxl_exe_path: this.state.xxl.exePath,
+                    xxl_extra_args: this.state.xxl.extraArgs || ''
                 });
             }
 
@@ -5920,14 +7520,13 @@ const EnsembleManager = {
 
                 // Log command
                 if (result.command) {
-                    ConsoleManager.appendRaw(`\n> ${result.command}\n`);
+                    // The command line is echoed by the API (api.py) into the run's output; not twice (owner W509).
                 }
 
                 // Start polling
                 ProcessManager.startLogPolling();
                 ProcessManager.startStatusMonitoring();
 
-                ConsoleManager.log('Two-pass ensemble started', 'info');
             } else {
                 ErrorHandler.show('Start Failed', result.message);
             }
@@ -5961,11 +7560,13 @@ const EnsembleManager = {
                     hint: b.install_hint || ''
                 };
             });
-
             // Update both pass1 and pass2 segmenter dropdowns
             ['pass1-segmenter', 'pass2-segmenter'].forEach(selectId => {
                 const select = document.getElementById(selectId);
                 if (!select) return;
+                // v1.9.2: when the dropdown is showing Silero VAD versions it is not
+                // listing segmenter backends, so backend availability does not apply.
+                if (select.dataset.mode === 'vad-version') return;
 
                 Array.from(select.options).forEach(option => {
                     const backend = option.value;
@@ -5979,11 +7580,11 @@ const EnsembleManager = {
                     if (info && !info.available) {
                         option.disabled = true;
                         option.title = info.hint || 'Not available';
-                        option.textContent = option.textContent.replace(/ \(N\/A\)$/, '') + ' (N/A)';
+                        option.textContent = I18n.englishText(option).replace(/ \(N\/A\)$/, '') + ' (N/A)';
                     } else {
                         option.disabled = false;
                         option.title = '';
-                        option.textContent = option.textContent.replace(/ \(N\/A\)$/, '');
+                        option.textContent = I18n.englishText(option).replace(/ \(N\/A\)$/, '');
                     }
                 });
             });
@@ -5997,7 +7598,7 @@ const EnsembleManager = {
     /**
      * Update enhancer dropdown options based on backend availability.
      * Called on pywebviewready when API becomes available.
-     * Handles both legacy format ("clearvoice") and new format ("clearvoice:MossFormer2_SE_48K").
+     * Handles both plain format ("bs-roformer") and backend:model format ("bs-roformer:vocals").
      */
     async updateEnhancerAvailability() {
         if (!window.pywebview || !pywebview.api) {
@@ -6038,11 +7639,11 @@ const EnsembleManager = {
                     if (info && !info.available) {
                         option.disabled = true;
                         option.title = info.hint || 'Not available';
-                        option.textContent = option.textContent.replace(/ \(N\/A\)$/, '') + ' (N/A)';
+                        option.textContent = I18n.englishText(option).replace(/ \(N\/A\)$/, '') + ' (N/A)';
                     } else {
                         option.disabled = false;
                         option.title = '';
-                        option.textContent = option.textContent.replace(/ \(N\/A\)$/, '');
+                        option.textContent = I18n.englishText(option).replace(/ \(N\/A\)$/, '');
                     }
                 });
             });
@@ -6151,7 +7752,7 @@ const KeyboardShortcuts = {
             if (e.key === 'F5') {
                 if (AppState.isRunning) {
                     e.preventDefault();
-                    if (confirm('Process is running. Refresh anyway? This will terminate the process.')) {
+                    if (confirm(I18n.t('Process is running. Refresh anyway? This will terminate the process.'))) {
                         location.reload();
                     }
                 }
@@ -6523,7 +8124,7 @@ const UpdateManager = {
 
     async startUpdate() {
         // Confirm with user
-        if (!confirm('WhisperJAV will close and update. The application will restart automatically after the update completes.\n\nContinue?')) {
+        if (!confirm(I18n.t('WhisperJAV will close and update. The application will restart automatically after the update completes.\n\nContinue?'))) {
             return;
         }
 
@@ -7151,6 +8752,31 @@ const OllamaPullModal = {
 // ============================================================
 // Provider UI Manager — centralized provider-change handler
 // ============================================================
+// v1.10.0 (REQ2, owner W22 (1)): llama-cpp ('local') was removed; Ollama is the only
+// local translator. A saved 'local' choice -- in browser storage or in the translate
+// settings file -- is read as 'ollama'. The backend prints the owner's one line (W43)
+// once; it is shown in this console once as well.
+function migrateRemovedProvider(provider) {
+    if (provider !== 'local') return provider;
+    if (!migrateRemovedProvider._noted) {
+        migrateRemovedProvider._noted = true;
+        reportSavedLocalProvider(true);
+    }
+    return 'ollama';
+}
+
+async function reportSavedLocalProvider(seenInBrowser) {
+    try {
+        const r = await pywebview.api.saved_local_provider_notice(!!seenInBrowser);
+        if (r && r.text && !reportSavedLocalProvider._shown) {
+            reportSavedLocalProvider._shown = true;
+            ConsoleManager.log(r.text, 'warning');
+        }
+    } catch (e) {
+        console.warn('Could not report the saved llama-cpp choice:', e);
+    }
+}
+
 const ProviderUIManager = {
     // Tab context element mapping
     tabElements: {
@@ -7159,16 +8785,14 @@ const ProviderUIManager = {
             model: 'ensembleTranslateModel',
             modelOverride: 'ensembleTranslateModelOverride',
             apiKeyRow: null,
-            ollamaPanel: 'ensembleOllamaPanel',
-            deprecation: 'ensembleDeprecationHint'
+            ollamaPanel: 'ensembleOllamaPanel'
         },
         srt: {
             provider: 'translatorProvider',
             model: 'translatorModel',
             modelOverride: 'translatorCustomModel',
             apiKeyRow: 'translatorApiKeyRow',
-            ollamaPanel: 'srtOllamaPanel',
-            deprecation: 'srtDeprecationHint'
+            ollamaPanel: 'srtOllamaPanel'
         }
     },
 
@@ -7176,8 +8800,14 @@ const ProviderUIManager = {
         const els = this.tabElements[tabContext];
         if (!els) return;
 
+        // v1.10.0: a saved llama-cpp ('local') choice is read as Ollama.
+        if (provider === 'local') {
+            provider = migrateRemovedProvider(provider);
+            const dd = document.getElementById(els.provider);
+            if (dd) dd.value = provider;
+        }
+
         const ollamaPanel = document.getElementById(els.ollamaPanel);
-        const deprecation = document.getElementById(els.deprecation);
         const apiKeyRow = els.apiKeyRow ? document.getElementById(els.apiKeyRow) : null;
         const modelEl = document.getElementById(els.model);
         const modelOverrideEl = document.getElementById(els.modelOverride);
@@ -7190,14 +8820,12 @@ const ProviderUIManager = {
         if (!provider || provider === '') {
             // Blank placeholder — hide everything
             if (ollamaPanel) ollamaPanel.style.display = 'none';
-            if (deprecation) deprecation.style.display = 'none';
             if (apiKeyRow) apiKeyRow.style.display = 'none';
             return;
         }
 
         if (provider === 'ollama') {
             if (apiKeyRow) apiKeyRow.style.display = 'none';
-            if (deprecation) deprecation.style.display = 'none';
             if (ollamaPanel) ollamaPanel.style.display = 'block';
 
             // Show "Looking for Ollama server..." immediately
@@ -7217,18 +8845,10 @@ const ProviderUIManager = {
                 if (modelOverrideEl) modelOverrideEl.style.display = '';
                 this.updateModelDropdown('ollama', tabContext);
             }
-        } else if (provider === 'local') {
-            if (apiKeyRow) apiKeyRow.style.display = 'none';
-            if (ollamaPanel) ollamaPanel.style.display = 'none';
-            if (deprecation) deprecation.style.display = 'block';
-            if (modelEl) modelEl.style.display = '';
-            if (modelOverrideEl) modelOverrideEl.style.display = '';
-            this.updateModelDropdown('local', tabContext);
         } else {
             // Cloud / custom provider
             if (apiKeyRow) apiKeyRow.style.display = '';
             if (ollamaPanel) ollamaPanel.style.display = 'none';
-            if (deprecation) deprecation.style.display = 'none';
             if (modelEl) modelEl.style.display = '';
             if (modelOverrideEl) modelOverrideEl.style.display = '';
             this.updateModelDropdown(provider, tabContext);
@@ -7252,12 +8872,6 @@ const ProviderUIManager = {
         const modelSelect = document.getElementById(els.model);
         if (!modelSelect) return;
 
-        const localModelLabels = {
-            'gemma-9b': 'gemma-9b (8GB)',
-            'llama-8b': 'llama-8b (6GB)',
-            'llama-3b': 'llama-3b (3GB)',
-            'auto': 'auto'
-        };
 
         const currentValue = modelSelect.value;
 
@@ -7274,15 +8888,11 @@ const ProviderUIManager = {
         modelSelect.innerHTML = '<option value="">Default</option>' +
             models.map(m => {
                 let label = m;
-                if (provider === 'local') label = localModelLabels[m] || m;
                 return `<option value="${m}">${label}</option>`;
             }).join('');
 
         if (currentValue) modelSelect.value = currentValue;
 
-        if (provider === 'local' && models.includes('gemma-9b')) {
-            if (!currentValue) modelSelect.value = 'gemma-9b';
-        }
     },
 
     _buildOllamaDropdown(modelSelect, currentValue, tabContext) {
@@ -7396,12 +9006,16 @@ const TranslatorManager = {
 
     // Provider model options (Ollama models are now driven by OllamaStateManager)
     providerModels: {
-        local: ['gemma-9b', 'llama-8b', 'llama-3b', 'auto'],
-        deepseek: ['deepseek-chat', 'deepseek-coder'],
-        gemini: ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'],
+        // #325: deepseek-chat/-reasoner deprecate 2026-07-24; v4 names per
+        // https://api-docs.deepseek.com/ (pro = thinking; flash is sent with thinking off).
+        // v1.9.5 (PR #457): flash is now 'deepseek-flash'; 'deepseek-v4-flash' still accepted.
+        deepseek: ['deepseek-flash', 'deepseek-v4-pro'],
+        gemini: ['gemini-3.6-flash', 'gemini-3.8-flash', 'gemini-3.5-flash-lite'],  // WP-002: 2.0 / 1.5 are retired
         claude: ['claude-3-5-haiku-20241022', 'claude-3-5-sonnet-20241022', 'claude-3-opus-20240229'],
         gpt: ['gpt-4o-mini', 'gpt-4o', 'gpt-4-turbo'],
-        openrouter: ['deepseek/deepseek-chat', 'anthropic/claude-3.5-sonnet', 'openai/gpt-4o'],
+        // #325: the routed DeepSeek model was deprecated 2026-07-24 alongside the
+        // direct one; v4-flash is now published on OpenRouter, so both agree again.
+        openrouter: ['deepseek/deepseek-v4-flash', 'deepseek/deepseek-v4-pro', 'anthropic/claude-3.5-sonnet', 'openai/gpt-4o'],
         glm: ['glm-4-flash', 'glm-4', 'glm-4-plus'],
         groq: ['llama-3.3-70b-versatile', 'llama-3.1-70b-versatile', 'mixtral-8x7b-32768'],
         custom: []
@@ -7491,18 +9105,11 @@ const TranslatorManager = {
         const modelSelect = document.getElementById('translatorModel');
         if (!modelSelect) return;
 
-        const localModelLabels = {
-            'gemma-9b': 'gemma-9b (8GB)',
-            'llama-8b': 'llama-8b (6GB)',
-            'llama-3b': 'llama-3b (3GB)',
-            'auto': 'auto'
-        };
 
         const models = this.providerModels[provider] || [];
         modelSelect.innerHTML = '<option value="">Default</option>' +
             models.map(m => {
                 let label = m;
-                if (provider === 'local') label = localModelLabels[m] || m;
                 return `<option value="${m}">${label}</option>`;
             }).join('');
     },
@@ -7511,10 +9118,9 @@ const TranslatorManager = {
         const statusEl = document.getElementById('translatorApiStatus');
         if (!statusEl) return;
 
-        // Ollama/Local/custom providers don't need API key
-        if (provider === 'ollama' || provider === 'local' || provider === 'custom') {
+        // Ollama/custom providers don't need API key
+        if (provider === 'ollama' || provider === 'custom') {
             if (provider === 'ollama') statusEl.textContent = 'Ollama (No API Key)';
-            else if (provider === 'local') statusEl.textContent = 'Local (No API)';
             else statusEl.textContent = 'Custom (No API)';
             statusEl.className = 'api-status configured';
             return;
@@ -7546,7 +9152,7 @@ const TranslatorManager = {
         const apiKey = document.getElementById('translatorApiKey')?.value || null;
 
         const testBtn = document.getElementById('translatorTestConnection');
-        const originalText = testBtn.textContent;
+        const originalText = I18n.englishText(testBtn);  // put back in whatever language is on then
         testBtn.textContent = 'Testing...';
         testBtn.disabled = true;
 
@@ -7782,16 +9388,11 @@ const TranslateIntegrationManager = {
     },
 
     init() {
-        // Bind checkbox handlers for Transcription Mode
-        const transcribeCheckbox = document.getElementById('translateAfterTranscription');
-        const quickSettings = document.getElementById('translateQuickSettings');
-
-        if (transcribeCheckbox && quickSettings) {
-            transcribeCheckbox.addEventListener('change', () => {
-                quickSettings.style.display = transcribeCheckbox.checked ? 'flex' : 'none';
-                this.state.enabled = transcribeCheckbox.checked;
-            });
-        }
+        // v1.9.3: the Transcription Mode enable checkbox used to be bound here, to
+        // 'translateAfterTranscription', with 'translateQuickSettings' as its panel.
+        // Neither id exists in index.html, so this never bound anything. Translation is
+        // available from the Ensemble tab only; giving the Transcription tab its own
+        // controls is a GUI design job parked for the 1.10.x release (owner, 2026-09-16).
 
         // Bind checkbox handlers for Ensemble Mode
         const ensembleCheckbox = document.getElementById('ensembleTranslateAfter');
@@ -7803,35 +9404,21 @@ const TranslateIntegrationManager = {
             });
         }
 
-        // Bind provider/target selects for Transcription Mode
-        const quickProvider = document.getElementById('quickTranslateProvider');
-        const quickTarget = document.getElementById('quickTranslateTarget');
+        // v1.9.3: the Transcription Mode provider/target selects used to be bound here, to
+        // 'quickTranslateProvider' and 'quickTranslateTarget'. Neither id exists in
+        // index.html, so both bindings were silent no-ops and the state they wrote was
+        // never set. Removed rather than left to look wired. See isEnabled() below.
 
-        if (quickProvider) {
-            quickProvider.addEventListener('change', () => {
-                this.state.provider = quickProvider.value;
-            });
-        }
-        if (quickTarget) {
-            quickTarget.addEventListener('change', () => {
-                this.state.target = quickTarget.value;
-            });
-        }
-
-        // Bind provider/target selects for Ensemble Mode
+        // Bind provider/target select for Ensemble Mode
         const ensembleProvider = document.getElementById('ensembleTranslateProvider');
-        const ensembleTarget = document.getElementById('ensembleTranslateTarget');
 
         if (ensembleProvider) {
             ensembleProvider.addEventListener('change', () => {
                 // Sync with transcription mode if needed
             });
         }
-        if (ensembleTarget) {
-            ensembleTarget.addEventListener('change', () => {
-                // Sync with transcription mode if needed
-            });
-        }
+        // ('ensembleTranslateTarget' was bound here with an empty handler; no such id exists
+        //  and the Ensemble target is read from TranslationSettingsModal, so it is gone.)
 
         console.log('TranslateIntegrationManager initialized');
     },
@@ -7871,9 +9458,12 @@ const TranslateIntegrationManager = {
         const tabId = activeTab.dataset.tab;
 
         if (tabId === 'tab1' || tabId === 'tab2') {
-            // Transcription Mode or Advanced Options - use main checkbox
-            const checkbox = document.getElementById('translateAfterTranscription');
-            return checkbox && checkbox.checked;
+            // Translation is not offered on the Transcription tab or Advanced Options.
+            // This used to read a 'translateAfterTranscription' checkbox that does not
+            // exist in index.html, so it already always evaluated false -- this states it
+            // instead of arriving at it by accident. Giving these tabs real translation
+            // controls is parked for the 1.10.x release (owner, 2026-09-16).
+            return false;
         } else if (tabId === 'tab3') {
             // Ensemble Mode
             const checkbox = document.getElementById('ensembleTranslateAfter');
@@ -7915,11 +9505,12 @@ const TranslateIntegrationManager = {
                 ollamaKeepAlive: fullSettings.ollamaKeepAlive
             };
         } else {
-            // Transcription Mode settings
-            return {
-                provider: document.getElementById('quickTranslateProvider')?.value || 'local',
-                target: document.getElementById('quickTranslateTarget')?.value || 'english'
-            };
+            // Not reachable: isEnabled() returns false on tab1/tab2, so nothing asks for
+            // these settings. Kept as a defensive default rather than reading
+            // 'quickTranslateProvider'/'quickTranslateTarget', two ids that do not exist --
+            // reading them returned these same values while looking as though the user's
+            // choice had been honoured. Parked for 1.10.x with the controls themselves.
+            return { provider: 'ollama', target: 'english' };
         }
     },
 
@@ -8078,12 +9669,16 @@ const TranslateIntegrationManager = {
 const TranslationSettingsModal = {
     // Provider model options (Ollama models are now driven by OllamaStateManager)
     providerModels: {
-        local: ['gemma-9b', 'llama-8b', 'llama-3b', 'auto'],
-        deepseek: ['deepseek-chat', 'deepseek-coder'],
-        gemini: ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'],
+        // #325: deepseek-chat/-reasoner deprecate 2026-07-24; v4 names per
+        // https://api-docs.deepseek.com/ (pro = thinking; flash is sent with thinking off).
+        // v1.9.5 (PR #457): flash is now 'deepseek-flash'; 'deepseek-v4-flash' still accepted.
+        deepseek: ['deepseek-flash', 'deepseek-v4-pro'],
+        gemini: ['gemini-3.6-flash', 'gemini-3.8-flash', 'gemini-3.5-flash-lite'],  // WP-002: 2.0 / 1.5 are retired
         claude: ['claude-3-5-haiku-20241022', 'claude-3-5-sonnet-20241022', 'claude-3-opus-20240229'],
         gpt: ['gpt-4o-mini', 'gpt-4o', 'gpt-4-turbo'],
-        openrouter: ['deepseek/deepseek-chat', 'anthropic/claude-3.5-sonnet', 'openai/gpt-4o'],
+        // #325: the routed DeepSeek model was deprecated 2026-07-24 alongside the
+        // direct one; v4-flash is now published on OpenRouter, so both agree again.
+        openrouter: ['deepseek/deepseek-v4-flash', 'deepseek/deepseek-v4-pro', 'anthropic/claude-3.5-sonnet', 'openai/gpt-4o'],
         glm: ['glm-4-flash', 'glm-4', 'glm-4-plus'],
         groq: ['llama-3.3-70b-versatile', 'llama-3.1-70b-versatile', 'mixtral-8x7b-32768'],
         custom: []
@@ -8134,12 +9729,14 @@ const TranslationSettingsModal = {
         document.getElementById('translationTestConnection')?.addEventListener('click', () => this.testConnection());
 
         // Tone change reflects the tone's default temperature in the modal's
-        // Temperature field. That field is ALWAYS forwarded to the backend,
-        // so without this the tone-aware default (pornify=1.2, contextual=0.8)
-        // never applied — the stale field value silently won. User edits after
-        // the tone switch still stick (Save reads the field).
+        // Temperature field. That field is always forwarded to the backend,
+        // so without this the tone-aware defaults in translate/service.py
+        // (_build_provider_options) never applied — the stale field value
+        // silently won. User edits after the tone switch still stick.
+        // Keep this map in sync with _build_provider_options.
+        const toneTemperatureDefaults = { standard: 0.5, contextual: 0.8, pornify: 1.2 };
         document.getElementById('translationTone')?.addEventListener('change', (e) => {
-            const temp = TranslatorManager.toneTemperatureDefaults[e.target.value];
+            const temp = toneTemperatureDefaults[e.target.value];
             const tempInput = document.getElementById('translationTemperature');
             if (temp !== undefined && tempInput) {
                 tempInput.value = temp;
@@ -8158,6 +9755,7 @@ const TranslationSettingsModal = {
             document.querySelectorAll('.ollama-settings-row').forEach(el => {
                 el.style.display = (e.target.value === 'ollama') ? 'block' : 'none';
             });
+            this.updateTemperatureHint(e.target.value);
         });
 
         // No default provider initialization — dropdown starts blank
@@ -8245,6 +9843,7 @@ const TranslationSettingsModal = {
             if (saved) {
                 const parsed = JSON.parse(saved);
                 this.settings = { ...this.settings, ...parsed };
+                if (this.settings.provider) this.settings.provider = migrateRemovedProvider(this.settings.provider);
             }
         } catch (e) {
             console.warn('Could not load translation settings from localStorage:', e);
@@ -8264,7 +9863,15 @@ const TranslationSettingsModal = {
         }
     },
 
+    // #444: for the custom provider the temperature is left to the server, so the
+    // Temperature field is labelled as not sent.
+    updateTemperatureHint(provider) {
+        const hint = document.getElementById('translationTemperatureHint');
+        if (hint) hint.style.display = (provider === 'custom') ? 'block' : 'none';
+    },
+
     populateForm() {
+        this.updateTemperatureHint(document.getElementById('ensembleTranslateProvider')?.value || '');
         document.getElementById('translationApiKey').value = this.settings.apiKey;
         document.getElementById('translationTargetLang').value = this.settings.targetLang;
         document.getElementById('translationTone').value = this.settings.tone;
@@ -8307,43 +9914,35 @@ const TranslationSettingsModal = {
         const modelSelect = document.getElementById('ensembleTranslateModel');
         if (!modelSelect) return;
 
-        const localModelLabels = {
-            'gemma-9b': 'gemma-9b (8GB)',
-            'llama-8b': 'llama-8b (6GB)',
-            'llama-3b': 'llama-3b (3GB)',
-            'auto': 'auto'
-        };
 
         const models = this.providerModels[provider] || [];
         modelSelect.innerHTML = '<option value="">Default</option>' +
             models.map(m => {
                 let label = m;
-                if (provider === 'local') label = localModelLabels[m] || m;
                 return `<option value="${m}">${label}</option>`;
             }).join('');
 
-        // Set default model for local provider to gemma-9b
-        if (provider === 'local' && models.includes('gemma-9b')) {
-            modelSelect.value = 'gemma-9b';
-        }
     },
 
     async testConnection() {
         const btn = document.getElementById('translationTestConnection');
         const statusEl = document.getElementById('translationApiStatus');
-        const provider = document.getElementById('ensembleTranslateProvider')?.value || 'local';
+        const provider = document.getElementById('ensembleTranslateProvider')?.value || 'ollama';
         const apiKey = document.getElementById('translationApiKey')?.value || '';
 
-        // Ollama/Local/custom providers don't need API key testing
-        if (provider === 'ollama' || provider === 'local' || provider === 'custom') {
+        // Ollama/custom providers don't need API key testing
+        if (provider === 'ollama' || provider === 'custom') {
             if (statusEl) {
                 if (provider === 'ollama') statusEl.textContent = 'Ollama (No API Key)';
-                else if (provider === 'local') statusEl.textContent = 'Local (No API)';
                 else statusEl.textContent = 'Custom (No API)';
                 statusEl.className = 'api-status connected';
             }
-            const label = provider === 'ollama' ? 'Ollama' : provider === 'local' ? 'Local LLM' : 'Custom endpoint';
-            ConsoleManager.log(`${label} provider selected - no API key required`, 'info');
+            if (provider === 'custom') {
+                // #420: it said "no API key required", but a custom endpoint may need one.
+                ConsoleManager.log('Custom endpoint selected - not tested here; the API key is sent if you entered one', 'info');
+                return;
+            }
+            ConsoleManager.log('Ollama provider selected - no API key required', 'info');
             return;
         }
 
@@ -8415,16 +10014,174 @@ const TranslationSettingsModal = {
 // GUI Settings Persistence
 // ============================================================
 const SettingsPersistence = {
-    // Disabled: Tab 1 + Tab 3 always start from HTML defaults.
-    // Backend module (gui_settings.py) retained for future "exit prompt" feature.
-    // Preset CRUD (EnsembleManager) is unaffected.
-    init() {},
-    collectAll() { return {}; },
-    applyToForm() {},
-    async loadFromBackend() {},
-    scheduleSave() {},
-    async _doSave() {},
-    async restorePresets() {},
+    // v1.9.0 (#96/#298): OPT-IN persistence for Tab 1 form fields.
+    FIELDS: {
+        'mode':             { key: 'mode',           prop: 'value' },
+        'sensitivity':      { key: 'sensitivity',    prop: 'value' },
+        'source-language':  { key: 'sourceLanguage', prop: 'value' },
+        'language':         { key: 'subsLanguage',   prop: 'value' },
+        'outputDir':        { key: 'outputDir',      prop: 'value' },
+        'outputFormat':     { key: 'outputFormat',   prop: 'value' },
+        'tempDir':          { key: 'tempDir',        prop: 'value' },
+        'debugLogging':     { key: 'debugLogging',   prop: 'checked' },
+        'keepTemp':         { key: 'keepTemp',       prop: 'checked' },
+        'skipExisting':     { key: 'skipExisting',   prop: 'checked' },
+        'offlineMode':      { key: 'offlineMode',    prop: 'checked' },
+        'failOnEmpty':      { key: 'failOnEmpty',    prop: 'checked' },
+        'failOnSuspect':    { key: 'failOnSuspect',  prop: 'checked' },
+        'asrTelemetry':     { key: 'asrTelemetry',   prop: 'checked' },
+        'modelRefreshAudioMinutes': { key: 'modelRefreshAudioMinutes', prop: 'value' },
+        // v1.9.3 (D1/#381): the Ensemble tab's two-pass selectors. The backend has
+        // accepted and returned these keys since 1.9.2 (_GUI_SETTINGS_MAP in api.py);
+        // only the page side was missing, so a restart lost the whole two-pass setup.
+        'pass1-pipeline':   { key: 'pass1Pipeline',       prop: 'value' },
+        'pass1-sensitivity':{ key: 'pass1Sensitivity',    prop: 'value' },
+        'pass1-scene':      { key: 'pass1SceneDetector',  prop: 'value' },
+        'pass1-enhancer':   { key: 'pass1SpeechEnhancer', prop: 'value' },
+        'pass1-segmenter':  { key: 'pass1SpeechSegmenter',prop: 'value' },
+        'pass1-model':      { key: 'pass1Model',          prop: 'value' },
+        'pass2-enabled':    { key: 'pass2Enabled',        prop: 'checked' },
+        'pass2-pipeline':   { key: 'pass2Pipeline',       prop: 'value' },
+        'pass2-sensitivity':{ key: 'pass2Sensitivity',    prop: 'value' },
+        'pass2-scene':      { key: 'pass2SceneDetector',  prop: 'value' },
+        'pass2-enhancer':   { key: 'pass2SpeechEnhancer', prop: 'value' },
+        'pass2-segmenter':  { key: 'pass2SpeechSegmenter',prop: 'value' },
+        'pass2-model':      { key: 'pass2Model',          prop: 'value' },
+        'merge-strategy':   { key: 'mergeStrategy',       prop: 'value' },
+        // 1.10.1 (owner W501): "Finish each file" is remembered like the merge strategy beside it.
+        'ensemble-serial':  { key: 'ensembleSerial',      prop: 'checked' },
+    },
+    _saveTimer: null,
+    enabled: false,
+    init() {
+        const toggle = document.getElementById('rememberSettings');
+        if (!toggle) return;
+        toggle.addEventListener('change', () => {
+            this.enabled = toggle.checked;
+            this._doSave();
+        });
+        for (const id of Object.keys(this.FIELDS)) {
+            const el = document.getElementById(id);
+            if (el) el.addEventListener('change', () => this.scheduleSave());
+        }
+    },
+    collectAll() {
+        const out = { rememberSettings: this.enabled };
+        if (!this.enabled) return out;
+        for (const [id, spec] of Object.entries(this.FIELDS)) {
+            const el = document.getElementById(id);
+            if (el) out[spec.key] = el[spec.prop];
+        }
+        // v1.10.0 (item 3): while a pass is marked with a removed enhancer, its saved
+        // value stays as it was; it changes only when the user chooses an entry.
+        if (typeof EnsembleManager !== 'undefined') {
+            for (const pass of ['pass1', 'pass2']) {
+                const saved = EnsembleManager.removedEnhancer[pass];
+                if (saved) out[this.FIELDS[`${pass}-enhancer`].key] = saved;
+            }
+        }
+        // The two preset names are not form controls -- they live in EnsembleManager's
+        // state, set when a preset is loaded and cleared when a field is edited by hand.
+        const ens = (typeof EnsembleManager !== 'undefined') ? EnsembleManager.state : null;
+        if (ens) {
+            out.pass1Preset = ens.pass1?.presetName || '';
+            out.pass2Preset = ens.pass2?.presetName || '';
+        }
+        return out;
+    },
+    applyToForm(settings) {
+        for (const [id, spec] of Object.entries(this.FIELDS)) {
+            if (!(spec.key in settings)) continue;
+            const el = document.getElementById(id);
+            if (!el) continue;
+            const wanted = settings[spec.key];
+            const before = el.value;
+            el[spec.prop] = wanted;
+            // v1.9.3: a saved value the control no longer offers must not be dispatched.
+            // Assigning it to a <select> sets value to '' -- the change handler would then
+            // write '' into EnsembleManager's state (and the run would send an empty
+            // model), and the same event reaches scheduleSave, writing '' back to disk so
+            // the degradation becomes permanent. This happens for real: a model saved for
+            // one pipeline is not offered after the pipeline is restored ahead of it.
+            // Rejected either because the control does not offer the value, or because the
+            // saved value is blank and blank is not a real option. The second case matters:
+            // a settings file written before this guard existed can hold "", and comparing
+            // el.value !== String("") is '' !== '' -- false -- so the guard would pass the
+            // blank straight through, dispatch it, and put "" back into the run.
+            const blankButNoBlankOption = spec.prop === 'value' && wanted === ''
+                && el.tagName === 'SELECT'
+                && !Array.from(el.options).some(o => o.value === '');
+            if (spec.prop === 'value' && el.tagName === 'SELECT'
+                    && (el.value !== String(wanted) || blankButNoBlankOption)) {
+                // The assignment already blanked the control -- put back what was there.
+                el.value = before;
+                ConsoleManager.log(
+                    `A setting saved earlier, "${wanted}", is no longer one of the ` +
+                    `choices, so "${el.value || 'nothing'}" has been kept instead.`,
+                    'warn');
+                // v1.10.0 (item 3): a removed enhancer (ClearVoice) marks the pass, so
+                // Start asks the user to choose another one (M2).
+                const pass = { 'pass1-enhancer': 'pass1', 'pass2-enhancer': 'pass2' }[id];
+                if (pass && typeof EnsembleManager !== 'undefined'
+                        && EnsembleManager.isRemovedEnhancer(wanted)) {
+                    EnsembleManager.markRemovedEnhancer(pass, wanted);
+                }
+                continue;
+            }
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+    },
+    async loadFromBackend() {
+        try {
+            const res = await pywebview.api.get_gui_settings();
+            if (!res || !res.success) return;
+            const settings = res.settings || {};
+            const toggle = document.getElementById('rememberSettings');
+            this.enabled = !!settings.rememberSettings;
+            if (toggle) toggle.checked = this.enabled;
+            if (this.enabled) {
+                this.applyToForm(settings);
+                // #454: the box must agree with the restored Output field; save the result
+                DirectoryControls.syncOutputDir();
+                this.scheduleSave();
+                // after the selectors are back, restore each pass's preset label
+                await this.restorePresets(settings);
+            }
+        } catch (e) {
+            console.warn('Failed to load GUI settings:', e);
+        }
+    },
+    scheduleSave() {
+        if (!this.enabled) return;
+        clearTimeout(this._saveTimer);
+        this._saveTimer = setTimeout(() => this._doSave(), 500);
+    },
+    async _doSave() {
+        try {
+            await pywebview.api.save_gui_settings(this.collectAll());
+        } catch (e) {
+            console.warn('Failed to save GUI settings:', e);
+        }
+    },
+    // v1.9.3 (D1): deliberately does NOT restore the two preset names, though collectAll
+    // still saves them for the work below.
+    //
+    // An earlier version of this set EnsembleManager.state.pass1/2.presetName from the
+    // saved settings. That is wrong on its own: updateBadges() (EnsembleManager, ~line
+    // 2256) derives the green badge, the "Edit Parameters" button and the modal's
+    // [Custom] title from presetName alone, while the parameters a preset names live in
+    // passState.params -- which this cannot restore. The result was a GUI reporting that
+    // preset X was in force when params was null and a run would have used defaults.
+    // It also resurrected a cleared preset: Reset to Defaults nulls presetName but does
+    // not rewrite the saved settings, so the old name came back at the next restart.
+    //
+    // Restoring the label honestly means restoring the values it names -- loading the
+    // preset through the presets API and applying it to passState.params. That is the
+    // Customize-modal half of D1 and is not done here. Until then no label is restored,
+    // so the badge tells the truth: after a restart the pass is on defaults.
+    async restorePresets(_settings) {
+        return;
+    },
 };
 
 // ============================================================
@@ -8432,6 +10189,10 @@ const SettingsPersistence = {
 // ============================================================
 document.addEventListener('DOMContentLoaded', async () => {
     console.log('WhisperJAV Web GUI - Phase 5 (Production Ready)');
+
+    // 1.10.0 (item 6): the language button and the watcher that translates what is
+    // added to the window; the saved language is applied on pywebviewready.
+    I18n.init();
 
     // Initialize state
     await AppState.init();
@@ -8454,6 +10215,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     TranslatorManager.init();
     TranslateIntegrationManager.init();
     TranslationSettingsModal.init();
+    SettingsPersistence.init();
 
     // Initial validation
     FormManager.validateForm();
@@ -8479,6 +10241,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 // PyWebView ready event — populate dynamic options and load Tab 4 settings.
 window.addEventListener('pywebviewready', async () => {
     console.log('PyWebView API ready!');
+    // 1.10.0 (item 6): the language first, so the window changes once, early.
+    await I18n.loadSaved();
     ConsoleManager.log('PyWebView bridge connected', 'success');
 
     await AppState.loadDefaultOutputDir();
@@ -8487,6 +10251,8 @@ window.addEventListener('pywebviewready', async () => {
 
     // Reload BYOP preferences now that API is available
     // (DOMContentLoaded init may have run before pywebview was ready)
+    // 1.10.0 (item 5): written into EnsembleManager's state, which collectConfig sends. Before,
+    // this wrote to AppState.state.pass2, which no run reads.
     try {
         const byopPrefs = await pywebview.api.get_byop_preferences();
         if (byopPrefs) {
@@ -8494,12 +10260,12 @@ window.addEventListener('pywebviewready', async () => {
             // AppState) — the old AppState.state reference threw TypeError
             // into the catch below, so the saved path never reached the UI.
             if (byopPrefs.xxl_exe_path) {
-                EnsembleManager.state.pass2.xxlExePath = byopPrefs.xxl_exe_path;
+                EnsembleManager.state.xxl.exePath = byopPrefs.xxl_exe_path;
                 const pathInput = document.getElementById('xxl-exe-path');
                 if (pathInput) pathInput.value = byopPrefs.xxl_exe_path;
             }
             if (byopPrefs.xxl_extra_args) {
-                EnsembleManager.state.pass2.xxlExtraArgs = byopPrefs.xxl_extra_args;
+                EnsembleManager.state.xxl.extraArgs = byopPrefs.xxl_extra_args;
                 const argsInput = document.getElementById('xxl-extra-args');
                 if (argsInput) argsInput.value = byopPrefs.xxl_extra_args;
             }
@@ -8511,13 +10277,26 @@ window.addEventListener('pywebviewready', async () => {
     // Tab 4 translation settings (unaffected by persistence removal)
     await TranslationSettingsModal.loadSettingsFromBackend();
 
-    // Restore saved provider selections from localStorage
-    const savedEnsemble = localStorage.getItem('whisperjav_ensemble_provider');
+    await SettingsPersistence.loadFromBackend();
+
+    // Restore the translation choices of both tabs (#435). They come from the
+    // translate settings file; browser storage is cleared at every launch
+    // (private_mode, main.py), so it is only a fallback for the provider.
+    let tabState = {};
+    try {
+        const r = await pywebview.api.get_translation_tab_state();
+        if (r && r.success) tabState = r.state || {};
+    } catch (e) {
+        console.warn('Could not load translation tab state:', e);
+    }
+    const lsGet = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+
+    const savedEnsemble = migrateRemovedProvider((tabState.ensemble || {}).provider || lsGet('whisperjav_ensemble_provider'));
     if (savedEnsemble) {
         const dd = document.getElementById('ensembleTranslateProvider');
         if (dd) {
             dd.value = savedEnsemble;
-            ProviderUIManager.onProviderChange(savedEnsemble, 'ensemble');
+            await ProviderUIManager.onProviderChange(savedEnsemble, 'ensemble');
             TranslationSettingsModal.updateModelOptions(savedEnsemble);
             // Show/hide Ollama URL field in settings modal
             document.querySelectorAll('.ollama-settings-row').forEach(el => {
@@ -8525,13 +10304,81 @@ window.addEventListener('pywebviewready', async () => {
             });
         }
     }
-    const savedSrt = localStorage.getItem('whisperjav_srt_provider');
+    const savedSrt = migrateRemovedProvider((tabState.srt || {}).provider || lsGet('whisperjav_srt_provider'));
     if (savedSrt) {
         const dd = document.getElementById('translatorProvider');
         if (dd) {
             dd.value = savedSrt;
-            ProviderUIManager.onProviderChange(savedSrt, 'srt');
+            await ProviderUIManager.onProviderChange(savedSrt, 'srt');
             TranslatorManager.updateApiKeyStatus(savedSrt);
         }
     }
+    TranslationTabState.apply(tabState);
+    TranslationTabState.bind();
+    // A saved llama-cpp choice the backend found in the settings file (v1.10.0).
+    reportSavedLocalProvider(false);
 });
+
+// #435: remember the translation choices of the Ensemble row and the AI SRT Translate
+// tab between launches (saved through the backend; see api.save_translation_tab_state).
+const TranslationTabState = {
+    FIELDS: {
+        ensemble: {
+            provider: 'ensembleTranslateProvider', model: 'ensembleTranslateModel',
+            modelOverride: 'ensembleTranslateModelOverride',
+        },
+        srt: {
+            provider: 'translatorProvider', model: 'translatorModel', customModel: 'translatorCustomModel',
+            sourceLang: 'translatorSourceLang', targetLang: 'translatorTargetLang', tone: 'translatorTone',
+            customEndpoint: 'translatorCustomEndpoint', maxBatchSize: 'translatorMaxBatchSize',
+            maxRetries: 'translatorMaxRetries', rateLimit: 'translatorRateLimit',
+            sceneThreshold: 'translatorSceneThreshold',
+        },
+    },
+    _timers: {},
+
+    // Fill everything but the provider (already restored, with its model list).
+    // A saved value a drop-down no longer offers is skipped, not forced in.
+    apply(state) {
+        for (const [tab, fields] of Object.entries(this.FIELDS)) {
+            const saved = (state || {})[tab] || {};
+            for (const [key, id] of Object.entries(fields)) {
+                if (key === 'provider' || saved[key] === undefined) continue;
+                const el = document.getElementById(id);
+                if (!el) continue;
+                if (el.tagName === 'SELECT' && !Array.from(el.options).some(o => o.value === saved[key])) continue;
+                el.value = saved[key];
+            }
+        }
+    },
+
+    collect(tab) {
+        const values = {};
+        for (const [key, id] of Object.entries(this.FIELDS[tab])) {
+            const el = document.getElementById(id);
+            if (el && el.value !== undefined && el.value !== '') values[key] = String(el.value).trim();
+        }
+        return values;
+    },
+
+    save(tab) {
+        clearTimeout(this._timers[tab]);
+        this._timers[tab] = setTimeout(async () => {
+            try {
+                if (window.pywebview?.api?.save_translation_tab_state) {
+                    await pywebview.api.save_translation_tab_state(tab, this.collect(tab));
+                }
+            } catch (e) {
+                console.warn('Could not save translation tab state:', e);
+            }
+        }, 400);
+    },
+
+    bind() {
+        for (const [tab, fields] of Object.entries(this.FIELDS)) {
+            for (const id of Object.values(fields)) {
+                document.getElementById(id)?.addEventListener('change', () => this.save(tab));
+            }
+        }
+    },
+};

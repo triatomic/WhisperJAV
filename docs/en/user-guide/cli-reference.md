@@ -17,9 +17,9 @@ whisperjav [OPTIONS] INPUT [INPUT...]
 | Option | Default | Description |
 |--------|---------|-------------|
 | `INPUT` | (required) | One or more video/audio file paths |
-| `--mode` | `balanced` | Pipeline: `balanced`, `fast`, `faster`, `fidelity`, `transformers` |
+| `--mode` | `balanced` | Pipeline: `balanced`, `fast`, `faster`, `fidelity`, `transformers`, `qwen` |
 | `--sensitivity` | `aggressive` | Detection sensitivity: `aggressive`, `balanced`, `conservative` |
-| `--language` | `ja` | Source language code (`ja`, `ko`, `zh`, `en`) |
+| `--language` | `japanese` | Source audio language: `japanese`, `korean`, `chinese`, `english` |
 | `--output-dir` | Same as source | Directory for output SRT files |
 | `--output-format` | `srt` | Output format: `srt`, `vtt`, `both` |
 
@@ -35,17 +35,29 @@ whisperjav [OPTIONS] INPUT [INPUT...]
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--ensemble` | Off | Enable ensemble mode |
-| `--ensemble-serial` | Off | Complete each file fully before starting the next |
-| `--pass1-pipeline` | `balanced` | Pipeline for first pass |
-| `--pass2-pipeline` | `qwen` | Pipeline for second pass |
-| `--merge-strategy` | `smart` | Merge strategy: `pass1_primary`, `smart`, `full`, `pass2_primary`, `longest` |
+| `--ensemble-serial` | On | Complete each file fully before starting the next; `--no-ensemble-serial` runs Pass 1 on all files, then Pass 2, each pass starting once for all files |
+| `--pass1-pipeline` | `balanced` | Pipeline for first pass; also the seven GGUF pipelines `parakeet-crispasr`, `cohere-crispasr`, `reazonspeech-crispasr`, `kotoba-crispasr`, `whisper-turbo-crispasr`, `whisper-large-crispasr`, `moss-crispasr` (see [GGUF pipelines (CrispASR)](../pipelines/crispasr.md)) and `xxl` (your own Faster Whisper XXL, see [BYOP: XXL Faster Whisper](../pipelines/ensemble.md#byop-xxl-faster-whisper-v189-pass-1-since-1100)) |
+| `--pass2-pipeline` | (none) | Pipeline for second pass, the same choices; giving it turns pass 2 on |
+| `--xxl-exe` | (none) | Path to `faster-whisper-xxl.exe`; required when either pass is `xxl`. `--pass1-model` / `--pass2-model` pick the model XXL runs (default `large-v2`) |
+| `--merge-strategy` | `pass1_primary` | Merge strategy: `pass1_primary`, `pass2_primary`, `smart_merge`, `full_merge`, `pass1_overlap`, `pass2_overlap`, `longest` |
+
+### ChronosJAV Timing Options (`--mode qwen`)
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--qwen-aligner` | `wav2vec2-ja` (in an aligner mode) | The aligner an aligner timestamp mode uses to time the ASR model's text: `wav2vec2-ja` (232 MB), `qwen3-fa-gguf` (529 MB), `parakeet-ctc-ja` (not recommended: its times came back evenly spread in our tests), all run by CrispASR; or a PyTorch model ID such as `Qwen/Qwen3-ForcedAligner-0.6B`. Given without `--qwen-timestamp-mode`, it turns on `aligner_vad_fallback` |
+| `--qwen-timestamp-mode` | `vad_only` | Default since 1.10.1: no aligner is loaded; each subtitle takes its piece of speech's times (the timing model, if chosen, can still move the start). `aligner_vad_fallback` (1.10.0's default): the aligner times the text; a piece of speech it cannot time keeps the speech segmenter's times |
+| `--qwen-timing-model` | `none` | `whisper-small` (488 MB; its text is not used) moves a subtitle's start later, to where speech starts, where the aligner gave no time; where the aligner timed a piece of speech, it splits it at a punctuation mark or space near where a new sentence starts. `none` (default since 1.10.1) leaves it off |
+| `--qwen-stepdown` | Off | Retry a scene whose alignment collapses, with pieces of speech up to 6 s. When off (the default), such a scene takes the times of its pieces of speech with `aligner_vad_fallback` |
+
+The aligner and the timing model are new in 1.10.0 and off by default since 1.10.1; they are downloaded the first time a run uses them, and run where the install's CrispASR runs; `--device cpu` does not hold them on the CPU. See [Subtitle timing](../pipelines/chronosjav.md#subtitle-timing-1100). In an Ensemble pass, give them in `--pass1-qwen-params`, for example `'{"timestamp_mode": "aligner_vad_fallback", "timing_model": "whisper-small"}'`.
 
 ### Processing Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--cpu-only` | Off | Force CPU mode (no GPU) |
-| `--async` | Off | Enable async processing |
+| `--device` | `auto` | Where this run's ASR and other models run, for every pipeline. `auto` = as the install is made for: its GPU when it can be used, else the CPU (not accelerated); `cpu` = this run on the CPU; `cuda` = an NVIDIA GPU is required. See [Accelerated or not](../getting-started/index.md#accelerated-or-not). |
+| `--async-processing` | Off | Enable async processing |
 | `--temp-dir` | System temp | Custom directory for temporary files |
 | `--keep-temp` | Off | Keep intermediate files |
 | `--debug` | Off | Enable debug logging |
@@ -59,8 +71,8 @@ whisperjav video.mp4
 # Fast mode with conservative sensitivity
 whisperjav video.mp4 --mode faster --sensitivity conservative
 
-# Ensemble with serial mode
-whisperjav *.mp4 --ensemble --ensemble-serial --merge-strategy smart
+# Ensemble with serial mode (the default since 1.10.1; the flag can be left out)
+whisperjav *.mp4 --ensemble --ensemble-serial --merge-strategy smart_merge
 
 # VTT output
 whisperjav video.mp4 --output-format vtt
@@ -68,9 +80,30 @@ whisperjav video.mp4 --output-format vtt
 # Custom output directory
 whisperjav video.mp4 --output-dir ./subtitles/
 
-# CPU-only mode
-whisperjav video.mp4 --mode faster --cpu-only
+# This run on the CPU (not accelerated)
+whisperjav video.mp4 --mode faster --device cpu
+
+# ChronosJAV with 1.10.0's timing (the aligner and the timing model)
+whisperjav video.mp4 --mode qwen --qwen-timestamp-mode aligner_vad_fallback --qwen-timing-model whisper-small
+
+# Parakeet-CrispASR as one Ensemble pass
+whisperjav video.mp4 --ensemble --pass1-pipeline parakeet-crispasr
+
+# Check the install: accelerator, where each part runs, models
+whisperjav --check
 ```
+
+### When a run does not start
+
+| Exit status | Meaning |
+|---|---|
+| 0 | the run finished |
+| 1 | the run finished, and at least one file failed (or is in a state named by `--fail-on`) |
+| 2 | the run did not start: a setting it cannot use (the message says which) |
+| 3 | the run did not start: the install is made for the NVIDIA GPU, and the GPU cannot be used now. The box names the reason and the fix; `--device cpu` runs the job on the CPU this time |
+| 4 | the run did not start: PyTorch is missing or damaged (on an Own PyTorch install: not yet added). The message gives the command that fixes it |
+
+When the install's GPU can be used (an NVIDIA GPU or Apple GPU install), nothing is shown at the start of a run. On every other install, a box says where each part runs on this computer; the run then goes on. `--hf-device` and `--qwen-device` from earlier releases still work as other names for `--device`.
 
 ---
 
@@ -107,18 +140,21 @@ whisperjav-translate [OPTIONS] -i INPUT.srt
 
 ## whisperjav-upgrade
 
-Upgrade WhisperJAV to the latest version.
+Upgrades an install made with the Windows installer to the newest 1.10 release. Run it with the install's `python.exe`:
 
-```bash
-whisperjav-upgrade [OPTIONS]
 ```
+"%LOCALAPPDATA%\WhisperJAV\python.exe" -m whisperjav.upgrade [OPTIONS]
+```
+
+(or the `python.exe` in your install folder). Do not start it with `Scripts\whisperjav-upgrade.exe` ([why](../UPGRADE.md#windows-installer-installs)). Source installs upgrade with git instead ([Upgrade Guide](../UPGRADE.md#source-installs-windows-macos-linux)).
 
 | Option | Description |
 |--------|-------------|
-| `--check` | Check for updates without upgrading |
-| `--wheel-only` | Code-only upgrade (skip dependency reinstall) |
-| `--list-snapshots` | Show available rollback points |
-| `--rollback` | Rollback to previous version |
-| `--extras` | Upgrade specific extras only (e.g., `cli,gui`) |
+| `--check` | Check for a newer release without upgrading (`--force`: ask again at once instead of using the answer kept for 6 hours) |
+| `--yes` | Upgrade without asking first |
+| `--wheel-only` | Update WhisperJAV alone; the packages it uses keep their versions |
+| `--list-snapshots` | List the package lists saved before earlier upgrades |
+| `--rollback` | Put such a list back. Does not work on installs made with the Windows installer in 1.10: it stops with an error ([repair instead](../MANUAL_ROLLBACK.md)) |
+| `--extras` | Not for installs made with the Windows installer: they always get the release's full set of packages, and the tool stops if another value is given |
 
 See [Upgrade Guide](../UPGRADE.md) for details.

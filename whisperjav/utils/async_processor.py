@@ -162,6 +162,10 @@ class AsyncPipelineProcessor:
         # Add the reporter to the pipeline args, as it's an expected kwarg
         pipeline_args_with_reporter = pipeline_args.copy()
         pipeline_args_with_reporter['progress_reporter'] = progress_reporter
+        # A per-file output directory (--output-dir source) overrides the
+        # batch-wide one; each task has its own pipeline instance.
+        if media_info.get('output_dir'):
+            pipeline_args_with_reporter['output_dir'] = media_info['output_dir']
         
         pipeline = None
         try:
@@ -448,9 +452,6 @@ class AsyncPipelineManager:
         elif pipeline_mode == "balanced":
             from whisperjav.pipelines.balanced_pipeline import BalancedPipeline
             pipeline_class = BalancedPipeline
-        elif pipeline_mode == "kotoba-faster-whisper":
-            from whisperjav.pipelines.kotoba_faster_whisper_pipeline import KotobaFasterWhisperPipeline
-            pipeline_class = KotobaFasterWhisperPipeline
         else:  # fidelity
             from whisperjav.pipelines.fidelity_pipeline import FidelityPipeline
             pipeline_class = FidelityPipeline
@@ -462,7 +463,6 @@ class AsyncPipelineManager:
             'keep_temp_files': resolved_config.get('keep_temp_files', False),
             'subs_language': resolved_config.get('subs_language', 'japanese'),
             'resolved_config': resolved_config,
-            'scene_method': resolved_config.get('scene_method', 'auditok')
         }
         
         # Submit the batch for processing. This call is non-blocking.

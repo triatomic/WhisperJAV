@@ -20,6 +20,9 @@
                     <span class="update-indicator-dot"></span>
                     <span id="updateIndicatorText">Update available</span>
                 </a>
+                <!-- 1.10.0 (item 6, #448): English / Simplified Chinese. The button names the
+                     language it switches to, so it is never translated itself. -->
+                <button id="langBtn" class="theme-button lang-button" data-i18n-skip title="English / 中文" aria-label="English / 中文">中文</button>
                 <!-- Minimal theme switch button -->
                 <button id="themeBtn" class="theme-button" aria-label="Theme" title="Theme">
                     🎨
@@ -221,9 +224,6 @@
                                             <option value="balanced" selected>balanced&nbsp;&nbsp;&nbsp;&nbsp;(large-v2-int8&nbsp;&nbsp;&nbsp;&nbsp;6GB VRAM)</option>
                                             <option value="fast">fast&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;(turbo-int8&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;4GB VRAM)</option>
                                             <option value="faster">faster&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;(turbo-int8-batch8&nbsp;&nbsp;6GB VRAM)</option>
-                                            <!-- kotoba-faster-whisper temporarily hidden (implementation preserved)
-                                            <option value="kotoba-faster-whisper">kotoba&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;(kotoba-v2-fp16&nbsp;&nbsp;&nbsp;6GB VRAM)</option>
-                                            -->
                                             <option value="transformers">transformers&nbsp;&nbsp;(HF kotoba-bilingual&nbsp;6GB VRAM)</option>
                                             <option value="sensevoice">sensevoice&nbsp;&nbsp;&nbsp;(FunASR Small&nbsp;&nbsp;&nbsp;&nbsp;~1GB VRAM)</option>
                                             <option value="anime" disabled>anime (future placeholder)</option>
@@ -343,6 +343,18 @@
                                         <span>Keep temp files</span>
                                     </label>
                                 </div>
+                                <div class="form-group">
+                                    <label class="checkbox-label" title="Skip files that already have a WhisperJAV subtitle in the output folder">
+                                        <input type="checkbox" id="skipExisting">
+                                        <span>Skip already-subtitled files</span>
+                                    </label>
+                                </div>
+                                <div class="form-group">
+                                    <label class="checkbox-label" title="Restore these form settings the next time WhisperJAV starts">
+                                        <input type="checkbox" id="rememberSettings">
+                                        <span>Remember settings</span>
+                                    </label>
+                                </div>
                                 <div class="form-group temp-dir-group inline-field">
                                     <label for="tempDir" class="form-label" style="white-space: nowrap;">Temp dir:</label>
                                     <div class="input-with-button">
@@ -359,18 +371,49 @@
                                 </div>
                             </div>
 
-                            <!-- Row 3: Accept CPU mode -->
+                            <!-- Row 3: offline mode (1.10.0: the "Accept CPU-only mode" box is gone,
+                                 design 22.5.1 -- each install is made for one accelerator; nothing asks) -->
                             <div class="form-row" id="adv-row-3">
                                 <div class="form-group">
-                                    <label class="checkbox-label" title="Skip GPU performance warning and accept CPU-only mode">
-                                        <input type="checkbox" id="acceptCpuMode">
-                                        <span>Accept CPU-only mode (skip GPU warning)</span>
+                                    <label class="checkbox-label" title="Use only the Hugging Face models already downloaded and make no requests to huggingface.co (same as --offline). A model that has not been downloaded fails immediately instead of retrying for minutes. Silero via torch.hub, openai-whisper weights, ModelScope enhancers and NeMo configs are not covered.">
+                                        <input type="checkbox" id="offlineMode">
+                                        <span>Offline mode (downloaded Hugging Face models only)</span>
                                     </label>
                                 </div>
                             </div>
-
-                            <!-- Row 4: Batched transcription (balanced pipeline speedup, issue #357) -->
+                            <!-- Run outcome contract: every file ends as done / empty / suspect / failed / skipped.
+                                 Only 'failed' fails the run by default; these promote the other two. Same as --fail-on. -->
                             <div class="form-row" id="adv-row-4">
+                                <div class="form-group">
+                                    <label class="checkbox-label" title="A file that produced no subtitles is reported as 'empty' and does not fail the run. Tick to treat it as a failure (same as --fail-on empty).">
+                                        <input type="checkbox" id="failOnEmpty">
+                                        <span>Treat 'empty' files as failures</span>
+                                    </label>
+                                </div>
+                                <div class="form-group">
+                                    <label class="checkbox-label" title="A file whose subtitles cover too little of the media, whose recognizer stopped while speech was still detected, or whose audio track looks damaged is reported as 'suspect' and does not fail the run. Tick to treat it as a failure (same as --fail-on suspect); a file with damaged audio is then stopped before transcription.">
+                                        <input type="checkbox" id="failOnSuspect">
+                                        <span>Treat 'suspect' files as failures</span>
+                                    </label>
+                                </div>
+                                <div class="form-group">
+                                    <label class="checkbox-label" title="Balanced runs keep a per-scene record of the recognizer (timing, decoder retries, confidence, memory) in raw_subs next to the outputs, for diagnosing runs that stop producing subtitles. Untick to skip it (same as --no-asr-telemetry).">
+                                        <input type="checkbox" id="asrTelemetry" checked>
+                                        <span>Keep per-scene ASR telemetry (raw_subs)</span>
+                                    </label>
+                                </div>
+                            </div>
+                            <!-- v1.9.2 (CFF1): Balanced and Fidelity reload the recognizer with a fresh instance
+                                 after this much scene audio, at a scene boundary. 0 = never. Same as
+                                 --model-refresh-audio-minutes. Read by both the Transcription and Ensemble runs. -->
+                            <div class="form-row" id="adv-row-5">
+                                <div class="form-group inline-field">
+                                    <label for="modelRefreshAudioMinutes" class="form-label" style="white-space: nowrap;" title="Balanced and Fidelity unload the recognizer and load a fresh instance after this many minutes of scene audio, at a scene boundary (containment for runs that stop producing subtitles late in a long file). 0 = never. Same as --model-refresh-audio-minutes.">Reload recognizer every (minutes of audio):</label>
+                                    <input type="number" id="modelRefreshAudioMinutes" class="form-input" value="20" min="0" step="1" style="max-width: 6em;">
+                                </div>
+                            </div>
+                            <!-- Row 4: Batched transcription (balanced pipeline speedup, issue #357) -->
+                            <div class="form-row" id="adv-row-batched">
                                 <div class="form-group">
                                     <label class="checkbox-label" title="Batch the encoder across VAD groups using faster-whisper BatchedInferencePipeline. 5-20x faster transcription on GPU for the balanced pipeline. No effect on other modes.">
                                         <input type="checkbox" id="batchedPipeline" checked>
@@ -447,7 +490,7 @@
                                     <div class="col-pipeline">
                                         <select id="pass1-pipeline" class="form-select compact">
                                             <optgroup label="Whisper-Based">
-                                                <option value="balanced" selected>Balanced</option>
+                                                <option value="balanced">Balanced</option>
                                                 <option value="fast">Fast</option>
                                                 <option value="faster">Faster</option>
                                                 <option value="fidelity">Fidelity</option>
@@ -463,13 +506,30 @@
                                                 <option value="anime-whisper">Anime-Whisper</option>
                                                 <option value="cohere" title="Gated HuggingFace model: request access at huggingface.co/CohereLabs/cohere-transcribe-03-2026 and set HF_TOKEN before first use">Cohere-Transcribe (preview — gated HF)</option>
                                             </optgroup>
+                                            <!-- 1.10.0 (item 5, REQ5): XXL as pass 1, as in the pass 2 menu -->
+                                            <optgroup label="External (BYOP)">
+                                                <option value="xxl">XXL Faster Whisper</option>
+                                            </optgroup>
+                                            <optgroup label="GGUF via crispasr">
+                                                <option value="parakeet-crispasr" title="Experimental (early release). The GGUF (CrispASR) pipelines need folder names in plain Western letters (ASCII). When your user folder has Chinese, Japanese or Korean characters, WhisperJAV links or copies the model to a plain-named folder (the original stays where it is).">parakeet</option>
+                                                <option value="cohere-crispasr" selected title="Experimental (early release). The GGUF (CrispASR) pipelines need folder names in plain Western letters (ASCII). When your user folder has Chinese, Japanese or Korean characters, WhisperJAV links or copies the model to a plain-named folder (the original stays where it is).">cohere</option>
+                                            </optgroup>
+                                            <!-- 1.10.1 (owner W520 CLA2, W521): a divider line, then the five GGUF pipelines new in 1.10.1 under their own heading -->
+                                            <hr>
+                                            <optgroup label="Experimental, open to feedback">
+                                                <option value="reazonspeech-crispasr" title="New in 1.10.1, experimental (early release). The GGUF (CrispASR) pipelines need folder names in plain Western letters (ASCII). When your user folder has Chinese, Japanese or Korean characters, WhisperJAV links or copies the model to a plain-named folder (the original stays where it is).">reazonspeech</option>
+                                                <option value="kotoba-crispasr" title="New in 1.10.1, experimental (early release). The GGUF (CrispASR) pipelines need folder names in plain Western letters (ASCII). When your user folder has Chinese, Japanese or Korean characters, WhisperJAV links or copies the model to a plain-named folder (the original stays where it is).">kotoba</option>
+                                                <option value="whisper-turbo-crispasr" title="New in 1.10.1, experimental (early release). The GGUF (CrispASR) pipelines need folder names in plain Western letters (ASCII). When your user folder has Chinese, Japanese or Korean characters, WhisperJAV links or copies the model to a plain-named folder (the original stays where it is).">whisper-turbo</option>
+                                                <option value="whisper-large-crispasr" title="New in 1.10.1, experimental (early release). The GGUF (CrispASR) pipelines need folder names in plain Western letters (ASCII). When your user folder has Chinese, Japanese or Korean characters, WhisperJAV links or copies the model to a plain-named folder (the original stays where it is).">whisper-large</option>
+                                                <option value="moss-crispasr" title="New in 1.10.1, experimental (early release). The GGUF (CrispASR) pipelines need folder names in plain Western letters (ASCII). When your user folder has Chinese, Japanese or Korean characters, WhisperJAV links or copies the model to a plain-named folder (the original stays where it is).">MOSS</option>
+                                            </optgroup>
                                         </select>
                                     </div>
                                     <div class="col-separator"></div>
                                     <div class="col-sensitivity">
                                         <select id="pass1-sensitivity" class="form-select compact">
-                                            <option value="aggressive" selected>Aggressive</option>
-                                            <option value="balanced">Balanced</option>
+                                            <option value="aggressive">Aggressive</option>
+                                            <option value="balanced" selected>Balanced</option>
                                             <option value="conservative">Conservative</option>
                                         </select>
                                     </div>
@@ -489,17 +549,14 @@
                                                 <option value="ffmpeg-dsp">Audio Filters...</option>
                                             </optgroup>
                                             <optgroup label="ZipEnhancer (Recommended)">
-                                                <option value="zipenhancer">Torch (GPU)</option>
+                                                <option value="zipenhancer">PyTorch (GPU when available)</option>
                                                 <option value="zipenhancer:onnx" disabled class="coming-soon">ONNX (Coming Soon)</option>
-                                            </optgroup>
-                                            <optgroup label="ClearVoice">
-                                                <option value="clearvoice:MossFormer2_SE_48K" disabled title="Unstable on 8GB VRAM - causes memory fragmentation">MossFormer2 48kHz (Unstable)</option>
-                                                <option value="clearvoice:FRCRN_SE_16K">FRCRN 16kHz</option>
-                                                <option value="clearvoice:MossFormerGAN_SE_16K">MossFormerGAN 16kHz</option>
-                                                <option value="clearvoice:MossFormer2_SS_16K">MossFormer2 SS 16kHz</option>
                                             </optgroup>
                                             <optgroup label="BS-RoFormer">
                                                 <option value="bs-roformer:vocals" title="Band-Split RoFormer vocal isolation — separates speech from music/background (44.1kHz). Requires the bs-roformer-infer package.">Vocals</option>
+                                            </optgroup>
+                                            <optgroup label="htdemucs (Demucs v4)">
+                                                <option value="htdemucs" title="Isolates the voice from music and effects. Installed with WhisperJAV; its 84 MB model is fetched once on first use, from Meta's site rather than Hugging Face. If it cannot run, the run stops and says so.">Vocals</option>
                                             </optgroup>
                                         </select>
                                         <div class="enhance-for-vad-row" id="pass1-enhance-vad-row" style="display: none;">
@@ -510,6 +567,10 @@
                                         </div>
                                     </div>
                                     <div class="col-segmenter">
+                                        <!-- v1.9.2: the EXTERNAL speech segmenters. When a pass's
+                                             Pipeline is Balanced, app.js (populateSegmenterOptions)
+                                             swaps this list for the built-in VAD's Silero versions:
+                                             balanced offers no external segmenter (S2/S9). -->
                                         <select id="pass1-segmenter" class="form-select compact">
                                             <option value="silero">Silero v4.0</option>
                                             <option value="silero-v3.1">Silero v3.1</option>
@@ -522,8 +583,8 @@
                                             <!-- <option value="whisper-vad-tiny">Whisper VAD (tiny)</option> -->
                                             <!-- <option value="whisper-vad-medium">Whisper VAD (medium)</option> -->
                                             <option value="ten">TEN VAD</option>
-                                            <option value="firered" title="FireRedVAD — multilingual DFSMN VAD (Xiaohongshu), 97.57% F1 on FLEURS-VAD-102. Tiny model (~2MB), fast on CPU. Requires pip install fireredvad; weights auto-download from HuggingFace.">FireRedVAD</option>
-                                            <option value="whisperseg" selected title="Whisper-encoder VAD trained on Japanese ASMR (ONNX). Default since v1.8.13 — F1=0.787 on Netflix-GT JAV. For non-Japanese audio, switch to Silero v3.1.">WhisperSeg (JA-ASMR, default)</option>
+                                            <option value="whisperseg" title="Whisper-encoder VAD trained on Japanese ASMR (ONNX). F1=0.787 on Netflix-GT JAV. For non-Japanese audio, switch to Silero v3.1.">WhisperSeg (JA-ASMR)</option>
+                                            <option value="firered-vad" selected title="FireRedTeam DFSMN VAD (~0.6M params, 100+ languages). Installed with WhisperJAV since v1.9.2.">FireRedVAD</option>
                                             <option value="none">None</option>
                                         </select>
                                     </div>
@@ -533,6 +594,7 @@
                                             <option value="large-v2" selected>Large V2</option>
                                             <option value="large-v3">Large V3</option>
                                             <option value="turbo">Turbo</option>
+                                            <option value="TransWithAI/whisper-ja-1.5B-ct2" title="whisper-ja-1.5B Japanese finetune (CTranslate2). Use with the Balanced pipeline — not compatible with the Fidelity (OpenAI Whisper) pipeline.">whisper-ja-1.5B (CT2, JA)</option>
                                         </select>
                                     </div>
                                     <div class="col-actions">
@@ -544,6 +606,9 @@
                                         <span id="pass1-badge" class="pass-badge default">DEFAULT</span>
                                     </div>
                                 </div>
+
+                                <!-- Pass 1 CrispASR status (shown when a GGUF pipeline is selected; T16) -->
+                                <div class="crispasr-status-panel" id="pass1-crispasr-status" style="display: none;"></div>
 
                                 <!-- Pass 1 DSP Effects Panel (shown when FFmpeg DSP selected) -->
                                 <div class="dsp-effects-panel" id="pass1-dsp-panel" style="display: none;">
@@ -619,20 +684,33 @@
                                                 <option value="sensevoice">SenseVoice (Small)</option>
                                             </optgroup>
                                             <optgroup label="ChronosJAV">
-                                                <option value="qwen" selected>Qwen3-ASR</option>
+                                                <option value="qwen">Qwen3-ASR</option>
                                                 <option value="anime-whisper">Anime-Whisper</option>
                                                 <option value="cohere" title="Gated HuggingFace model: request access at huggingface.co/CohereLabs/cohere-transcribe-03-2026 and set HF_TOKEN before first use">Cohere-Transcribe (preview — gated HF)</option>
                                             </optgroup>
                                             <optgroup label="External (BYOP)">
                                                 <option value="xxl">XXL Faster Whisper</option>
                                             </optgroup>
+                                            <optgroup label="GGUF via crispasr">
+                                                <option value="parakeet-crispasr" selected title="Experimental (early release). The GGUF (CrispASR) pipelines need folder names in plain Western letters (ASCII). When your user folder has Chinese, Japanese or Korean characters, WhisperJAV links or copies the model to a plain-named folder (the original stays where it is).">parakeet</option>
+                                                <option value="cohere-crispasr" title="Experimental (early release). The GGUF (CrispASR) pipelines need folder names in plain Western letters (ASCII). When your user folder has Chinese, Japanese or Korean characters, WhisperJAV links or copies the model to a plain-named folder (the original stays where it is).">cohere</option>
+                                            </optgroup>
+                                            <!-- 1.10.1 (owner W520 CLA2, W521): a divider line, then the five GGUF pipelines new in 1.10.1 under their own heading -->
+                                            <hr>
+                                            <optgroup label="Experimental, open to feedback">
+                                                <option value="reazonspeech-crispasr" title="New in 1.10.1, experimental (early release). The GGUF (CrispASR) pipelines need folder names in plain Western letters (ASCII). When your user folder has Chinese, Japanese or Korean characters, WhisperJAV links or copies the model to a plain-named folder (the original stays where it is).">reazonspeech</option>
+                                                <option value="kotoba-crispasr" title="New in 1.10.1, experimental (early release). The GGUF (CrispASR) pipelines need folder names in plain Western letters (ASCII). When your user folder has Chinese, Japanese or Korean characters, WhisperJAV links or copies the model to a plain-named folder (the original stays where it is).">kotoba</option>
+                                                <option value="whisper-turbo-crispasr" title="New in 1.10.1, experimental (early release). The GGUF (CrispASR) pipelines need folder names in plain Western letters (ASCII). When your user folder has Chinese, Japanese or Korean characters, WhisperJAV links or copies the model to a plain-named folder (the original stays where it is).">whisper-turbo</option>
+                                                <option value="whisper-large-crispasr" title="New in 1.10.1, experimental (early release). The GGUF (CrispASR) pipelines need folder names in plain Western letters (ASCII). When your user folder has Chinese, Japanese or Korean characters, WhisperJAV links or copies the model to a plain-named folder (the original stays where it is).">whisper-large</option>
+                                                <option value="moss-crispasr" title="New in 1.10.1, experimental (early release). The GGUF (CrispASR) pipelines need folder names in plain Western letters (ASCII). When your user folder has Chinese, Japanese or Korean characters, WhisperJAV links or copies the model to a plain-named folder (the original stays where it is).">MOSS</option>
+                                            </optgroup>
                                         </select>
                                     </div>
                                     <div class="col-separator"></div>
                                     <div class="col-sensitivity">
                                         <select id="pass2-sensitivity" class="form-select compact" disabled>
-                                            <option value="aggressive">Aggressive</option>
-                                            <option value="balanced" selected>Balanced</option>
+                                            <option value="aggressive" selected>Aggressive</option>
+                                            <option value="balanced">Balanced</option>
                                             <option value="conservative">Conservative</option>
                                         </select>
                                     </div>
@@ -652,17 +730,14 @@
                                                 <option value="ffmpeg-dsp">Audio Filters...</option>
                                             </optgroup>
                                             <optgroup label="ZipEnhancer (Recommended)">
-                                                <option value="zipenhancer">Torch (GPU)</option>
+                                                <option value="zipenhancer">PyTorch (GPU when available)</option>
                                                 <option value="zipenhancer:onnx" disabled class="coming-soon">ONNX (Coming Soon)</option>
-                                            </optgroup>
-                                            <optgroup label="ClearVoice">
-                                                <option value="clearvoice:MossFormer2_SE_48K" disabled title="Unstable on 8GB VRAM - causes memory fragmentation">MossFormer2 48kHz (Unstable)</option>
-                                                <option value="clearvoice:FRCRN_SE_16K">FRCRN 16kHz</option>
-                                                <option value="clearvoice:MossFormerGAN_SE_16K">MossFormerGAN 16kHz</option>
-                                                <option value="clearvoice:MossFormer2_SS_16K">MossFormer2 SS 16kHz</option>
                                             </optgroup>
                                             <optgroup label="BS-RoFormer">
                                                 <option value="bs-roformer:vocals" title="Band-Split RoFormer vocal isolation — separates speech from music/background (44.1kHz). Requires the bs-roformer-infer package.">Vocals</option>
+                                            </optgroup>
+                                            <optgroup label="htdemucs (Demucs v4)">
+                                                <option value="htdemucs" title="Isolates the voice from music and effects. Installed with WhisperJAV; its 84 MB model is fetched once on first use, from Meta's site rather than Hugging Face. If it cannot run, the run stops and says so.">Vocals</option>
                                             </optgroup>
                                         </select>
                                         <div class="enhance-for-vad-row" id="pass2-enhance-vad-row" style="display: none;">
@@ -673,6 +748,10 @@
                                         </div>
                                     </div>
                                     <div class="col-segmenter">
+                                        <!-- v1.9.2: the EXTERNAL speech segmenters. When a pass's
+                                             Pipeline is Balanced, app.js (populateSegmenterOptions)
+                                             swaps this list for the built-in VAD's Silero versions:
+                                             balanced offers no external segmenter (S2/S9). -->
                                         <select id="pass2-segmenter" class="form-select compact" disabled>
                                             <option value="silero">Silero v4.0</option>
                                             <option value="silero-v3.1">Silero v3.1</option>
@@ -684,9 +763,9 @@
                                             <!-- <option value="whisper-vad">Whisper VAD (small)</option> -->
                                             <!-- <option value="whisper-vad-tiny">Whisper VAD (tiny)</option> -->
                                             <!-- <option value="whisper-vad-medium">Whisper VAD (medium)</option> -->
-                                            <option value="ten">TEN VAD</option>
-                                            <option value="firered" title="FireRedVAD — multilingual DFSMN VAD (Xiaohongshu), 97.57% F1 on FLEURS-VAD-102. Tiny model (~2MB), fast on CPU. Requires pip install fireredvad; weights auto-download from HuggingFace.">FireRedVAD</option>
-                                            <option value="whisperseg" selected title="Whisper-encoder VAD trained on Japanese ASMR (ONNX). Default since v1.8.13 — F1=0.787 on Netflix-GT JAV. For non-Japanese audio, switch to Silero v3.1.">WhisperSeg (JA-ASMR, default)</option>
+                                            <option value="ten" selected title="TEN VAD — pass 2 default for segmentation diversity vs pass 1's FireRedVAD.">TEN VAD (default)</option>
+                                            <option value="whisperseg" title="Whisper-encoder VAD trained on Japanese ASMR (ONNX). F1=0.787 on Netflix-GT JAV. For non-Japanese audio, switch to Silero v3.1.">WhisperSeg (JA-ASMR)</option>
+                                            <option value="firered-vad" title="FireRedTeam DFSMN VAD (~0.6M params, 100+ languages). Installed with WhisperJAV since v1.9.2.">FireRedVAD</option>
                                             <option value="none">None</option>
                                         </select>
                                     </div>
@@ -695,6 +774,8 @@
                                         <select id="pass2-model" class="form-select compact" disabled>
                                             <option value="Qwen/Qwen3-ASR-1.7B" selected>Qwen3-ASR-1.7B    8GB</option>
                                             <option value="Qwen/Qwen3-ASR-0.6B">Qwen3-ASR-0.6B    4GB</option>
+                                            <option value="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame" title="Full SFT of Qwen3-ASR-1.7B on galgame speech. Published CER 0.1285 vs base 0.1437; −26.8% on anime speech.">JA Anime-Galgame 1.7B    8GB</option>
+                                            <option value="neosophie/Qwen3-ASR-1.7B-JA" title="Japanese finetune of Qwen3-ASR-1.7B focused on proper nouns and kanji-heavy expressions.">JA-tuned 1.7B (neosophie)    8GB</option>
                                         </select>
                                     </div>
                                     <div class="col-actions">
@@ -706,6 +787,9 @@
                                         <span id="pass2-badge" class="pass-badge default">DEFAULT</span>
                                     </div>
                                 </div>
+
+                                <!-- Pass 2 CrispASR status (shown when a GGUF pipeline is selected; T16) -->
+                                <div class="crispasr-status-panel" id="pass2-crispasr-status" style="display: none;"></div>
 
                                 <!-- Pass 2 DSP Effects Panel (shown when FFmpeg DSP selected) -->
                                 <div class="dsp-effects-panel" id="pass2-dsp-panel" style="display: none;">
@@ -758,7 +842,7 @@
                                     </div>
                                 </div>
 
-                                <!-- BYOP Settings Row (shown when XXL Faster Whisper selected as Pass 2) -->
+                                <!-- BYOP Settings Row (shown when XXL Faster Whisper is selected in either pass; one panel for both) -->
                                 <div class="byop-settings-panel" id="byop-settings-panel" style="display: none;">
                                     <div class="byop-settings-header">
                                         <span class="byop-title">XXL Faster Whisper</span>
@@ -774,10 +858,12 @@
                                     </div>
                                     <div class="byop-settings-row">
                                         <label class="byop-label" for="xxl-extra-args">Extra Args</label>
+                                        <!-- 1.10.0 (item 5, owner W271 4): no model here; the Model column picks it.
+                                             Texts G2 (placeholder) and G3 (title), approved by the owner as drafted (W275). -->
                                         <input type="text" id="xxl-extra-args" class="form-input byop-args-input"
-                                               value="--model large-v3 --verbose True --standard_asia"
-                                               placeholder="e.g. --model large-v3 --verbose --standard_asia"
-                                               title="Additional command-line arguments passed directly to XXL">
+                                               value="--verbose True --standard_asia"
+                                               placeholder="e.g. --verbose True --standard_asia (choose the model in the Model column)"
+                                               title="Additional command-line arguments passed directly to XXL. The model is chosen in the Model column; a --model here is not used.">
                                     </div>
                                 </div>
 
@@ -794,7 +880,8 @@
                                             <option value="pass2_overlap">Pass 2 + Fill (30% Overlap)</option>
                                         </select>
                                         <label class="checkbox-label" style="margin-left: 16px; white-space: nowrap;" title="Complete each file fully before starting the next. Slower (reloads models per file) but delivers results incrementally.">
-                                            <input type="checkbox" id="ensemble-serial">
+                                            <!-- 1.10.1: ticked by default (owner W493 1) -->
+                                            <input type="checkbox" id="ensemble-serial" checked>
                                             <span>Finish each file</span>
                                         </label>
                                     </div>
@@ -813,7 +900,6 @@
                                             <option value="" disabled selected>— Select a Provider —</option>
                                             <optgroup label="Local LLM">
                                                 <option value="ollama">Ollama</option>
-                                                <option value="local">llama-cpp (deprecated)</option>
                                             </optgroup>
                                             <optgroup label="Cloud AI">
                                                 <option value="deepseek">DeepSeek</option>
@@ -873,9 +959,6 @@
                                             <span class="ollama-ready-text">Ollama server connected</span>
                                         </div>
                                     </div>
-                                    <div id="ensembleDeprecationHint" class="provider-deprecation-hint" style="display:none">
-                                        This backend is being retired in v1.9.0. Consider switching to Ollama.
-                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -901,7 +984,6 @@
                                                 <option value="" disabled selected>— Select a Provider —</option>
                                                 <optgroup label="Local LLM">
                                                     <option value="ollama">Ollama</option>
-                                                    <option value="local">llama-cpp (deprecated)</option>
                                                 </optgroup>
                                                 <optgroup label="Cloud AI">
                                                     <option value="deepseek">DeepSeek</option>
@@ -951,9 +1033,6 @@
                                                 <span class="ollama-ready-dot"></span>
                                                 <span class="ollama-ready-text">Ollama server connected</span>
                                             </div>
-                                        </div>
-                                        <div id="srtDeprecationHint" class="provider-deprecation-hint" style="display:none">
-                                            This backend is being retired in v1.9.0. Consider switching to Ollama.
                                         </div>
                                         <div class="form-group">
                                             <label for="translatorModel" class="form-label">Model:</label>
@@ -1005,6 +1084,9 @@
                                                 <option value="portuguese">Portuguese</option>
                                                 <option value="spanish">Spanish</option>
                                                 <option value="french">French</option>
+                                                <option value="italian">Italian</option>
+                                                <option value="thai">Thai</option>
+                                                <option value="korean">Korean</option>
                                             </select>
                                         </div>
                                         <div class="form-group">
@@ -1190,7 +1272,7 @@
                     </div>
                 </div>
                 <div class="section-content">
-                    <div class="console-output" id="consoleOutput">
+                    <div class="console-output" id="consoleOutput" data-i18n-skip>
                         <div class="console-line">Ready.</div>
                     </div>
                 </div>
@@ -1262,6 +1344,23 @@
         </div>
     </div>
 
+    <!-- A run that did not start, or ended without a run summary (design 22.9.2; owner D-G) -->
+    <div class="modal-overlay" id="runStopModal">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <h2 id="runStopTitle">The run did not start</h2>
+                <button class="modal-close" onclick="RunStopDialog.close()" aria-label="Close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p id="runStopText"></p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="runStopCpuBtn" onclick="RunStopDialog.runOnCpu()" style="display: none;">Run on the CPU this time</button>
+                <button class="btn btn-primary" onclick="RunStopDialog.close()">Close</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Changelog Modal -->
     <div class="modal-overlay" id="changelogModal">
         <div class="modal-dialog">
@@ -1279,7 +1378,7 @@
                         <span class="changelog-version" id="changelogVersion">v1.7.5</span>
                         <span class="changelog-date" id="changelogDate"></span>
                     </div>
-                    <div class="changelog-notes" id="changelogNotes">
+                    <div class="changelog-notes" id="changelogNotes" data-i18n-skip>
                         <!-- Release notes will be inserted here -->
                     </div>
                 </div>
@@ -1339,7 +1438,7 @@
                             <div id="stableReleaseNotes" class="release-notes-section" style="display: none;">
                                 <details class="release-notes-details">
                                     <summary>Release Notes</summary>
-                                    <div id="stableReleaseNotesContent" class="release-notes-content"></div>
+                                    <div id="stableReleaseNotesContent" class="release-notes-content" data-i18n-skip></div>
                                 </details>
                             </div>
                             <div id="stableActions" class="track-actions" style="display: none;">
@@ -1366,7 +1465,7 @@
                             </div>
                             <div id="devCommitsList" class="dev-commits-list" style="display: none;">
                                 <div class="commits-header">Recent commits:</div>
-                                <ul id="devRecentCommits" class="commits-list"></ul>
+                                <ul id="devRecentCommits" class="commits-list" data-i18n-skip></ul>
                             </div>
                             <div id="devActions" class="track-actions" style="display: none;">
                                 <button id="updateToDev" class="btn btn-secondary btn-sm">Open Release Page</button>
@@ -1402,6 +1501,8 @@
                     <button class="modal-tab" data-tab="enhancer">Enhancer</button>
                     <button class="modal-tab" data-tab="scene">Scene</button>
                     <button class="modal-tab" data-tab="context" style="display: none;">Context</button>
+                    <!-- 1.10.1 (owner W413 2): shown only for a CrispASR pass (openCrispasrCustomize) -->
+                    <button class="modal-tab" data-tab="timing" style="display: none;">Timing</button>
                 </div>
                 <!-- Tab Panels -->
                 <div class="modal-tab-content">
@@ -1422,6 +1523,9 @@
                     </div>
                     <div id="tab-context" class="modal-tab-panel">
                         <!-- Context hints and generation safety (Qwen only) -->
+                    </div>
+                    <div id="tab-timing" class="modal-tab-panel">
+                        <!-- Word timestamps of a CrispASR pass: from the model or from the aligner (1.10.1) -->
                     </div>
                 </div>
             </div>
@@ -1480,6 +1584,9 @@
                                 <option value="portuguese">Portuguese</option>
                                 <option value="spanish">Spanish</option>
                                 <option value="french">French</option>
+                                <option value="italian">Italian</option>
+                                <option value="thai">Thai</option>
+                                <option value="korean">Korean</option>
                             </select>
                         </div>
                         <div class="form-group">
@@ -1548,6 +1655,8 @@
                             <div class="form-group" title="Randomness of word choice (applies to cloud providers AND Ollama).&#10;ACCURACY: lower (0.2-0.4) = more literal, consistent, fewer hallucinations — best for subtitles; higher = more creative but more drift/invented lines.&#10;SPEED: no effect.&#10;VRAM: no effect.&#10;For Ollama, 0.3 is the tuned default.">
                                 <label for="translationTemperature" class="form-label">Temperature:</label>
                                 <input type="number" id="translationTemperature" class="form-input" value="0.5" min="0" max="2" step="0.1">
+                                <!-- #444 (owner, 2026-10-06): a custom server keeps its own temperature -->
+                                <div id="translationTemperatureHint" style="display:none; font-size:11px; font-style:italic; color:var(--text-tertiary); margin-top:2px">Custom provider: set by your server (not sent)</div>
                             </div>
                             <div class="form-group" title="Nucleus sampling: keep only the most probable tokens summing to this probability (cloud providers AND Ollama).&#10;ACCURACY: lower (0.9-0.92) trims unlikely/garbage tokens, steadier output; 1.0 disables it.&#10;SPEED: no effect.&#10;VRAM: no effect.">
                                 <label for="translationTopP" class="form-label">Top P:</label>
@@ -1650,7 +1759,8 @@
         </div>
     </div>
 
-    <!-- JavaScript -->
+    <!-- JavaScript. i18n_zh.js: the Simplified Chinese texts (1.10.0, item 6), read by I18n in app.js -->
+    <script src="i18n_zh.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

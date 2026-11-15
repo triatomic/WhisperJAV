@@ -23,12 +23,15 @@ from .components import (
     get_vad_registry,
     get_feature_registry,
 )
-from whisperjav.utils.device_detector import get_best_device
+from whisperjav.utils.device_detector import ctranslate2_device, get_best_device
 
 logger = logging.getLogger("whisperjav")
 
 # CTranslate2-based providers support "auto" compute_type selection
-CTRANSLATE2_PROVIDERS = {"faster_whisper", "kotoba_faster_whisper"}
+CTRANSLATE2_PROVIDERS = {"faster_whisper"}
+# Providers whose ASR runs on CTranslate2: balanced (faster_whisper), and fast and faster
+# (stable_ts with turbo_mode=True, fast_pipeline.py / faster_pipeline.py).
+CTRANSLATE2_DEVICE_PROVIDERS = {"faster_whisper", "stable_ts"}
 
 
 
@@ -135,10 +138,11 @@ def _get_compute_type_for_device(device: str, provider: str) -> str:
     """
     Select optimal compute_type based on device and provider.
 
-    CTranslate2 providers (faster_whisper, kotoba_faster_whisper):
-    - CUDA (non-Pascal): "float16" for best accuracy
+    CTranslate2 providers (faster_whisper):
     - CUDA + Pascal (sm_6x): "float32" (see Pascal note below)
-    - CUDA + Blackwell (sm_120): "float16" (int8_float16 buggy in CTranslate2)
+    - CUDA + Blackwell (sm_120+): "auto" — CTranslate2 picks, which is int8_float16
+      there; the float16 this used to force is what garbles output on those cards
+    - CUDA, everything else (Turing, Ampere, Ada): "float16"
     - Non-CUDA (CPU, MPS, etc.): "auto" — delegate to CTranslate2
     - See: https://github.com/OpenNMT/CTranslate2/issues/1865
 
@@ -182,20 +186,31 @@ def _get_compute_type_for_device(device: str, provider: str) -> str:
             )
             return "float32"
 
-        # Blackwell workaround (sm_120+): CTranslate2's "auto" incorrectly selects
-        # int8_float16 which fails on Blackwell. Force float16.
-        # See: https://github.com/meizhong986/WhisperJAV/issues/113
+        # Blackwell (sm_120+, RTX 50): "auto" (owner decision, 2026-09-11).
+        #
+        # Until v1.9.2 these cards were forced to float16 to dodge a CTranslate2
+        # crash (issue #113). That reason expired: CTranslate2 disabled int8 for
+        # sm_120 in 4.6.2 and runs it again in the 4.8.1 pinned here. Meanwhile the
+        # forced float16 became the problem -- the reporter of issue #414 measured
+        # it on an RTX 5070 producing garbled windows and almost no subtitles, where
+        # "auto" (int8_float16) gave him clean output. So these cards ask the library.
         if _is_blackwell_gpu():
             logger.info(
-                "Blackwell GPU detected (RTX 50 series). Using float16 compute_type "
-                "due to CTranslate2 int8_float16 compatibility issue."
+                "Blackwell GPU detected (RTX 50 series). Using 'auto' compute_type so "
+                "CTranslate2 selects for this card (see issue #414)."
             )
-            return "float16"
+            return "auto"
 
-        # All other CUDA GPUs (Turing, Ampere, Ada Lovelace): float16 for best
-        # accuracy. "auto" would pick int8_float16 which introduces quantization
-        # artifacts. float16 uses ~1-2GB more VRAM but preserves full precision.
-        # Users with limited VRAM can override with --compute-type int8_float16.
+        # Every other CUDA GPU (Turing, Ampere, Ada): float16.
+        #
+        # "auto" loads int8_float16 on these cards, and it was measured on an RTX 3060
+        # against the human subtitles in test_media/Ground_Truths/ (7 clips, 2 repeats,
+        # large-v2, balanced): accuracy is a wash (CER difference +0.012 in int8's
+        # favour, 95% CI -0.003..+0.027, so not significant), it saves about 1.9 GB of
+        # video memory, and it costs 14-30% throughput on those clips and 32% on JAV
+        # audio. The owner's largest user group gains nothing worth a third of their
+        # speed, so they stay on float16. Users short of video memory can still ask
+        # for int8_float16 with --compute-type.
         return "float16"
     else:
         # PyTorch-based providers can use float16 on GPU/MPS, float32 on CPU
@@ -327,6 +342,11 @@ def resolve_config_v3(
     if device and device != "auto":
         selected_device = device
         logger.debug(f"v3.0 resolver: Using user-specified device='{selected_device}'")
+    elif asr_component.provider in CTRANSLATE2_DEVICE_PROVIDERS:
+        # balanced, fast and faster run on CTranslate2: "cuda" only when CTranslate2 itself sees
+        # a CUDA device, not when a ROCm PyTorch says so (design 22.3.3).
+        selected_device = ctranslate2_device("auto", best=get_best_device())
+        logger.debug(f"v3.0 resolver: Auto-detected CTranslate2 device='{selected_device}'")
     else:
         selected_device = get_best_device()
         logger.debug(f"v3.0 resolver: Auto-detected device='{selected_device}'")
@@ -357,6 +377,9 @@ def resolve_config_v3(
         'task': task,
         'language': asr_params.get('language', 'ja'),
         'model': model_config,
+        # The device asked for (None = auto), before the CTranslate2 rule: the speech enhancer
+        # runs on PyTorch and follows it (pipeline_helper.create_enhancer_from_config).
+        'run_device': device,
         'params': {
             'asr': asr_params,
             'vad': vad_params,

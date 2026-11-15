@@ -101,8 +101,7 @@ class Extra(Enum):
     CLI = "cli"             # Audio processing, VAD, scene detection
     GUI = "gui"             # PyWebView GUI
     TRANSLATE = "translate" # AI translation (pysubtrans, OpenAI, Gemini)
-    LLM = "llm"             # Local LLM server (FastAPI, uvicorn)
-    ENHANCE = "enhance"     # Speech enhancement (ZipEnhancer, ClearVoice, BS-RoFormer, FFmpeg-DSP)
+    ENHANCE = "enhance"     # Speech enhancement (ZipEnhancer, BS-RoFormer, htdemucs, FFmpeg-DSP)
     HUGGINGFACE = "huggingface"  # HuggingFace Transformers
     QWEN = "qwen"           # Qwen3-ASR support (v1.8.3+)
     ANALYSIS = "analysis"   # Scientific analysis and visualization
@@ -124,7 +123,7 @@ class InstallSource(Enum):
     PYPI = auto()           # Standard PyPI (default)
     GIT = auto()            # Git repository
     INDEX_URL = auto()      # PyPI-like index (e.g., PyTorch CUDA wheels)
-    WHEEL_URL = auto()      # Direct wheel URL (e.g., HuggingFace llama-cpp)
+    WHEEL_URL = auto()      # Direct wheel URL
 
 
 class Platform(Enum):
@@ -221,7 +220,7 @@ class Package:
         Generate pyproject.toml dependency specification.
 
         Returns string like:
-        - "numpy>=2.0.0"
+        - "numpy>=2.5,<2.6"
         - "openai-whisper @ git+https://github.com/openai/whisper@main"
         - "pywin32>=305; sys_platform == 'win32'"
         """
@@ -331,6 +330,7 @@ PACKAGES: List[Package] = [
     #
     Package(
         name="torch",
+        version="==2.11.0",  # v1.10.0: pinned, as in pyproject.toml (torchaudio ends at 2.11.0)
         extra=Extra.CORE,
         source=InstallSource.INDEX_URL,
         index_url="https://download.pytorch.org/whl/{cuda}",
@@ -340,21 +340,13 @@ PACKAGES: List[Package] = [
     ),
     Package(
         name="torchaudio",
+        version="==2.11.0",
         extra=Extra.CORE,
         source=InstallSource.INDEX_URL,
         index_url="https://download.pytorch.org/whl/{cuda}",
         order=11,
         required=True,
         reason="Audio processing for PyTorch - must match torch version",
-    ),
-    Package(
-        name="torchvision",
-        extra=Extra.CORE,
-        source=InstallSource.INDEX_URL,
-        index_url="https://download.pytorch.org/whl/{cuda}",
-        order=12,
-        required=True,
-        reason="PyTorch vision - required by ClearVoice enhancement backend; must match torch CUDA index",
     ),
 
     # =========================================================================
@@ -367,11 +359,12 @@ PACKAGES: List[Package] = [
     #
     Package(
         name="numpy",
-        version=">=2.0.0",
+        version=">=2.5,<2.6",
         extra=Extra.CLI,
         order=20,
         required=True,
-        reason="Scientific computing (numpy 2.x required) - MUST be before numba (ABI compatibility)",
+        reason="Scientific computing - MUST be before numba (ABI compatibility). v1.10.0: 2.5.x "
+               "satisfies numba 0.68 (<2.6) and every roadmap item read (pyproject.toml comment)",
     ),
     Package(
         name="scipy",
@@ -382,10 +375,10 @@ PACKAGES: List[Package] = [
     ),
     Package(
         name="numba",
-        version=">=0.60.0",
+        version=">=0.61.0",
         extra=Extra.CLI,
         order=22,
-        reason="JIT compilation for performance - 0.60.0+ required for numpy 2.x binary support",
+        reason="JIT compilation for performance - 0.61.0+ matches pyproject (numpy 2.x binary support)",
     ),
 
     # =========================================================================
@@ -424,13 +417,47 @@ PACKAGES: List[Package] = [
         order=32,
         reason="FFmpeg bindings - PyPI tarball has build issues, use git",
     ),
+    # v1.9.2: faster-whisper and CTranslate2 are pinned exactly, not by range.
+    #
+    # faster-whisper is pinned to a COMMIT on SYSTRAN's master branch, three commits
+    # past the v1.2.1 tag, because those three commits are the ones we want:
+    #   ed9a06c  Adds new VAD parameters (#1386)
+    #   2eeafe0  Update Silero-VAD weights to v6.2 (#1390)
+    #   cf42429  Remove "local_dir_use_symlinks" from download_model() (#1389)
+    # The 1.2.1 release still carries the older Silero v6 weights. Pinning the commit
+    # rather than the branch keeps installs reproducible: the branch moves, this does
+    # not. It is also the exact build the maintainer develops and tests against.
+    #
+    # CT2 4.6.2 reproduces the #125 crash on exit (0xC0000409); 4.8.1 does not.
+    # v1.10.0: 4.8.3 (#459), taken without measurement (owner, W36 (4)). On a CUDA 13
+    # Windows install it runs on the cuBLAS 12 DLLs placed in its folder
+    # (whisperjav/installer/cublas12.py).
+    # ctranslate2 is listed first so the pinned version is in place when
+    # faster-whisper is resolved.
+    #
+    # The Windows installer installs both from its locked file in one --no-deps
+    # step (v1.10.0, item 2f: uv.lock exported per PyTorch build), so faster-whisper
+    # never resolves ctranslate2 for itself; it needs it at run time, not at
+    # install time.
     Package(
-        name="faster-whisper",
-        version=">=1.1.0",
+        name="ctranslate2",
+        version="==4.8.3",
         extra=Extra.CORE,
         order=33,
         required=True,
-        reason="CTranslate2-based Whisper for 4x faster inference",
+        reason="Inference engine behind faster-whisper. Pinned exactly: 4.6.2 "
+               "reproduces the #125 crash on exit; 4.8.3 since v1.10.0 (#459).",
+    ),
+    Package(
+        name="faster-whisper",
+        extra=Extra.CORE,
+        source=InstallSource.GIT,
+        git_url="git+https://github.com/SYSTRAN/faster-whisper.git@ed9a06cd89a93e47838f564998a6c09b655d7f43",
+        order=34,
+        required=True,
+        import_name="faster_whisper",
+        reason="CTranslate2-based Whisper. Pinned to master@ed9a06c (3 commits past "
+               "v1.2.1) for the Silero v6.2 weights and the new VAD parameters.",
     ),
 
     # =========================================================================
@@ -447,6 +474,13 @@ PACKAGES: List[Package] = [
         extra=Extra.CLI,
         order=41,
         reason="Audio segment manipulation for scene detection",
+    ),
+    Package(
+        name="audioop-lts",
+        extra=Extra.CLI,
+        order=41,
+        import_name="audioop",
+        reason="audioop for pydub: Python 3.13 removed it (v1.10.0 item 3: it came through gradio before)",
     ),
     Package(
         name="librosa",
@@ -494,6 +528,13 @@ PACKAGES: List[Package] = [
         order=48,
         import_name="sklearn",  # pip name != import name
         reason="Clustering for semantic scene detection",
+    ),
+    Package(
+        name="fireredvad",
+        version=">=0.0.2",
+        extra=Extra.CLI,
+        order=49,
+        reason="FireRedVAD speech segmenter - ships by default since v1.9.2 (owner CFF6); selected with --speech-segmenter firered-vad",
     ),
 
     # =========================================================================
@@ -560,49 +601,6 @@ PACKAGES: List[Package] = [
     ),
 
     # =========================================================================
-    # PHASE 5: LLM Server Packages (Order 63-69)
-    # =========================================================================
-    #
-    # NOTE: llama-cpp-python itself is installed separately with CUDA detection
-    # These are just the server dependencies
-    #
-    Package(
-        name="uvicorn",
-        version=">=0.22.0",
-        extra=Extra.LLM,
-        order=63,
-        reason="ASGI server for LLM API",
-    ),
-    Package(
-        name="fastapi",
-        version=">=0.100.0",
-        extra=Extra.LLM,
-        order=64,
-        reason="API framework for LLM server",
-    ),
-    Package(
-        name="pydantic-settings",
-        version=">=2.0.1",
-        extra=Extra.LLM,
-        order=65,
-        reason="Configuration management for LLM server",
-    ),
-    Package(
-        name="sse-starlette",
-        version=">=1.6.1",
-        extra=Extra.LLM,
-        order=66,
-        reason="Server-Sent Events for streaming LLM responses",
-    ),
-    Package(
-        name="starlette-context",
-        version=">=0.3.6,<0.4",
-        extra=Extra.LLM,
-        order=67,
-        reason="Request context for Starlette - pinned to 0.3.x for compatibility",
-    ),
-
-    # =========================================================================
     # PHASE 5: Enhancement Packages (Order 70-79)
     # =========================================================================
     #
@@ -611,8 +609,8 @@ PACKAGES: List[Package] = [
     # Reference: https://modelscope.cn/models/iic/speech_zipenhancer_ans_multiloss_16k_base
     #
     # IMPORTANT - Version Sensitivity:
-    # - datasets: ModelScope requires >=3.0.0,<=3.6.0 (as of 2026-03)
-    # - modelscope: >=1.20 required, 1.22.0+ recommended
+    # - datasets: ModelScope 1.40's tested range >=4.0.0,<=4.8.4 (see pyproject.toml)
+    # - modelscope: >=1.40 (the first release that accepts datasets 4.x)
     # - setuptools: Required at RUNTIME by modelscope (uses pkg_resources in utils/plugins.py)
     # - einops: Required by modelscope framework for tensor operations
     #
@@ -623,7 +621,7 @@ PACKAGES: List[Package] = [
     #
     Package(
         name="modelscope",
-        version=">=1.20",
+        version=">=1.40",
         extra=Extra.ENHANCE,
         order=70,
         reason="ModelScope framework for ZipEnhancer speech enhancement",
@@ -663,10 +661,10 @@ PACKAGES: List[Package] = [
     ),
     Package(
         name="datasets",
-        version=">=3.0.0,<=3.6.0",
+        version=">=4.0.0,<=4.8.4",
         extra=Extra.ENHANCE,
         order=73,
-        reason="HuggingFace datasets - must match modelscope constraint (>=3.0.0)",
+        reason="HuggingFace datasets - ModelScope's tested range",
     ),
     Package(
         name="simplejson",
@@ -693,44 +691,13 @@ PACKAGES: List[Package] = [
         import_name="PIL",
         reason="Image processing - required by modelscope framework",
     ),
-    Package(
-        name="clearvoice",
-        extra=Extra.ENHANCE,
-        source=InstallSource.GIT,
-        git_url="git+https://github.com/meizhong986/ClearerVoice-Studio.git#subdirectory=clearvoice",
-        order=77,
-        reason="ClearVoice speech enhancement - custom fork with relaxed librosa",
-    ),
-    # ClearVoice transitive deps (explicit for --no-deps safety in Phase 3.5):
-    # These are declared in ClearVoice's pyproject.toml but skipped with --no-deps.
-    # Version pins are relaxed from ClearVoice's exact pins to avoid conflicts.
-    Package(
-        name="gdown",
-        extra=Extra.ENHANCE,
-        order=77,
-        reason="Google Drive downloader - used by ClearVoice for model downloads",
-    ),
+    # v1.10.0 (item 3, owner W73): ClearVoice is no longer included, and with it gdown,
+    # opencv-python, python-speech-features, scenedetect, torchinfo and yamlargparse.
     Package(
         name="joblib",
         extra=Extra.ENHANCE,
         order=77,
-        reason="Lightweight parallelism - ClearVoice transitive dep (also via scikit-learn)",
-    ),
-    Package(
-        name="opencv-python",
-        version=">=4.10.0",
-        extra=Extra.ENHANCE,
-        order=77,
-        import_name="cv2",
-        reason="Computer vision - required by ClearVoice. 4.10.0+ for numpy 2.x support",
-    ),
-    Package(
-        name="python-speech-features",
-        version=">=0.6",
-        extra=Extra.ENHANCE,
-        order=77,
-        import_name="python_speech_features",
-        reason="Speech feature extraction - required by ClearVoice",
+        reason="Lightweight parallelism (scikit-learn)",
     ),
     Package(
         name="rotary-embedding-torch",
@@ -738,26 +705,7 @@ PACKAGES: List[Package] = [
         extra=Extra.ENHANCE,
         order=77,
         import_name="rotary_embedding_torch",
-        reason="Rotary positional embeddings - required by ClearVoice model architecture",
-    ),
-    Package(
-        name="scenedetect",
-        version=">=0.6",
-        extra=Extra.ENHANCE,
-        order=77,
-        reason="Video scene detection - required by ClearVoice",
-    ),
-    Package(
-        name="torchinfo",
-        extra=Extra.ENHANCE,
-        order=77,
-        reason="PyTorch model summary utility - required by ClearVoice",
-    ),
-    Package(
-        name="yamlargparse",
-        extra=Extra.ENHANCE,
-        order=77,
-        reason="YAML-based argument parser - required by ClearVoice configuration",
+        reason="Rotary positional embeddings - required by BS-RoFormer",
     ),
     Package(
         name="bs-roformer-infer",
@@ -765,6 +713,12 @@ PACKAGES: List[Package] = [
         order=78,
         import_name="bs_roformer",  # pip name != import name
         reason="BS-RoFormer vocal isolation",
+    ),
+    Package(
+        name="demucs",
+        extra=Extra.ENHANCE,
+        order=79,
+        reason="htdemucs vocal isolation (Demucs v4)",
     ),
     Package(
         name="onnxruntime",
@@ -779,27 +733,25 @@ PACKAGES: List[Package] = [
     # =========================================================================
     Package(
         name="huggingface-hub",
-        version=">=0.25.0",
+        version=">=1.0,<2",
         extra=Extra.HUGGINGFACE,
         order=80,
         reason="HuggingFace cache management for model downloads",
     ),
     Package(
         name="transformers",
-        version=">=4.40.0,<5.0",
+        version=">=5.20,<6",
         extra=Extra.HUGGINGFACE,
         order=81,
         reason=(
-            "HuggingFace Transformers for ASR pipeline (kotoba-whisper). "
-            "Upper bound <5.0 added in v1.8.14: transformers 5.x breaks the "
-            "Qwen3-ASR fork (@check_model_inputs() decorator API change at "
-            "modeling_qwen3_asr.py:986). Pin removed in v1.9.0 once Qwen3-ASR "
-            "is patched and Cohere preview ships."
+            "HuggingFace Transformers for ASR pipeline (kotoba-whisper). v1.10.0 (item 3): "
+            "5.20 is the first release with every model class the 1.10.x roadmap names; "
+            "Qwen3-ASR runs through the qwen-asr fork."
         ),
     ),
     Package(
         name="accelerate",
-        version=">=0.26.0",
+        version=">=1.15",
         extra=Extra.HUGGINGFACE,
         order=82,
         reason="Efficient model loading for Transformers",
@@ -825,11 +777,13 @@ PACKAGES: List[Package] = [
     #
     Package(
         name="qwen-asr",
-        version=">=0.0.6",
         extra=Extra.QWEN,
+        source=InstallSource.GIT,
+        git_url="git+https://github.com/meizhong986/Qwen3-ASR.git@10cfb322e42c74cd75a6be622054c9becfeb3082",
         order=84,
         import_name="qwen_asr",  # pip name (qwen-asr) != import name (qwen_asr)
-        reason="Qwen3-ASR transformers backend for multilingual ASR with ForcedAligner",
+        reason="Qwen3-ASR transformers backend with ForcedAligner. v1.10.0 (item 3): the WhisperJAV "
+               "fork of qwen-asr 0.0.6, which runs on transformers 5",
     ),
 
     # =========================================================================
@@ -1017,6 +971,12 @@ PACKAGES: List[Package] = [
         extra=Extra.DEV,
         order=113,
         reason="Git hooks for code quality",
+    ),
+    Package(
+        name="build",
+        extra=Extra.DEV,
+        order=114,
+        reason="v1.10.0 (item 2f): installer/build_release.py builds the wheel with it",
     ),
 ]
 

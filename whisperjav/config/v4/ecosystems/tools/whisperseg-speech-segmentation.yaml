@@ -55,8 +55,12 @@ contract:
 spec:
   # --- Core VAD Parameters ---
   threshold: 0.35
-  # Offset (hysteresis) threshold is always auto-derived as
-  # max(threshold − 0.15, 0.01) inside the backend. Not user-tunable.
+  # Offset (hysteresis) threshold: auto-derived as max(threshold − 0.15, 0.01)
+  # inside the backend UNLESS an explicit neg_threshold is supplied via
+  # segmenter_config (v1.9.0). The formula collapses to 0.01 (dead hysteresis)
+  # below threshold 0.30, so low-threshold presets must decouple it — the
+  # anime-whisper aggressive row does (config/anime_whisper_vad.py). Not set
+  # here: the YAML presets all keep threshold >= 0.25 where the formula is sane.
 
   # --- Duration Filters ---
   min_speech_duration_ms: 100
@@ -75,6 +79,7 @@ spec:
   # v1.8.12: tightened 9→6. Typical JA dialogue groups span 2-3 subs over
   # ~6s; this matches the natural distribution.
   max_group_duration_s: 6
+  min_group_duration_s: 0      # 1.10.1 (owner W426 3): the shortest group; 0 = off
 
   # --- Runtime ---
   force_cpu: false
@@ -197,8 +202,8 @@ gui:
       Two consecutive segments separated by a gap larger than this are placed
       into different ASR groups. Smaller = more, tighter groups. Larger =
       fewer, longer groups.
-    min: 0.5
-    max: 5.0
+    min: 0.1
+    max: 30.0
     step: 0.1
     data_type: float
     unit: "s"
@@ -210,9 +215,20 @@ gui:
     description: >
       Upper bound for a grouped-segment ASR chunk. Should stay well under the
       ASR model context (30 s for Whisper). Typical JAV sweet spot: 8–10 s.
-    min: 4.0
-    max: 14.0
+    min: 1.0
+    max: 420
     step: 1.0
+    data_type: float
+    unit: "s"
+    group: grouping
+
+  min_group_duration_s:
+    widget: slider
+    label: "Shortest Group (s)"
+    description: "A group shorter than this joins the next group while both together fit within the Max Group Duration. 0 = off."
+    min: 0
+    max: 300
+    step: 5
     data_type: float
     unit: "s"
     group: grouping

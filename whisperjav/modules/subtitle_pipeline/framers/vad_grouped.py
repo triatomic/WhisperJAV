@@ -20,6 +20,8 @@ from whisperjav.modules.subtitle_pipeline.types import (
     TemporalFrame,
 )
 from whisperjav.utils.logger import logger
+from whisperjav.modules import model_audio
+from whisperjav.modules.model_audio import MIN_MODEL_AUDIO_S, widen_frames
 
 
 class VadGroupedFramer:
@@ -102,7 +104,9 @@ class VadGroupedFramer:
 
         frames = []
         speech_regions_per_frame: list[list[tuple[float, float]]] = []
+        speech_starts_per_frame: list[Optional[float]] = []
         skipped = 0
+        too_short = 0
 
         for group in seg_result.groups:
             if not group:
@@ -115,6 +119,12 @@ class VadGroupedFramer:
             # Filter short groups
             if (group_end - group_start) < self._min_duration:
                 skipped += 1
+                continue
+            # The shortest audio a model is given (owner W461, W463 CL2; whisperjav/modules/model_audio.py): a group
+            # under 0.2 s is usually a VAD false positive and is cut (SHORT_VAD_GROUPS "cut"); with "widen" it is
+            # kept and widened below.
+            if model_audio.SHORT_VAD_GROUPS == "cut" and (group_end - group_start) < MIN_MODEL_AUDIO_S:
+                too_short += 1
                 continue
 
             frames.append(
@@ -130,6 +140,20 @@ class VadGroupedFramer:
             regions = [(seg.start_sec, seg.end_sec) for seg in group]
             speech_regions_per_frame.append(regions)
 
+            # "3a" refined display start: first segment in the group that
+            # recorded a speech_start_sec (first frame >= speech_start_threshold
+            # in the backend). None -> consumers fall back to the frame start.
+            speech_starts_per_frame.append(
+                next(
+                    (
+                        s.metadata.get("speech_start_sec")
+                        for s in group
+                        if s.metadata.get("speech_start_sec") is not None
+                    ),
+                    None,
+                )
+            )
+
         if skipped > 0:
             logger.debug(
                 "[VadGroupedFramer] Filtered %d groups below %.2fs minimum",
@@ -137,7 +161,18 @@ class VadGroupedFramer:
                 self._min_duration,
             )
 
-        logger.info(
+        # SHORT_VAD_GROUPS "widen" (model_audio.py): a group shorter than 0.2 s is widened to it into the scene's
+        # audio beside it, without reaching into the next or previous group.
+        widened = widen_frames(frames, duration) if model_audio.SHORT_VAD_GROUPS == "widen" else 0
+        if widened:
+            logger.debug("[VadGroupedFramer] Widened %d groups to the %.1fs model minimum", widened,
+                         MIN_MODEL_AUDIO_S)
+        if too_short:
+            logger.debug("[VadGroupedFramer] Cut %d groups under the %.1fs model minimum (VAD false positives)",
+                         too_short, MIN_MODEL_AUDIO_S)
+
+        # One line per scene: shown with --debug only (owner W350; 2,712 lines in a four-file Ensemble run).
+        logger.debug(
             "[VadGroupedFramer] %s: %d segments → %d groups → %d frames (%.1fs audio, %.1f%% speech)",
             seg_result.method,
             seg_result.num_segments,
@@ -156,10 +191,16 @@ class VadGroupedFramer:
                 "total_segments": seg_result.num_segments,
                 "total_groups": seg_result.num_groups,
                 "groups_skipped": skipped,
+                "groups_widened": widened,
+                "groups_cut_short": too_short,
                 "audio_duration_sec": duration,
                 "speech_coverage_ratio": seg_result.speech_coverage_ratio,
                 "speech_regions": speech_regions_per_frame,
+                "speech_starts": speech_starts_per_frame,
                 "segmenter_params": seg_result.parameters,
+                # Set when the segmenter caught its own failure and returned no groups: not silence.
+                # Read by the CrispASR pipelines to count failed scenes.
+                "segmenter_error": getattr(seg_result, "error", None),
             },
         )
 

@@ -7,7 +7,9 @@ Completely decoupled from UI - can be tested standalone.
 """
 
 import json
+import collections
 import os
+import re
 import sys
 import time
 import queue
@@ -15,7 +17,7 @@ import threading
 import subprocess
 import webbrowser
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 import webview
 from webview import FileDialog
 
@@ -23,6 +25,7 @@ from whisperjav.utils.process_manager import (
     terminate_process_tree,
     PSUTIL_AVAILABLE,
 )
+from whisperjav.config.qwen3_whisperseg_vad import QWEN3_WHISPERSEG_DEFAULTS
 
 
 # Determine REPO_ROOT for module resolution
@@ -62,6 +65,60 @@ def _compute_default_output_dir() -> Path:
 DEFAULT_OUTPUT = _compute_default_output_dir()
 
 
+# Exit statuses of a run that did not start, so nothing was processed (design 22.5.4, 22.9.2):
+# 2 an argument error, 3 this install's NVIDIA GPU cannot be used (the GUI offers "Run on the
+# CPU this time"), 4 PyTorch missing.
+EXIT_NVIDIA_UNUSABLE = 3
+RUN_DID_NOT_START_STATUSES = (2, 3, 4)
+
+
+GUI_LOG_NAME = "whisperjav_run.log"
+_GUI_PASS_LOG = re.compile(r"^whisperjav_run\.pass\d+\.log$")
+
+
+def gui_log_file(output_dir: Any, inputs: List[Any]) -> Optional[Path]:
+    """The log file of a GUI run (owner W511 2, W512 c): raw_subs\\whisperjav_run.log beside the run manifest
+    (whisperjav_run.json, placed by the CLI's own rule, default_manifest_path); an Ensemble pass writes
+    whisperjav_run.pass<N>.log beside it. None when the manifest has no place (no inputs)."""
+    from whisperjav.utils.run_outcome import default_manifest_path
+    manifest = default_manifest_path(str(output_dir), [str(p) for p in inputs or []])
+    if manifest is None:
+        return None
+    return manifest.parent / "raw_subs" / GUI_LOG_NAME
+
+
+def _clear_gui_logs(path: Path) -> None:
+    """Each GUI run replaces the last run's log files (W512 c): only the GUI's own names are removed."""
+    folder = path.parent
+    try:
+        olds = [path] + [p for p in folder.iterdir() if _GUI_PASS_LOG.match(p.name)] if folder.is_dir() else []
+    except OSError:
+        olds = []
+    for old in olds:
+        try:
+            old.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:   # e.g. still open by a run of another GUI window: the new run adds to it
+            pass
+
+
+def _with_device_cpu(args: List[str]) -> List[str]:
+    """The same command with --device cpu (and no other --device): every part on the CPU."""
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a == "--device":
+            skip = True
+            continue
+        if a.startswith("--device="):
+            continue
+        out.append(a)
+    return out + ["--device", "cpu"]
+
+
 class WhisperJAVAPI:
     """
     API class exposed to JavaScript via PyWebView.
@@ -89,6 +146,45 @@ class WhisperJAVAPI:
 
         # Output file tracking - computed when process starts, returned on completion
         self._expected_output_files: List[str] = []
+
+        # Run-outcome contract (v1.9.2): the CLI writes whisperjav_run.json
+        # next to the outputs with one state per file. The GUI reads it when
+        # the process exits and reports the same words; it never re-derives
+        # the exit status.
+        self._run_options: Dict[str, Any] = {}
+        self._process_started_at: float = 0.0
+        self._run_summary: Optional[Dict[str, Any]] = None
+        # The last run started (which start method, with which options), for "Run on the CPU
+        # this time" (design 22.9.2, D-G).
+        self._last_start: Optional[Tuple[str, Dict[str, Any]]] = None
+
+    def _output_dir(self, options: Dict[str, Any]) -> Any:
+        """
+        The output folder to pass on as --output-dir.
+
+        #454: a blank value (an empty folder saved by Remember settings) counts as
+        not given. Passed on as --output-dir "", it resolved against this
+        process's working folder, site-packages, and the subtitles landed there.
+        """
+        value = options.get('output_dir')
+        if value is None or not str(value).strip():
+            return self.default_output
+        return value
+
+    def _with_log_file(self, args: List[str], options: Dict[str, Any]) -> List[str]:
+        """The run's command with --log-file raw_subs\\whisperjav_run.log beside the run manifest (owner W511 2,
+        W512 c), the last run's log files removed first. Not for --check, nor when the command names its own
+        --log-file. Never raises: a run starts without a log file rather than not at all."""
+        if "--check" in args or any(a == "--log-file" or a.startswith("--log-file=") for a in args):
+            return args
+        try:
+            path = gui_log_file(self._output_dir(options), options.get("inputs") or [])
+            if path is None:
+                return args
+            _clear_gui_logs(path)
+        except Exception:  # noqa: BLE001 - a log file must never stop a run from starting
+            return args
+        return args + ["--log-file", str(path)]
 
     # ========================================================================
     # Process Management
@@ -163,7 +259,7 @@ class WhisperJAVAPI:
         if scene_method:
             args += ["--scene-detection-method", scene_method]
 
-        output_dir = options.get('output_dir', self.default_output)
+        output_dir = self._output_dir(options)
         args += ["--output-dir", output_dir]
 
         # Optional paths
@@ -173,6 +269,27 @@ class WhisperJAVAPI:
 
         if options.get('keep_temp', False):
             args += ["--keep-temp"]
+
+        if options.get('skip_existing', False):
+            args += ["--skip-existing"]
+
+        # Run-outcome contract: same words and same rule as the CLI's --fail-on.
+        _fail_on = [s for s in ("empty", "suspect") if options.get(f"fail_on_{s}", False)]
+        if _fail_on:
+            args += ["--fail-on", ",".join(_fail_on)]
+
+        # Per-scene ASR telemetry is on by default; the checkbox only opts out.
+        if options.get('asr_telemetry', True) is False:
+            args += ["--no-asr-telemetry"]
+
+        # #415: downloaded Hugging Face models only (HF_HUB_OFFLINE=1 in the child and its workers).
+        if options.get('offline_mode', False):
+            args += ["--offline"]
+
+        # v1.9.2 (CFF1): recogniser refresh budget in minutes of scene audio (0 = never).
+        _mr = options.get('model_refresh_audio_minutes')
+        if _mr not in (None, ''):
+            args += ["--model-refresh-audio-minutes", str(_mr)]
 
         # Debug logging
         if options.get('debug', False):
@@ -195,8 +312,16 @@ class WhisperJAVAPI:
         if options.get('async_processing', False):
             args += ["--async-processing"]
 
-        # Speech segmenter selection (replaces --no-vad)
+        # Speech segmenter selection.
+        # v1.9.2 (S2/S9): the balanced pipeline has no external speech segmenter --
+        # it runs faster-whisper's built-in VAD, and main.py rejects
+        # --speech-segmenter with --mode balanced. The Transcription tab never sends
+        # one (S9.2: it uses the defaults), so this only guards a caller that does.
         speech_segmenter = options.get('speech_segmenter', '').strip()
+        if speech_segmenter and options.get('mode') == 'balanced':
+            print(f"[api] Ignoring speech_segmenter={speech_segmenter!r}: the balanced "
+                  f"pipeline uses the built-in VAD (v1.9.2). Use vad_version instead.")
+            speech_segmenter = ''
         if speech_segmenter:
             args += ["--speech-segmenter", speech_segmenter]
 
@@ -210,6 +335,9 @@ class WhisperJAVAPI:
                 batch_size = options.get('batch_size', None)
                 if batch_size:
                     args += ["--batch-size", str(int(batch_size))]
+        # No --vad-version is emitted here on purpose: S9.2 says the Transcription tab
+        # "shall just use the default", and it has no VAD control. The version is chosen
+        # per pass in the Ensemble tab (_build_twopass_args).
 
         # Model override
         model_override = options.get('model_override', '').strip()
@@ -220,10 +348,6 @@ class WhisperJAVAPI:
         credit = options.get('credit', '').strip()
         if credit:
             args += ["--credit", credit]
-
-        # Accept CPU mode (skip GPU warning)
-        if options.get('accept_cpu_mode', False):
-            args += ["--accept-cpu-mode"]
 
         return args
 
@@ -247,12 +371,14 @@ class WhisperJAVAPI:
         args += ["--subs-language", subs_language]
 
         # Output directory
-        output_dir = options.get('output_dir', self.default_output)
+        output_dir = self._output_dir(options)
         args += ["--output-dir", output_dir]
 
-        # Device is always passed (essential arg)
+        # --device governs every pipeline (design 22.3.1, owner W237 1); auto is the default,
+        # so only another choice is passed.
         hf_device = options.get('hf_device', 'auto')
-        args += ["--hf-device", str(hf_device)]
+        if hf_device and hf_device != 'auto':
+            args += ["--device", str(hf_device)]
 
         # Check if user explicitly customized parameters
         is_customized = options.get('hf_customized', False)
@@ -294,6 +420,22 @@ class WhisperJAVAPI:
         if options.get('keep_temp', False):
             args += ["--keep-temp"]
 
+        if options.get('skip_existing', False):
+            args += ["--skip-existing"]
+
+        # Run-outcome contract: same words and same rule as the CLI's --fail-on.
+        _fail_on = [s for s in ("empty", "suspect") if options.get(f"fail_on_{s}", False)]
+        if _fail_on:
+            args += ["--fail-on", ",".join(_fail_on)]
+
+        # Per-scene ASR telemetry is on by default; the checkbox only opts out.
+        if options.get('asr_telemetry', True) is False:
+            args += ["--no-asr-telemetry"]
+
+        # #415: downloaded Hugging Face models only (HF_HUB_OFFLINE=1 in the child and its workers).
+        if options.get('offline_mode', False):
+            args += ["--offline"]
+
         if options.get('debug', False):
             args += ["--debug"]
 
@@ -301,9 +443,6 @@ class WhisperJAVAPI:
         output_format = options.get('output_format', 'srt')
         if output_format and output_format != 'srt':
             args += ["--output-format", output_format]
-
-        if options.get('accept_cpu_mode', False):
-            args += ["--accept-cpu-mode"]
 
         return args
 
@@ -384,7 +523,7 @@ class WhisperJAVAPI:
             List of expected output SRT file paths
         """
         inputs = options.get('inputs', [])
-        output_dir = options.get('output_dir', self.default_output)
+        output_dir = self._output_dir(options)
         source_language = options.get('source_language', 'japanese')
 
         # Also check 'mode' key for backward compatibility with start_process
@@ -424,6 +563,14 @@ class WhisperJAVAPI:
 
         return expected_files
 
+    def rerun_on_cpu(self) -> Dict[str, Any]:
+        """ "Run on the CPU this time" (design 22.9.2, D-G): the last run again, with --device cpu,
+        after it stopped because this install's NVIDIA GPU cannot be used (exit status 3)."""
+        if not self._last_start:
+            return {"success": False, "message": "There is no run to start again."}
+        method, options = self._last_start
+        return getattr(self, method)({**options, "run_on_cpu": True})
+
     def start_process(self, options: Dict[str, Any]) -> Dict[str, Any]:
         """
         Start WhisperJAV subprocess with given options.
@@ -448,7 +595,12 @@ class WhisperJAVAPI:
 
         try:
             # Build arguments
+            self._run_options = dict(options)
             args = self.build_args(options)
+            if options.get('run_on_cpu'):  # "Run on the CPU this time" (design 22.9.2, D-G)
+                args = _with_device_cpu(args)
+            args = self._with_log_file(args, options)   # owner W511 2: the GUI run's log file
+            self._last_start = ("start_process", dict(options))
 
             # Compute expected output files for post-completion use (e.g., translation)
             self._expected_output_files = self._compute_expected_outputs(options)
@@ -484,6 +636,8 @@ class WhisperJAVAPI:
             # Update status
             self.status = "running"
             self.exit_code = None
+            self._process_started_at = time.time()
+            self._run_summary = None
 
             # Start log streaming thread
             self._stream_thread = threading.Thread(
@@ -597,21 +751,26 @@ class WhisperJAVAPI:
         if self.process is not None and self.process.poll() is not None:
             self.exit_code = self.process.returncode
             self.process = None
+            self._run_summary = self._read_run_summary()
 
             if self.status == "cancelled":
                 pass  # Keep cancelled status
             elif self.exit_code == 0:
                 self.status = "completed"
-                self.log_queue.put("\n[SUCCESS] Process completed successfully.\n")
+                self.log_queue.put(f"\n{self._finish_line()}\n")
             else:
                 self.status = "error"
-                self.log_queue.put(f"\n[ERROR] Process exited with code {self.exit_code}.\n")
+                self.log_queue.put(f"\n{self._finish_line()}\n")
 
         result = {
             "status": self.status,
             "exit_code": self.exit_code,
-            "has_logs": not self.log_queue.empty()
+            "has_logs": not self.log_queue.empty(),
+            "run_summary": self._run_summary if self.status in ("completed", "error") else None,
         }
+        # A run that ended without a run summary: the reason it printed, for the dialog (22.9.2).
+        if self.status == "error" and self._run_summary is None:
+            result["reason"] = self._stop_reason()
 
         # Include output files when completed (for post-processing like translation)
         if self.status == "completed" and self._expected_output_files:
@@ -619,22 +778,124 @@ class WhisperJAVAPI:
 
         return result
 
+    # ------------------------------------------------------------------
+    # Run-outcome contract: read what the CLI decided, say it in its words
+    # ------------------------------------------------------------------
+
+    def _read_run_summary(self) -> Optional[Dict[str, Any]]:
+        """Read the manifest the CLI wrote for the run that just exited.
+
+        The manifest path is derived exactly as the CLI derives it, from the
+        same output directory and inputs. A manifest older than this process is
+        a previous run's and is ignored, so a crash before the CLI's finisher
+        never shows stale states. Never raises.
+        """
+        try:
+            import datetime as _dt
+
+            from whisperjav.utils.run_outcome import STATES, default_manifest_path
+
+            opts = self._run_options or {}
+            # The same call, on the same raw inputs and output_dir the CLI was
+            # given, as the CLI itself makes in _finish_run().
+            inputs = [str(p) for p in (opts.get("inputs") or [])]
+            output_dir = opts.get("output_dir") or self.default_output
+            path = default_manifest_path(str(output_dir), inputs)
+            if path is None or not path.exists():
+                return None
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            # This run's manifest, not a previous run's: the CLI stamps its own
+            # start time, on the same clock as ours, after this process began.
+            started = data.get("started_at")
+            if started:
+                if _dt.datetime.fromisoformat(started).timestamp() < self._process_started_at:
+                    return None
+            elif path.stat().st_mtime < self._process_started_at:
+                return None
+            counts = {s: int((data.get("counts") or {}).get(s, 0)) for s in STATES}
+            files = [
+                {
+                    "name": Path(f.get("path", "")).name,
+                    "state": f.get("state"),
+                    "detail": f.get("detail", ""),
+                    "output": f.get("output"),
+                    "translated_output": f.get("translated_output"),
+                }
+                for f in (data.get("files") or [])
+            ]
+            return {
+                "manifest_path": str(path),
+                "exit_status": data.get("exit_status"),
+                "fails_on": data.get("fails_on") or ["failed"],
+                "note": data.get("note"),
+                "counts": counts,
+                "tally": " · ".join(f"{s} {counts[s]}" for s in STATES),
+                "files": files,
+            }
+        except Exception:  # noqa: BLE001 - reporting must not break the GUI
+            return None
+
+    def _finish_line(self) -> str:
+        """The console line that ends a run: what happened, in the CLI's words.
+
+        "Finished" states the one thing the GUI knows for certain, that the
+        process ended; the exit status is the CLI's decision, repeated rather
+        than re-derived. The per-file counts are in the RUN SUMMARY the CLI
+        printed just above, so this line does not repeat them (owner W509 item
+        2, W512 d: the end lines once); the status bar still shows them.
+        """
+        s = self._run_summary
+        code = self.exit_code
+        if s is None:
+            if code == 0:
+                return f"[FINISHED] exit status {code} (no run summary was written)"
+            if code in RUN_DID_NOT_START_STATUSES:
+                return f"[DID NOT START] exit status {code}"
+            return f"[ENDED WITHOUT RUN SUMMARY] exit status {code}"
+        if s.get("note"):
+            return f"[STOPPED] {s['note']} (exit status {code})"
+        if code == 0:
+            return f"[FINISHED] exit status {code}"
+        return (f"[FINISHED WITH FAILURES] exit status {code}; "
+                f"a run fails on: {', '.join(s.get('fails_on') or ['failed'])}")
+
     def _stream_output(self):
         """
         Background thread to read subprocess output and queue it.
 
         This runs in a separate thread to avoid blocking the main thread.
         """
+        self._output_tail = collections.deque(maxlen=80)
         try:
             if self.process and self.process.stdout:
                 for line in self.process.stdout:
                     self.log_queue.put(line)
+                    self._output_tail.append(line)
         except Exception as e:
             self.log_queue.put(f"\n[ERROR] Log streaming error: {e}\n")
         finally:
             # Process has finished
             if self.process:
                 self.process.wait()
+
+    def _stop_reason(self) -> str:
+        """What a run that ended without a run summary printed last: the text of its last box
+        (the start-up stop, T41), the text between its last two rules of '=' (PyTorch missing,
+        T42), or its last lines. For the GUI's dialog (design 22.9.2)."""
+        lines = [l.rstrip("\n") for l in getattr(self, "_output_tail", [])]
+        tops = [i for i, l in enumerate(lines) if "╔" in l]
+        if tops:
+            box = []
+            for l in lines[tops[-1] + 1:]:
+                if "╚" in l:
+                    break
+                box.append(l.replace("║", " ").strip())
+            return " ".join(" ".join(box).split())
+        rules = [i for i, l in enumerate(lines) if l.strip() and set(l.strip()) == {"="} and len(l.strip()) >= 40]
+        if len(rules) >= 2:
+            return " ".join(l.strip() for l in lines[rules[-2] + 1:rules[-1]] if l.strip())
+        return " ".join(l.strip() for l in lines[-5:] if l.strip())
 
     def get_logs(self) -> List[str]:
         """
@@ -1284,6 +1545,76 @@ class WhisperJAVAPI:
         except Exception:
             return {}
 
+    # Widget hints for faster-whisper's built-in VAD. The DEFAULTS are not here --
+    # they come from the FasterWhisperVAD preset for the pass's sensitivity, so this
+    # table and the runtime cannot drift.
+    _NATIVE_VAD_GUI = {
+        "threshold": {
+            "widget": "slider", "min": 0.05, "max": 0.95, "step": 0.05,
+            "data_type": "float", "label": "Speech Threshold", "group": "detection",
+            "description": "Probability above which a 32 ms window counts as speech. "
+                           "Lower catches quieter, breathier speech and more noise.",
+        },
+        "min_speech_duration_ms": {
+            "widget": "spinner", "min": 0, "max": 5000, "step": 10,
+            "data_type": "int", "label": "Min Speech (ms)", "group": "detection",
+            "description": "Speech shorter than this is discarded.",
+        },
+        "min_silence_duration_ms": {
+            "widget": "spinner", "min": 0, "max": 5000, "step": 50,
+            "data_type": "int", "label": "Min Silence (ms)", "group": "detection",
+            "description": "Silence shorter than this does not split a speech chunk.",
+        },
+        "max_speech_duration_s": {
+            "widget": "slider", "min": 1.0, "max": 60.0, "step": 1.0,
+            "data_type": "float", "label": "Max Speech (s)", "group": "grouping",
+            "description": "A speech chunk longer than this is split. A subtitle-length "
+                           "knob: it does not change how fast the recognizer runs.",
+        },
+        "speech_pad_ms": {
+            "widget": "spinner", "min": 0, "max": 2000, "step": 50,
+            "data_type": "int", "label": "Speech Padding (ms)", "group": "grouping",
+            "description": "Padding kept on each side of a detected speech chunk.",
+        },
+    }
+
+    def _native_vad_schema(self, backend: str) -> Dict[str, Any]:
+        """Parameter schema for faster-whisper's built-in VAD (v1.9.2)."""
+        try:
+            from whisperjav.config.components.vad.faster_whisper_vad import FasterWhisperVAD
+            from whisperjav.modules.silero_vad_adapter import (
+                DEFAULT_VAD_VERSION, VAD_VERSION_LABELS,
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            return {"success": False, "error": f"Could not load native VAD schema: {e}"}
+
+        presets = {
+            name: {k: v for k, v in FasterWhisperVAD.get_preset(name).model_dump().items()
+                   if k != "version" and v is not None}
+            for name in ("conservative", "balanced", "aggressive")
+        }
+        defaults = presets["balanced"]
+        parameters = self._convert_gui_hints_to_schema(self._NATIVE_VAD_GUI, defaults)
+        version_list = ", ".join(VAD_VERSION_LABELS)
+        return {
+            "success": True,
+            "backend": backend,
+            "display_name": "Internal FW Silero VAD",
+            "description": (
+                "Faster-Whisper finds the speech itself, in one pass over each scene. "
+                "The Balanced pipeline uses this and nothing else since v1.9.2."
+            ),
+            "info_message": (
+                f"Pick the version in this pass's row above ({version_list}). "
+                f"The default is {DEFAULT_VAD_VERSION}. The settings below apply to "
+                "whichever version you pick."
+            ),
+            "parameters": parameters,
+            "defaults": defaults,
+            "presets": presets,
+            "groups": self._extract_groups(self._NATIVE_VAD_GUI),
+        }
+
     def _convert_gui_hints_to_schema(self, gui_hints: Dict, spec: Dict) -> Dict[str, Any]:
         """Convert YAML gui hints to frontend schema format."""
         schema = {}
@@ -1365,8 +1696,18 @@ class WhisperJAVAPI:
             "nemo-lite": "nemo-speech-segmentation.yaml",
             "silero-v6.2": "silero-v6-speech-segmentation.yaml",
             "whisperseg": "whisperseg-speech-segmentation.yaml",
-            "firered": "firered-speech-segmentation.yaml",
+            "firered-vad": "firered-vad-speech-segmentation.yaml",  # v1.9.0; installed by default since v1.9.2
         }
+
+        # v1.9.2: "faster-whisper" is not an external segmenter and has no tool YAML
+        # -- it is the recognizer's OWN VAD, and its parameters are faster-whisper
+        # VadOptions. The balanced pipeline uses nothing else since v1.9.2, so this
+        # branch is what the Customize > Segmenter tab shows for every balanced pass.
+        # Built from the FasterWhisperVAD Pydantic component, the single source of
+        # truth for those values; before this the tab returned "Unknown segmenter
+        # backend: faster-whisper".
+        if backend == "faster-whisper":
+            return self._native_vad_schema(backend)
 
         # Handle "none" backend
         if backend == "none":
@@ -1420,7 +1761,7 @@ class WhisperJAVAPI:
         Get parameter schema for a speech enhancer backend.
 
         Args:
-            backend: Enhancer name (ffmpeg-dsp, clearvoice, zipenhancer, etc.)
+            backend: Enhancer name (ffmpeg-dsp, zipenhancer, bs-roformer, etc.)
 
         Returns:
             Schema dict with parameters and options
@@ -1462,41 +1803,6 @@ class WhisperJAVAPI:
                 "defaults": {"effects": ["loudnorm"]},
             }
 
-        # ClearVoice schema
-        if backend == "clearvoice":
-            return {
-                "success": True,
-                "backend": "clearvoice",
-                "display_name": "ClearVoice Speech Enhancement",
-                "description": "Neural speech enhancement for noise reduction (48kHz processing)",
-                "parameters": {
-                    "model": {
-                        "type": "dropdown",
-                        "label": "Model",
-                        "description": "ClearVoice model variant",
-                        "options": [
-                            {"value": "MossFormer2_SE_48K", "label": "MossFormer2 48kHz (Best quality)"},
-                            {"value": "FRCRN_SE_16K", "label": "FRCRN 16kHz (Fast)"},
-                            {"value": "MossFormerGAN_SE_16K", "label": "MossFormerGAN 16kHz"},
-                            {"value": "MossFormer2_SS_16K", "label": "MossFormer2 SS 16kHz (Source separation)"},
-                        ],
-                        "default": "MossFormer2_SE_48K",
-                    },
-                    "device": {
-                        "type": "dropdown",
-                        "label": "Device",
-                        "description": "Compute device",
-                        "options": [
-                            {"value": "auto", "label": "Auto (detect GPU)"},
-                            {"value": "cuda", "label": "CUDA (GPU)"},
-                            {"value": "cpu", "label": "CPU"},
-                        ],
-                        "default": "auto",
-                    },
-                },
-                "defaults": {"model": "MossFormer2_SE_48K", "device": "auto"},
-            }
-
         # ZipEnhancer schema
         if backend == "zipenhancer":
             return {
@@ -1518,9 +1824,9 @@ class WhisperJAVAPI:
                         "type": "dropdown",
                         "label": "Device",
                         "options": [
-                            {"value": "auto", "label": "Auto"},
-                            {"value": "cuda", "label": "CUDA"},
-                            {"value": "cpu", "label": "CPU"},
+                            {"value": "auto", "label": "Auto (the GPU when one can be used, else the CPU)"},
+                            {"value": "cuda", "label": "NVIDIA GPU (CUDA)"},
+                            {"value": "cpu", "label": "CPU (not accelerated)"},
                         ],
                         "default": "auto",
                     },
@@ -1550,9 +1856,9 @@ class WhisperJAVAPI:
                         "type": "dropdown",
                         "label": "Device",
                         "options": [
-                            {"value": "auto", "label": "Auto"},
-                            {"value": "cuda", "label": "CUDA"},
-                            {"value": "cpu", "label": "CPU"},
+                            {"value": "auto", "label": "Auto (the GPU when one can be used, else the CPU)"},
+                            {"value": "cuda", "label": "NVIDIA GPU (CUDA)"},
+                            {"value": "cpu", "label": "CPU (not accelerated)"},
                         ],
                         "default": "auto",
                     },
@@ -1578,16 +1884,20 @@ class WhisperJAVAPI:
             "error": f"Unknown enhancer backend: {backend}"
         }
 
-    def get_scene_detector_schema(self, backend: str) -> Dict[str, Any]:
+    def get_scene_detector_schema(self, backend: str, pipeline: str = None) -> Dict[str, Any]:
         """
         Get parameter schema for a scene detector backend.
 
         Args:
-            backend: Detector name (auditok, silero, semantic, none)
+            backend: Detector name (auditok, silero, semantic, none, rscn)
+            pipeline: The pass's pipeline; rscn shows that pipeline's preset (1.10.1). Ignored by the others.
 
         Returns:
             Schema dict with parameters
         """
+        if backend == "rscn":
+            return self._rscn_scene_schema(pipeline)
+
         if backend == "none":
             return {
                 "success": True,
@@ -1629,6 +1939,45 @@ class WhisperJAVAPI:
                 "success": False,
                 "error": str(e)
             }
+
+    # R-SCN (owner W448-W455; docs/plans/design/2026-11-02-rscn-design.md section 15): the Customize Scene tab of a
+    # pass whose scene detector is rscn. The CONTROLS (widget, label, description, group) come from
+    # rscn-scene-detection.yaml like the other detectors'; the DEFAULTS come from the detector's own settings
+    # (rscn/settings.py, the pipeline's preset), never from the YAML, so the tab and the run cannot drift. Each control
+    # is one Customize value rscn_<setting>, sent in --passN-params; a setting without a control stays reachable from
+    # the command line. Light: no model, no CrispASR.
+    RSCN_YAML = "rscn-scene-detection.yaml"
+
+    def _rscn_gui_hints(self) -> Dict[str, Any]:
+        return dict((self._load_tool_yaml(self.RSCN_YAML) or {}).get("gui") or {})
+
+    @staticmethod
+    def _rscn_defaults(pipeline: Optional[str], hints: Dict[str, Any]) -> Dict[str, Any]:
+        """The value of each control for the pipeline's preset, keyed rscn_<setting>."""
+        from whisperjav.modules.scene_detection_backends.rscn.settings import PREFIX, RSCNSettings
+        values = RSCNSettings.for_pipeline(pipeline).as_dict()
+        return {key: values[key[len(PREFIX):]] for key in hints
+                if str(key).startswith(PREFIX) and key[len(PREFIX):] in values}
+
+    def _rscn_scene_schema(self, pipeline: Optional[str] = None) -> Dict[str, Any]:
+        try:
+            config = self._load_tool_yaml(self.RSCN_YAML)
+            hints = config.get("gui") or {}
+            if not hints:
+                return {"success": False, "error": f"Could not load config for rscn ({self.RSCN_YAML})"}
+            defaults = self._rscn_defaults(pipeline, hints)
+            return {
+                "success": True,
+                "backend": "rscn",
+                "display_name": config.get("metadata", {}).get("displayName", "rscn"),
+                "description": config.get("metadata", {}).get("description", ""),
+                "parameters": self._convert_gui_hints_to_schema(hints, defaults),
+                "defaults": defaults,
+                "presets": {},
+                "groups": self._extract_groups(hints),
+            }
+        except Exception as e:  # noqa: BLE001 -- the tab says what failed
+            return {"success": False, "error": str(e)}
 
     def get_available_backends(self) -> Dict[str, Any]:
         """
@@ -1834,7 +2183,12 @@ class WhisperJAVAPI:
 
         try:
             # Build ensemble-specific arguments
+            self._run_options = dict(options)
             args = self._build_ensemble_args(options)
+            if options.get('run_on_cpu'):  # "Run on the CPU this time" (design 22.9.2, D-G)
+                args = _with_device_cpu(args)
+            args = self._with_log_file(args, options)   # owner W511 2: the GUI run's log file
+            self._last_start = ("start_ensemble_process", dict(options))
 
             # Construct command
             cmd = [sys.executable, "-X", "utf8", "-m", "whisperjav.main", *args]
@@ -1867,6 +2221,8 @@ class WhisperJAVAPI:
             # Update status
             self.status = "running"
             self.exit_code = None
+            self._process_started_at = time.time()
+            self._run_summary = None
 
             # Start log streaming thread
             self._stream_thread = threading.Thread(
@@ -1932,7 +2288,7 @@ class WhisperJAVAPI:
         args += ["--task", task]
 
         # Output directory
-        output_dir = options.get('output_dir', self.default_output)
+        output_dir = self._output_dir(options)
         args += ["--output-dir", output_dir]
 
         # Parameter overrides - pass as JSON
@@ -1948,6 +2304,27 @@ class WhisperJAVAPI:
 
         if options.get('keep_temp', False):
             args += ["--keep-temp"]
+
+        if options.get('skip_existing', False):
+            args += ["--skip-existing"]
+
+        # Run-outcome contract: same words and same rule as the CLI's --fail-on.
+        _fail_on = [s for s in ("empty", "suspect") if options.get(f"fail_on_{s}", False)]
+        if _fail_on:
+            args += ["--fail-on", ",".join(_fail_on)]
+
+        # Per-scene ASR telemetry is on by default; the checkbox only opts out.
+        if options.get('asr_telemetry', True) is False:
+            args += ["--no-asr-telemetry"]
+
+        # #415: downloaded Hugging Face models only (HF_HUB_OFFLINE=1 in the child and its workers).
+        if options.get('offline_mode', False):
+            args += ["--offline"]
+
+        # v1.9.2 (CFF1): recogniser refresh budget in minutes of scene audio (0 = never).
+        _mr = options.get('model_refresh_audio_minutes')
+        if _mr not in (None, ''):
+            args += ["--model-refresh-audio-minutes", str(_mr)]
 
         # Verbosity
         verbosity = options.get('verbosity', 'summary')
@@ -2047,9 +2424,9 @@ class WhisperJAVAPI:
                         "type": "dropdown",
                         "label": "Device",
                         "options": [
-                            {"value": "auto", "label": "Auto (detect GPU)"},
-                            {"value": "cuda", "label": "CUDA (GPU)"},
-                            {"value": "cpu", "label": "CPU"},
+                            {"value": "auto", "label": "Auto (the GPU when one can be used, else the CPU)"},
+                            {"value": "cuda", "label": "NVIDIA GPU (CUDA)"},
+                            {"value": "cpu", "label": "CPU (not accelerated)"},
                         ],
                         "default": "auto"
                     },
@@ -2275,14 +2652,172 @@ class WhisperJAVAPI:
             },
         }
 
-    def get_qwen_schema(self) -> Dict[str, Any]:
-        """
-        Get parameter schema for Qwen3-ASR pipeline customize modal.
+    # Segmenters whose backend does not enforce a longest-segment cap (Silero
+    # v3.1/v4.0 ignore max_speech_duration_s, config/components/vad/silero.py),
+    # and the dialog levers only WhisperSeg has.
+    _NO_MAX_SPEECH_SEGMENTERS = ("silero", "silero-v3.1", "silero-v4.0", "none")
+    _WHISPERSEG_ONLY_LEVERS = ("vad_decoder", "vad_grow_floor", "vad_gap_merge_ms")
 
-        Returns the schema used by the frontend to generate the customize
-        modal UI for Qwen3-ASR pipeline parameters.  Organized into 5
-        pipeline-stage sections: model, audio, generation, alignment, output.
+    def get_qwen_schema(self, sensitivity: str = "balanced",
+                        generator_backend: str = "qwen3",
+                        segmenter: str = "whisperseg") -> Dict[str, Any]:
         """
+        Get parameter schema for the Qwen / ChronosJAV customize modal.
+
+        v1.9.4: the dialog shows what the pass will run, for its model,
+        sensitivity AND speech segmenter, because Apply sends every shown value
+        back as the user's choice; a wrong default would silently change the run.
+        - Segmenter values (VAD Threshold, Max Speech Duration, and for
+          WhisperSeg the Decoder / Grow Floor / Gap Cut) are resolved through
+          config/chronosjav_vad.py, the same decision main.py and the ensemble
+          worker make: ChronosJAV values for WhisperSeg, otherwise that
+          segmenter's own sensitivity preset (e.g. TEN on the default pass 2),
+          except the longest segment of TEN and FireRedVAD (4 s, 2026-10-08).
+        - Controls a segmenter does not have are left out of the schema, so they
+          are neither shown nor sent: the three WhisperSeg-only levers for other
+          segmenters; Max Speech Duration for Silero v3.1/v4.0 and None; the VAD
+          Threshold for None.
+        - anime-whisper's pipeline values (Frame Gap, Max Group, Start/End Pad)
+          come from its per-sensitivity table, as in a run; its Silence Before
+          Each Window is 0 with Silero (2026-10-09). Qwen3-ASR with WhisperSeg
+          shows End Pad 0 (2026-10-09).
+        Balanced is the fallback for an unknown sensitivity.
+        """
+        result = self._get_qwen_schema_base()
+        if not result.get("success"):
+            return result
+        audio = result["schema"]["audio"]
+        if generator_backend == "anime-whisper":
+            from whisperjav.config.anime_whisper_vad import (
+                anime_leading_silence_default, anime_whisperseg_defaults)
+            # v1.9.4 (owner, 2026-10-06): the lead-in silence and its off switch (0);
+            # 0 by default with Silero (owner, 2026-10-09), as a run uses it.
+            result["schema"]["generation"]["leading_silence_ms"] = {
+                "type": "slider",
+                "label": "Silence Before Each Window (ms)",
+                "description": "Silence placed before every audio window sent to anime-whisper. It helped "
+                               "the first words of a line come out right. Where each window starts and ends does not change. "
+                               "0 turns it off.",
+                "min": 0, "max": 500, "step": 50,
+                "default": anime_leading_silence_default(segmenter),
+            }
+            aw = anime_whisperseg_defaults(sensitivity)
+            audio["chunk_threshold_ms"]["default"] = int(round(aw["chunk_threshold_s"] * 1000))
+            audio["max_group_duration"]["default"] = aw["max_group_duration_s"]
+            audio["vad_start_pad"]["default"] = int(aw["start_pad_ms"])
+            audio["vad_end_pad"]["default"] = int(aw["end_pad_ms"])
+
+        # Qwen3-ASR + WhisperSeg: end pad 0 ms (owner, 2026-10-09), as a run uses it.
+        from whisperjav.config.chronosjav_vad import chronosjav_end_pad_default
+        _end_pad_default = chronosjav_end_pad_default(generator_backend, segmenter)
+        if _end_pad_default is not None:
+            audio["vad_end_pad"]["default"] = _end_pad_default
+
+        segmenter = (segmenter or "whisperseg").strip().lower()
+        if segmenter == "none":
+            for key in ("vad_threshold", "max_speech_duration") + self._WHISPERSEG_ONLY_LEVERS:
+                audio.pop(key, None)
+            return result
+
+        from whisperjav.config.chronosjav_vad import resolve_chronosjav_segmenter_config
+        cfg = resolve_chronosjav_segmenter_config(generator_backend, segmenter, sensitivity)
+        if cfg.get("threshold") is not None:
+            audio["vad_threshold"]["default"] = float(cfg["threshold"])
+        if segmenter == "whisperseg":
+            if cfg.get("segmentation_decoder"):
+                audio["vad_decoder"]["default"] = cfg["segmentation_decoder"]
+            if cfg.get("grow_floor") is not None:
+                audio["vad_grow_floor"]["default"] = float(cfg["grow_floor"])
+            if cfg.get("gap_merge_ms") is not None:
+                audio["vad_gap_merge_ms"]["default"] = int(cfg["gap_merge_ms"])
+        else:
+            for key in self._WHISPERSEG_ONLY_LEVERS:
+                audio.pop(key, None)
+        max_speech = cfg.get("max_speech_duration_s")
+        if segmenter in self._NO_MAX_SPEECH_SEGMENTERS or max_speech is None:
+            audio.pop("max_speech_duration", None)
+        else:
+            audio["max_speech_duration"]["default"] = float(max_speech)
+        return result
+
+    # The pass's aligner choices: the CrispASR aligners from the manifest (so the GUI and the run cannot
+    # drift), then the PyTorch Qwen3-ForcedAligner. Each option names its backend; the Alignment tab
+    # lists the options of the chosen backend. Labels and descriptions
+    # approved by the owner as drafted (W268); design note 2026-10-28 sections 8-9, Q3, Q10.
+    QWEN3_PYTORCH_ALIGNER = "Qwen/Qwen3-ForcedAligner-0.6B"
+    ALIGNER_NOT_MEASURED = "new in 1.10.0; not yet measured against reference subtitles"
+    # The default aligner with the timing model was measured in tuning (owner W301).
+    TIMING_MODEL_NEW = "new in 1.10.0"
+
+    def _aligner_and_timing_schema(self) -> Dict[str, Any]:
+        """The aligner backend, aligner model and timing model dropdowns of the Alignment tab."""
+        from whisperjav.crispasr import install, manifest
+
+        crisp_options = []
+        for name, model in manifest.ALIGNER_MODELS.items():
+            label = f"{name} — {model.label}, {install.mb(model.size)}"
+            if name == manifest.DEFAULT_ALIGNER:
+                label += " (recommended)"
+            if name == "parakeet-ctc-ja":
+                label += " — its times came back evenly spread in WhisperJAV's tests; not recommended"
+            crisp_options.append({"value": name, "label": label, "backend": "crispasr"})
+        timing = manifest.timing_model_for(None)
+        return {
+            "aligner_backend": {
+                "type": "dropdown",
+                "label": "Aligner Backend",
+                "description": ("Times each character of the text the ASR model wrote. CrispASR aligners are "
+                                f"{self.ALIGNER_NOT_MEASURED}; they run where this install's CrispASR runs."),
+                "options": [
+                    {"value": "crispasr", "label": "CrispASR (GGUF, recommended)"},
+                    {"value": "qwen3", "label": "Qwen3 ForcedAligner (PyTorch)"},
+                    {"value": "none", "label": "None (no aligner)"},
+                ],
+                "default": "crispasr",
+            },
+            "aligner_id": {
+                "type": "dropdown",
+                "label": "Aligner Model",
+                "options": crisp_options + [
+                    {"value": self.QWEN3_PYTORCH_ALIGNER, "label": "Qwen3-ForcedAligner-0.6B (PyTorch)",
+                     "backend": "qwen3"},
+                ],
+                "default": manifest.DEFAULT_ALIGNER,
+            },
+            "timing_model": {
+                "type": "dropdown",
+                "label": "Timing Model (Whisper)",
+                # 1.10.1 (owner W498 D1, W501 5): off by default; it splits only where an aligner timed the group.
+                "description": ("Finds where speech starts and where a new sentence starts inside each VAD group; "
+                                "its text is not used. Where no aligner gave a time, it moves the subtitle's start "
+                                "to where speech starts; only where an aligner timed the group can two sentences "
+                                "become two subtitles. "
+                                f"{timing.label}, {install.mb(timing.size)}, downloaded on first use; "
+                                f"{self.TIMING_MODEL_NEW}."),
+                "options": [
+                    {"value": timing.name, "label": timing.label},
+                    {"value": "none", "label": "None (no timing model)"},
+                ],
+                "default": "none",   # 1.10.1: off by default (owner W498 D1)
+            },
+        }
+
+    def _get_qwen_schema_base(self) -> Dict[str, Any]:
+        """
+        Build the static Qwen customize-modal schema (backend-agnostic).
+
+        Organized into 5 pipeline-stage sections: model, audio, generation,
+        alignment, output. Anime-whisper per-sensitivity overrides are applied
+        by the public get_qwen_schema() wrapper.
+        """
+        # The decoder a WhisperSeg run uses when nothing sets one (hysteresis),
+        # read from the segmenter factory so the dialog and the run cannot drift.
+        # Only anime-whisper aggressive pins "offline"; get_qwen_schema() applies
+        # that row. Before v1.9.4 this default was "offline" for every model and
+        # sensitivity, so Apply in Customize silently switched Qwen3-ASR and
+        # anime-whisper conservative/balanced from hysteresis to offline.
+        from whisperjav.modules.speech_segmentation.factory import _PARAM_SCHEMAS
+        whisperseg_decoder = _PARAM_SCHEMAS["whisperseg"]["segmentation_decoder"][1]
         return {
             "success": True,
             "schema": {
@@ -2294,9 +2829,17 @@ class WhisperJAVAPI:
                         "options": [
                             {"value": "Qwen/Qwen3-ASR-1.7B", "label": "Qwen3-ASR-1.7B (8GB VRAM)"},
                             {"value": "Qwen/Qwen3-ASR-0.6B", "label": "Qwen3-ASR-0.6B (4GB VRAM)"},
+                            # v1.9.0 (R6.4): galgame/anime SFT of the 1.7B base.
+                            {"value": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
+                             "label": "JA Anime-Galgame 1.7B (jaykwok finetune, 8GB VRAM)"},
+                            # v1.9.0 (R6.1): proper-noun/kanji-focused JA finetune.
+                            {"value": "neosophie/Qwen3-ASR-1.7B-JA",
+                             "label": "JA-tuned 1.7B (neosophie finetune, 8GB VRAM)"},
                         ],
                         "default": "Qwen/Qwen3-ASR-1.7B",
-                        "description": "1.7B is more accurate, 0.6B is faster and uses less VRAM",
+                        "description": "1.7B is more accurate, 0.6B is faster and uses less VRAM. "
+                                       "The JA finetunes are 1.7B-class (8GB): Anime-Galgame is "
+                                       "dialogue-tuned; neosophie targets proper nouns.",
                     },
                     "language": {
                         "type": "dropdown",
@@ -2323,9 +2866,9 @@ class WhisperJAVAPI:
                         "label": "Device",
                         "group": "hardware",
                         "options": [
-                            {"value": "auto", "label": "Auto (detect GPU)"},
-                            {"value": "cuda", "label": "CUDA (GPU)"},
-                            {"value": "cpu", "label": "CPU"},
+                            {"value": "auto", "label": "Auto (the GPU when one can be used, else the CPU)"},
+                            {"value": "cuda", "label": "NVIDIA GPU (CUDA)"},
+                            {"value": "cpu", "label": "CPU (not accelerated)"},
                         ],
                         "default": "auto",
                     },
@@ -2370,7 +2913,7 @@ class WhisperJAVAPI:
                     "safe_chunking": {
                         "type": "checkbox",
                         "label": "Safe Chunking",
-                        "description": "Enforce scene boundaries for ForcedAligner 180s limit",
+                        "description": "Gives the scene detector Min Duration and Max Duration (12 s and 48 s by default) as the shortest and longest scene. Off: the scene detector's own lengths.",
                         "default": True,
                     },
                     "scene_min_duration": {
@@ -2386,38 +2929,95 @@ class WhisperJAVAPI:
                         "label": "Max Duration",
                         "description": "Maximum scene length (default: 48s)",
                         "group": "scene_bounds",
-                        "min": 20, "max": 300, "step": 5,
+                        # Step 1 so the slider holds 48 s; with step 5 Apply sent 50 s (G1, owner W491).
+                        "min": 20, "max": 300, "step": 1,
                         "default": 48,
                     },
-                    "chunk_threshold": {
+                    "scene_clustering_threshold": {
                         "type": "slider",
-                        "label": "Frame Gap Threshold",
-                        "description": "Silence gap (seconds) that splits speech into separate frames. Lower = more smaller frames, higher = fewer larger frames.",
-                        "min": 0.3, "max": 5.0, "step": 0.1,
-                        "default": 1.0,
+                        "label": "Scene Change Threshold",
+                        "description": "Semantic detector only: clustering distance that separates scenes. Lower values tend to give more, shorter scenes (default: 22, the same value every pipeline uses)",
+                        "group": "scene_bounds",
+                        "min": 5, "max": 30, "step": 1,
+                        "default": 22,
+                    },
+                    "chunk_threshold_ms": {
+                        "type": "slider",
+                        "label": "Frame Gap Threshold (ms)",
+                        "description": "Max silence gap (ms) between two segments that can still be grouped together. Gaps larger than this start a new group. JAV default: 300ms.",
+                        "min": 100, "max": 2000, "step": 50,
+                        "default": 300,
                     },
                     "max_group_duration": {
                         "type": "slider",
-                        "label": "Max Group Duration",
-                        "description": "Maximum duration for VAD segment grouping",
-                        "min": 3, "max": 60, "step": 1,
-                        "default": 6,
+                        "label": "Max Group Duration (s)",
+                        "description": "Maximum duration (seconds) for a grouped VAD segment sent to ASR. JAV default: 3.0s.",
+                        "min": 1.0, "max": 14.0, "step": 0.5,
+                        "default": 3.0,
                     },
                     "vad_threshold": {
                         "type": "slider",
                         "label": "VAD Threshold",
-                        "description": "Speech detection probability threshold. Overrides sensitivity preset. Lower = more sensitive.",
+                        "description": "Speech detection probability threshold. Overrides sensitivity preset. Lower = more sensitive. JAV default: 0.25.",
                         "group": "vad_settings",
-                        "min": 0.05, "max": 0.80, "step": 0.05,
-                        "default": 0.35,
+                        # Step 0.01 so the slider holds every segmenter's preset (0.12, 0.18, 0.22, 0.32 ...);
+                        # with step 0.05 Apply sent the nearest step instead (G1, owner W491).
+                        "min": 0.05, "max": 0.80, "step": 0.01,
+                        "default": 0.25,
                     },
-                    "vad_padding": {
+                    "vad_start_pad": {
                         "type": "slider",
-                        "label": "VAD Padding (ms)",
-                        "description": "Padding around detected speech segments (ms). Overrides sensitivity preset.",
+                        "label": "VAD Start Pad (ms)",
+                        "description": "Padding added before each speech segment (ms). JAV default: 100ms.",
                         "group": "vad_settings",
-                        "min": 50, "max": 600, "step": 25,
-                        "default": 250,
+                        "min": 0, "max": 600, "step": 50,
+                        "default": 100,
+                    },
+                    "vad_end_pad": {
+                        "type": "slider",
+                        "label": "VAD End Pad (ms)",
+                        "description": "Padding added after each speech segment (ms). The default depends on the model, the sensitivity and the speech segmenter.",
+                        "group": "vad_settings",
+                        # Step 10 so the slider holds anime-whisper's 30 ms; with step 50 Apply sent 50 ms (G1, W491).
+                        "min": 0, "max": 800, "step": 10,
+                        "default": 100,
+                    },
+                    "vad_decoder": {
+                        "type": "dropdown",
+                        "label": "VAD Decoder",
+                        "description": "How speech probabilities become segments. Offline (two-level): seeds at VAD Threshold, edges grow to the Grow Floor, dialogs cut at pauses >= Gap Cut. Hysteresis: vendor streaming state machine (ChickenRice lineage).",
+                        "group": "vad_settings",
+                        "options": [
+                            {"value": "offline", "label": "Offline two-level"},
+                            {"value": "hysteresis", "label": "Hysteresis (ChickenRice)"},
+                        ],
+                        "default": whisperseg_decoder,
+                    },
+                    "vad_grow_floor": {
+                        "type": "slider",
+                        "label": "VAD Grow Floor",
+                        "description": "Offline decoder: segment edges extend while probability stays above this floor. The capture-vs-cut dial: lower keeps more quiet/whispered speech and cuts fewer pauses; higher trims tails and cuts more pauses.",
+                        "group": "vad_settings",
+                        "min": 0.01, "max": 0.30, "step": 0.01,
+                        "default": 0.05,
+                    },
+                    "vad_gap_merge_ms": {
+                        "type": "slider",
+                        "label": "VAD Gap Cut (ms)",
+                        "description": "Offline decoder: pauses at least this long (below the Grow Floor) split dialogs into separate segments; shorter pauses are absorbed.",
+                        "group": "vad_settings",
+                        "min": 100, "max": 1000, "step": 50,
+                        "default": 350,
+                    },
+                    "max_speech_duration": {
+                        "type": "slider",
+                        "label": "Max Speech Duration (s)",
+                        "description": "Single-segment ceiling. Segments longer than this are split at the quietest point (offline decoder) or per the force-split mode (hysteresis).",
+                        "group": "vad_settings",
+                        "min": 2.0, "max": 10.0, "step": 0.5,
+                        # Qwen3-ASR default (single source); anime-whisper rows
+                        # override it from config/anime_whisper_vad.py.
+                        "default": QWEN3_WHISPERSEG_DEFAULTS["max_speech_duration_s"],
                     },
                 },
                 # ── Tab 3: Generation ─────────────────────────────────
@@ -2455,25 +3055,11 @@ class WhisperJAVAPI:
                     },
                 },
                 # ── Tab 4: Alignment ──────────────────────────────────
+                # 1.10.0 (item 12): the CrispASR aligner and the timing model are the default
+                # (design note 2026-10-28 sections 7-8). Labels and descriptions
+                # approved by the owner as drafted (W268) (section 9, Q3, Q10).
                 "alignment": {
-                    "aligner_backend": {
-                        "type": "dropdown",
-                        "label": "Aligner Backend",
-                        "description": "Provides precise word timestamps for subtitle timing",
-                        "options": [
-                            {"value": "qwen3", "label": "Qwen3 ForcedAligner (recommended)"},
-                            {"value": "none", "label": "None (no word timestamps)"},
-                        ],
-                        "default": "qwen3",
-                    },
-                    "aligner_id": {
-                        "type": "dropdown",
-                        "label": "Aligner Model",
-                        "options": [
-                            {"value": "Qwen/Qwen3-ForcedAligner-0.6B", "label": "Qwen3-ForcedAligner-0.6B"},
-                        ],
-                        "default": "Qwen/Qwen3-ForcedAligner-0.6B",
-                    },
+                    **self._aligner_and_timing_schema(),
                     "assembly_cleaner": {
                         "type": "dropdown",
                         "label": "Text Cleaner",
@@ -2487,20 +3073,23 @@ class WhisperJAVAPI:
                     "timestamp_mode": {
                         "type": "dropdown",
                         "label": "Timestamp Mode",
-                        "description": "How word timestamps are resolved from aligner output",
+                        "description": "How subtitle timestamps are resolved (VAD frames or the aligner)",
                         "options": [
-                            {"value": "aligner_vad_fallback", "label": "Aligner + VAD Fallback (Recommended)"},
+                            {"value": "aligner_vad_fallback", "label": "Aligner + VAD Fallback"},
                             {"value": "aligner_interpolation", "label": "Aligner + Interpolation"},
                             {"value": "aligner_only", "label": "Aligner Only (no recovery on collapse)"},
                             {"value": "vad_only", "label": "VAD Only (no aligner loaded)"},
                         ],
-                        "default": "aligner_vad_fallback",
+                        "default": "vad_only",   # 1.10.1 (owner W498 D1); 1.10.0: aligner_vad_fallback
                     },
                     "stepdown": {
                         "type": "checkbox",
                         "label": "Adaptive Step-Down",
-                        "description": "Retry collapsed scenes with tighter framing",
-                        "default": True,
+                        # Description approved by the owner as drafted (W268) (W266 1; the old one said
+                        # "tighter framing", but the retry uses the Tier 2 duration, 6 s by default).
+                        "description": ("Retry a collapsed scene with VAD groups up to the Tier 2 duration. Off by "
+                                        "default: a collapsed scene then takes its VAD groups' times"),
+                        "default": False,
                     },
                     "stepdown_initial_group": {
                         "type": "slider",
@@ -2618,9 +3207,9 @@ class WhisperJAVAPI:
                         "label": "Device",
                         "group": "hardware",
                         "options": [
-                            {"value": "auto", "label": "Auto (detect GPU)"},
-                            {"value": "cuda", "label": "CUDA (GPU)"},
-                            {"value": "cpu", "label": "CPU"},
+                            {"value": "auto", "label": "Auto (the GPU when one can be used, else the CPU)"},
+                            {"value": "cuda", "label": "NVIDIA GPU (CUDA)"},
+                            {"value": "cpu", "label": "CPU (not accelerated)"},
                         ],
                         "default": "auto",
                     },
@@ -2660,7 +3249,7 @@ class WhisperJAVAPI:
                 # renders this section unguarded — keep all 8 keys present).
                 # vad_threshold/vad_padding become segmenter overrides
                 # (threshold / speech_pad_ms) for whichever speech segmenter
-                # the Ensemble row selects (whisperseg, firered, silero, ten).
+                # the Ensemble row selects (whisperseg, firered-vad, silero, ten).
                 "audio": {
                     "framer": {
                         "type": "dropdown",
@@ -2760,24 +3349,15 @@ class WhisperJAVAPI:
                         "default": 8,
                     },
                 },
+                # Cohere has no native word-level timestamps (HF discussion #19); the aligner
+                # produces them downstream, as for every ChronosJAV model (1.10.0). Selecting
+                # 'none' falls back to VAD-derived timing and flips timestamp_mode and stepdown
+                # together (handled at pack time).
+                # Fork default: VAD-only timing for Cohere (aligner 'none') — the speech
+                # segmenter drives subtitle granularity; pick an aligner here to re-enable it.
                 "alignment": {
-                    "aligner_backend": {
-                        "type": "dropdown",
-                        "label": "Aligner Backend",
-                        "description": (
-                            "Cohere has no native word-level timestamps (HF discussion #19). "
-                            "Default is VAD-only timing (ChronosJAV logic): the speech "
-                            "segmenter — FireRedVAD by default — drives subtitle granularity. "
-                            "The Qwen3 ForcedAligner benchmarked ~0% native alignment on JAV "
-                            "audio (scene-sized blocks); selecting it restores "
-                            "timestamp_mode and stepdown together (handled at pack time)."
-                        ),
-                        "options": [
-                            {"value": "none", "label": "None — VAD timing (recommended)"},
-                            {"value": "qwen3", "label": "Qwen3 ForcedAligner (+~1.2GB VRAM)"},
-                        ],
-                        "default": "none",
-                    },
+                    key: ({**spec, "default": "none"} if key == "aligner_backend" else spec)
+                    for key, spec in self._aligner_and_timing_schema().items()
                 },
             },
             "metadata": {
@@ -2791,13 +3371,19 @@ class WhisperJAVAPI:
     # Two-Pass Ensemble Methods
     # ========================================================================
 
-    def get_pipeline_defaults(self, pipeline: str, sensitivity: str) -> Dict[str, Any]:
+    def get_pipeline_defaults(self, pipeline: str, sensitivity: str, segmenter: str = None,
+                              scene_detector: str = None) -> Dict[str, Any]:
         """
         Get resolved parameters for a pipeline+sensitivity combination.
 
         Args:
-            pipeline: Pipeline name ('balanced', 'fast', 'faster', 'fidelity', 'kotoba-faster-whisper', 'transformers')
+            pipeline: Pipeline name ('balanced', 'fast', 'faster', 'fidelity', 'transformers')
             sensitivity: Sensitivity level ('conservative', 'balanced', 'aggressive')
+            segmenter: Speech segmenter the pass will use (drives the balanced VAD overlay)
+            scene_detector: Scene backend the pass will use ('semantic', 'auditok',
+                'silero', 'none'). v1.9.2: decides which scene parameter NAMES the panel
+                shows, because the backends read different ones. Empty/None = the shared
+                DEFAULT_SCENE_DETECTOR, the same default the CLI and the pass worker use.
 
         Returns:
             dict with resolved parameters that can be customized
@@ -2830,83 +3416,127 @@ class WhisperJAVAPI:
         try:
             from whisperjav.config.legacy import resolve_legacy_pipeline
 
+            # v1.9.2: resolve with the scene backend the pass will actually use, so the
+            # panel shows that backend's own parameter names and values (semantic reads
+            # min_duration / max_duration; auditok and silero read the _s spellings).
+            # Same default as main.py and pass_worker, from the one shared constant.
+            from whisperjav.config.segmenter_presets import DEFAULT_SCENE_DETECTOR
+            effective_scene_method = (scene_detector or '').strip() or DEFAULT_SCENE_DETECTOR
+
             config = resolve_legacy_pipeline(
                 pipeline_name=pipeline,
                 sensitivity=sensitivity,
-                task='transcribe'
+                task='transcribe',
+                scene_method=effective_scene_method,
             )
 
-            # Determine scene detection method (default: auditok)
-            scene_detection_method = 'auditok'
-            if 'features' in config and config['features'].get('scene_detection'):
-                # Could be enhanced to read from config if specified
-                pass
+            # v1.9.0: reflect the runtime balanced VAD defaults in the Customize
+            # panel — native faster_whisper_vad preset (e.g. threshold 0.40), or the
+            # Test-D fine-grained grouping for an external segmenter on balanced —
+            # instead of the raw silero preset. Uses
+            # the SAME shared helper main.py / pass_worker apply at run time, so the
+            # panel shows what will actually run.
+            if segmenter:
+                from whisperjav.config.legacy import apply_balanced_vad_defaults
+                from whisperjav.config.segmenter_presets import resolve_segmenter_sensitivity
+                ss = config.setdefault('params', {}).setdefault('speech_segmenter', {})
+                ss['backend'] = segmenter
+                # v1.9.2: same order as main.py — YAML sensitivity preset for a
+                # non-silero external backend, then the balanced overlay.
+                if segmenter not in ('none', 'faster-whisper') and not segmenter.startswith('silero'):
+                    for _k, _v in resolve_segmenter_sensitivity(segmenter, sensitivity).items():
+                        ss.setdefault(_k, _v)
+                apply_balanced_vad_defaults(
+                    config,
+                    sensitivity=sensitivity,
+                    is_balanced=(pipeline == 'balanced'),
+                )
+                # Mirror the ASR constructor firewall (faster_whisper_pro_asr.py):
+                # for a non-silero external backend the resolver's silero VAD
+                # values are discarded at run time, so show what actually runs —
+                # the segmenter's own effective parameters.
+                if segmenter not in ('none', 'faster-whisper') and not segmenter.startswith('silero'):
+                    config['params']['vad'] = {k: v for k, v in ss.items() if k != 'backend'}
 
-            # M11: Detect V3 config by structure, not pipeline name string
-            # V3 configs (like kotoba) have 'params.asr', legacy have 'params.decoder'
-            is_v3_config = 'asr' in config.get('params', {})
-            is_kotoba = is_v3_config  # Currently only kotoba uses V3
-
-            if is_v3_config:
-                # Kotoba uses V3 structure with params.asr
-                asr_params = config.get('params', {}).get('asr', {})
-                return {
-                    "success": True,
-                    "pipeline": pipeline,
-                    "sensitivity": sensitivity,
-                    "model": config.get('model', {}).get('model_name', 'kotoba-tech/kotoba-whisper-v2.0-faster'),
-                    "is_kotoba": True,
-                    "params": {
-                        "decoder": {
-                            "task": asr_params.get('task', 'transcribe'),
-                            "language": asr_params.get('language', 'ja'),
-                            "beam_size": asr_params.get('beam_size', 3),
-                            "best_of": asr_params.get('best_of', 3),
-                            "patience": asr_params.get('patience', 2.0),
-                            "suppress_blank": asr_params.get('suppress_blank', True),
-                            "without_timestamps": asr_params.get('without_timestamps', False),
-                        },
-                        "provider": {
-                            "temperature": asr_params.get('temperature', [0.0, 0.3]),
-                            "compression_ratio_threshold": asr_params.get('compression_ratio_threshold', 2.4),
-                            "logprob_threshold": asr_params.get('logprob_threshold', -1.5),
-                            "no_speech_threshold": asr_params.get('no_speech_threshold', 0.34),
-                            "condition_on_previous_text": asr_params.get('condition_on_previous_text', True),
-                            "word_timestamps": asr_params.get('word_timestamps', False),
-                            # Internal VAD parameters (kotoba-specific)
-                            "vad_filter": asr_params.get('vad_filter', True),
-                            "vad_threshold": asr_params.get('vad_threshold', 0.01),
-                            "min_speech_duration_ms": asr_params.get('min_speech_duration_ms', 90),
-                            "max_speech_duration_s": asr_params.get('max_speech_duration_s', 28.0),
-                            "min_silence_duration_ms": asr_params.get('min_silence_duration_ms', 150),
-                            "speech_pad_ms": asr_params.get('speech_pad_ms', 400),
-                            "repetition_penalty": asr_params.get('repetition_penalty', 1.0),
-                            "no_repeat_ngram_size": asr_params.get('no_repeat_ngram_size', 0),
-                        },
-                        "vad": {}  # Empty - kotoba uses internal VAD, not external
-                    },
-                    "scene_detection_method": scene_detection_method
-                }
+            # The scene method that will actually run. Before v1.9.2 this was hardcoded
+            # to 'auditok' beside an empty `if ... : pass`, so the panel reported auditok
+            # whatever the pass was configured to use.
+            scene_cfg = (config.get('features') or {}).get('scene_detection') or {}
+            scene_detection_method = scene_cfg.get('method') or effective_scene_method
 
             # Return the params section for customization (standard pipelines)
             return {
                 "success": True,
                 "pipeline": pipeline,
                 "sensitivity": sensitivity,
-                "is_kotoba": False,
                 "params": {
                     "decoder": config['params']['decoder'],
                     "provider": config['params']['provider'],
                     "vad": config['params']['vad']
                 },
                 "model": config['model'],
-                "scene_detection_method": scene_detection_method
+                "scene_detection_method": scene_detection_method,
+                # v1.9.2: the RESOLVED scene parameters, so the Customize panel seeds the
+                # Scene tab with what will actually run. Without this the tab fell back to
+                # the tool YAML's defaults, and saving a customised pass wrote those back
+                # over the pipeline's own values (Balanced resolves 28 s / 240 s and
+                # Fidelity a 240 s ceiling, while the semantic YAML declares 20 / 420).
+                "scene_params": {k: v for k, v in scene_cfg.items() if k != 'method'}
             }
         except Exception as e:
             return {
                 "success": False,
                 "error": str(e)
             }
+
+    def get_crispasr_customize_defaults(self, pipeline: str, sensitivity: str, segmenter: str = None,
+                                        scene_detector: str = None) -> Dict[str, Any]:
+        """The values a CrispASR pass runs with, for its Customize window (design 22.9.1; owner W214 2,
+        W232 8): the Segmenter tab as segmenter_settings() resolves them, the Scene tab as the pipeline
+        sets its scene detector (semantic with the pipeline's minimum, 12 s, MOSS-CrispASR 90 s, W482; auditok and
+        silero their own minimum; the pipeline's longest scene, 48 s, MOSS-CrispASR 240 s; rscn the values of its
+        preset for the tab's controls, 1.10.1, owner W455), and for MOSS-CrispASR its MOSS tab (1.10.1, W428 I1 4:
+        crispasr/moss_prompt.py; "model": schema and values; None for the other pipelines).
+        Light: no PyTorch, no CrispASR."""
+        try:
+            from whisperjav.crispasr import moss_prompt
+            from whisperjav.crispasr.pass_settings import (scene_detector_for, scene_max_s_for, scene_min_s_for,
+                                                           segmenter_settings)
+            settings = segmenter_settings(pipeline, (segmenter or None), sensitivity or None)
+            seg = dict(settings.config)
+            if settings.max_group_duration_s is not None:
+                seg["max_group_duration_s"] = settings.max_group_duration_s
+            if settings.chunk_threshold_s is not None:
+                seg["chunk_threshold_s"] = settings.chunk_threshold_s
+            method = (scene_detector or scene_detector_for(pipeline)).strip().lower()
+            longest = scene_max_s_for(pipeline)
+            scene: Dict[str, Any] = {}
+            if method == "semantic":
+                scene = {"min_duration": scene_min_s_for(pipeline), "max_duration": longest}
+            elif method in ("auditok", "silero"):
+                # The detector's own values with the pass's longest scene, as the pipeline builds it, not the
+                # YAML spec's: Apply without a change must not change the run (review P7 finding 14).
+                import dataclasses
+                from whisperjav.modules.scene_detection_backends.auditok_backend import AuditokSceneDetector
+                from whisperjav.modules.scene_detection_backends.silero_backend import SileroSceneDetector
+                build = (SileroSceneDetector._build_silero_config if method == "silero"
+                         else AuditokSceneDetector._build_config_from_kwargs)
+                for key, value in dataclasses.asdict(build({"max_duration": longest})).items():
+                    scene[key] = value
+                    if not key.endswith("_s"):
+                        scene[key + "_s"] = value  # the spelling the Scene tab's controls use
+            elif method == "rscn":
+                # R-SCN (owner W448-W455): the pipeline's preset, one rscn_<setting> value per control of the Scene tab
+                # (rscn-scene-detection.yaml); Apply without a change sends the preset back, so the run does not change.
+                scene = self._rscn_defaults(pipeline, self._rscn_gui_hints())
+            model = None
+            if pipeline == "moss-crispasr":
+                model = {"title": "MOSS", "schema": moss_prompt.GUI_SCHEMA,
+                         "defaults": dict(moss_prompt.DEFAULTS)}
+            return {"success": True, "segmenter_backend": settings.backend, "segmenter": seg,
+                    "scene_detection_method": method, "scene": scene, "model": model}
+        except Exception as e:  # noqa: BLE001 -- the window says what failed
+            return {"success": False, "error": str(e)}
 
     def get_merge_strategies(self) -> Dict[str, Any]:
         """
@@ -2961,7 +3591,12 @@ class WhisperJAVAPI:
 
         try:
             # Build CLI arguments for two-pass ensemble
+            self._run_options = dict(config)
             args = self._build_twopass_args(config)
+            if config.get('run_on_cpu'):  # "Run on the CPU this time" (design 22.9.2, D-G)
+                args = _with_device_cpu(args)
+            args = self._with_log_file(args, config)   # owner W511 2: the GUI run's log file
+            self._last_start = ("start_ensemble_twopass", dict(config))
 
             # Compute expected output files for post-completion use (e.g., translation)
             self._expected_output_files = self._compute_expected_outputs(config, is_ensemble=True)
@@ -2997,6 +3632,8 @@ class WhisperJAVAPI:
             # Update status
             self.status = "running"
             self.exit_code = None
+            self._process_started_at = time.time()
+            self._run_summary = None
 
             # Start log streaming thread
             self._stream_thread = threading.Thread(
@@ -3022,6 +3659,157 @@ class WhisperJAVAPI:
                 "success": False,
                 "message": f"Failed to start two-pass ensemble: {e}"
             }
+
+    # The CrispASR status panel under a pass row (owner W133 2; route B design 12, T16).
+    CRISPASR_MODEL_DOWNLOADED = "Model: {label} — downloaded"
+    CRISPASR_MODEL_MISSING = "Model: {label} — not downloaded yet ({size}); downloaded when the run starts"
+    # T16 (design 22.10), from the accelerator table (design 22.6.8; W241 Q1).
+    from whisperjav.installer.core import accelerators as _ACC
+    CRISPASR_RUNS_ON = _ACC.GUI_CRISPASR_RUNS_ON
+    CRISPASR_RUNS_ON_CPU = _ACC.GUI_CRISPASR_RUNS_ON_CPU
+    del _ACC
+    CRISPASR_CANNOT_RUN = "CrispASR cannot run here: {reason}"
+    # Asked in a child process: the device check loads PyTorch, which the GUI process never loads.
+    _CRISPASR_RUNTIME_PROBE = (
+        "import json\n"
+        "from whisperjav.crispasr import install\n"
+        "try:\n"
+        "    c = install.runtime_status(None)\n"
+        "    out = {'device': c.device, 'reason': c.reason}\n"
+        "except install.CrispASRSetupError as e:\n"
+        "    out = {'problem': str(e)}\n"
+        "print('RESULT=' + json.dumps(out))\n"
+    )
+
+    def _crispasr_runtime(self) -> Dict[str, Any]:
+        """Where CrispASR would run with --device auto, or why it cannot run; asked once per GUI session."""
+        cached = getattr(self, "_crispasr_runtime_cache", None)
+        if cached is not None:
+            return cached
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+        done = subprocess.run([sys.executable, "-c", self._CRISPASR_RUNTIME_PROBE], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", timeout=180,
+                              creationflags=creationflags)
+        line = next((l for l in done.stdout.splitlines() if l.startswith("RESULT=")), None)
+        if line is None:
+            raise RuntimeError((done.stderr or "no answer").strip().splitlines()[-1])
+        self._crispasr_runtime_cache = json.loads(line[len("RESULT="):])
+        return self._crispasr_runtime_cache
+
+    def get_crispasr_status(self, pipeline: str, model: Optional[str] = None,
+                            word_timestamps: Optional[str] = None) -> Dict[str, Any]:
+        """The lines of the CrispASR status panel for a pass: the model, downloaded or not, the aligner when the
+        pass uses it, and where CrispASR runs, or why it cannot run here. ``word_timestamps`` is the pass's
+        Timing tab choice ("model", "aligner"; None or "" = the pipeline's default). Reads files only; never
+        downloads."""
+        try:
+            from whisperjav.crispasr import install, manifest
+
+            m = manifest.model_for(pipeline, model or None)
+            if install.model_status(m).downloaded:
+                lines = [self.CRISPASR_MODEL_DOWNLOADED.format(label=m.label)]
+            else:
+                lines = [self.CRISPASR_MODEL_MISSING.format(label=m.label, size=install.mb(m.size))]
+            # Cohere-CrispASR aligns its text with the default aligner (item 12; W248 3, Q7;
+            # manifest.ALIGNED_PIPELINES), and the pass's Timing tab can switch it on or off for any CrispASR
+            # pipeline (manifest.word_timestamps_for; W413 2).
+            if manifest.word_timestamps_for(pipeline, word_timestamps or None) == "aligner":
+                lines.append(self._crispasr_part_line(
+                    install, self.CRISPASR_PART_ALIGNER, manifest.aligner_model_for(None)))
+            return self._with_crispasr_runtime(lines)
+        except Exception as e:  # noqa: BLE001 -- a status panel must not break the GUI
+            return {"success": False, "error": str(e)}
+
+    # The same panel under a ChronosJAV pass (item 12): its aligner and timing model run in CrispASR.
+    # Texts approved by the owner as drafted (W268); design note 2026-10-28 section 9.
+    CRISPASR_CHRONOSJAV_HEADING = "Aligner and timing model:"
+    CRISPASR_PART_ALIGNER = "Aligner"
+    CRISPASR_PART_TIMING = "Timing model"
+    CRISPASR_PART_DOWNLOADED = "{part}: {label} — downloaded"
+    CRISPASR_PART_MISSING = "{part}: {label} — not downloaded yet ({size}); downloaded the first time it is used"
+
+    @classmethod
+    def _crispasr_part_line(cls, install, part: str, model) -> str:
+        if install.model_status(model).downloaded:
+            return cls.CRISPASR_PART_DOWNLOADED.format(part=part, label=model.label)
+        return cls.CRISPASR_PART_MISSING.format(part=part, label=model.label, size=install.mb(model.size))
+
+    def _with_crispasr_runtime(self, lines: List[str]) -> Dict[str, Any]:
+        """The panel's lines plus where CrispASR runs, or why it cannot run here."""
+        runtime = self._crispasr_runtime()
+        if runtime.get("problem"):
+            lines.append(self.CRISPASR_CANNOT_RUN.format(reason=runtime["problem"]))
+            return {"success": True, "lines": lines, "can_run": False}
+        device = runtime.get("device")
+        lines.append(self.CRISPASR_RUNS_ON.get(device)
+                     or self.CRISPASR_RUNS_ON_CPU.format(reason=runtime.get("reason")))
+        return {"success": True, "lines": lines, "can_run": True}
+
+    def get_chronosjav_crispasr_status(self, aligner_backend: Optional[str] = None, aligner: Optional[str] = None,
+                                       timing_model: Optional[str] = None,
+                                       timestamp_mode: Optional[str] = None) -> Dict[str, Any]:
+        """The CrispASR status panel of a ChronosJAV pass: its CrispASR aligner and timing model, downloaded
+        or not, and where CrispASR runs. No lines when the pass uses neither (another aligner or none, and no
+        timing model). Reads files only; never downloads."""
+        try:
+            from whisperjav.crispasr import install, manifest
+
+            lines = []
+            uses_aligner = (timestamp_mode or "vad_only") != "vad_only"   # default vad_only since W498 D1
+            backend = aligner_backend or "crispasr"
+            if uses_aligner and backend == "crispasr":
+                name = aligner if aligner in manifest.ALIGNER_MODELS else None
+                lines.append(self._crispasr_part_line(install, self.CRISPASR_PART_ALIGNER,
+                                                      manifest.aligner_model_for(name)))
+            if (timing_model or "none") != "none":   # off by default since W498 D1
+                lines.append(self._crispasr_part_line(install, self.CRISPASR_PART_TIMING,
+                                                      manifest.timing_model_for(timing_model or None)))
+            if not lines:
+                return {"success": True, "lines": [], "can_run": True}
+            return self._with_crispasr_runtime([self.CRISPASR_CHRONOSJAV_HEADING] + lines)
+        except Exception as e:  # noqa: BLE001 -- a status panel must not break the GUI
+            return {"success": False, "error": str(e)}
+
+    @staticmethod
+    def _crispasr_pass_args(n: int, pass_config: Dict[str, Any]) -> List[str]:
+        """The pass settings of a CrispASR pass: sensitivity, speech segmenter, model, and since design
+        22.9.1 (owner W212 D3, W214 2, W232 8) the scene detector, the speech enhancer, Enhance for VAD
+        only and the Customize values (Segmenter, Enhancer and Scene tabs).
+
+        A value left out is not sent: main.py and the pass worker then use the pipeline's own
+        default (balanced; its default speech segmenter; its default model; semantic scenes; no
+        enhancer). The speech segmenter "none" is sent (owner W457, W458): each scene goes to the model
+        whole. The scene detector "none" is sent: one scene per file.
+        """
+        import json
+        args: List[str] = []
+        sensitivity = pass_config.get('sensitivity')
+        if sensitivity:
+            args += [f"--pass{n}-sensitivity", sensitivity]
+        segmenter = pass_config.get('speechSegmenter')
+        if segmenter:
+            args += [f"--pass{n}-speech-segmenter", segmenter]
+        model = pass_config.get('model')
+        if model:
+            args += [f"--pass{n}-model", model]
+        scene = pass_config.get('sceneDetector')
+        if scene:
+            args += [f"--pass{n}-scene-detector", scene]
+        enhancer = pass_config.get('speechEnhancer')
+        if enhancer and enhancer != 'none':
+            if enhancer == 'ffmpeg-dsp':
+                effects = pass_config.get('dspEffects', ['loudnorm']) or ['loudnorm']
+                enhancer = f"ffmpeg-dsp:{','.join(effects)}"
+            args += [f"--pass{n}-speech-enhancer", enhancer]
+            if pass_config.get('enhanceForVad'):
+                args += [f"--pass{n}-enhance-for-vad"]
+        if pass_config.get('customized') and pass_config.get('params'):
+            args += [f"--pass{n}-params", json.dumps(pass_config['params'])]
+        # The Customize Timing tab (1.10.1; owner W413 2): sent only when it differs from the pipeline's default.
+        word_timestamps = pass_config.get('wordTimestamps')
+        if word_timestamps in ('model', 'aligner'):
+            args += [f"--pass{n}-word-timestamps", word_timestamps]
+        return args
 
     def _build_twopass_args(self, config: Dict[str, Any]) -> List[str]:
         """
@@ -3060,9 +3848,9 @@ class WhisperJAVAPI:
         # Enable ensemble mode
         args.append("--ensemble")
 
-        # Serial mode: finish each file before starting the next
-        if config.get('serial_mode', False):
-            args.append("--ensemble-serial")
+        # "Finish each file": each file is finished before the next starts. On by default in the GUI and on the
+        # command line (owner W493 1, W501), so an unticked box sends the off switch.
+        args.append("--ensemble-serial" if config.get('serial_mode', True) else "--no-ensemble-serial")
 
         # Pass 1 configuration
         pass1 = config.get('pass1', {})
@@ -3074,7 +3862,23 @@ class WhisperJAVAPI:
             p1_pipeline = 'qwen'
         args += ["--pass1-pipeline", p1_pipeline]
 
-        if pass1.get('isTransformers'):
+        # The CrispASR pipelines (1.10.0, Ensemble passes only, owner W118): model, speech segmenter,
+        # sensitivity, scene detector, speech enhancer, Enhance for VAD only and the Customize values
+        # (design 22.9.1), all sent by _crispasr_pass_args; the source language like every pass's.
+        from whisperjav.crispasr.manifest import CRISPASR_PIPELINES
+
+        crispasr_p1 = p1_pipeline in CRISPASR_PIPELINES
+        # BYOP XXL as pass 1 (1.10.0, item 5): the exe path and the model the user chose
+        # (#449); the extra args come from the persisted BYOP preferences, as for pass 2.
+        xxl_p1 = bool(pass1.get('isXxl')) or p1_pipeline == 'xxl'
+        if xxl_p1:
+            if pass1.get('xxlExe'):
+                args += ["--xxl-exe", pass1['xxlExe']]
+            if pass1.get('model'):
+                args += ["--pass1-model", pass1['model']]
+        elif crispasr_p1:
+            args += self._crispasr_pass_args(1, pass1)
+        elif pass1.get('isTransformers'):
             # Transformers pass: no sensitivity, handle HF params
             if pass1.get('customized') and pass1.get('params'):
                 args += ["--pass1-hf-params", json.dumps(pass1['params'])]
@@ -3090,27 +3894,26 @@ class WhisperJAVAPI:
                 args += ["--pass1-sensitivity", pass1['sensitivity']]
             # Always inject framer from state (even when not customized)
             qwen1_params = dict(pass1.get('params') or {}) if pass1.get('customized') else {}
+            # v1.9.0: GUI stores Frame Gap in ms (chunk_threshold_ms); the CLI/pipeline
+            # contract is seconds (chunk_threshold). Convert at pack time.
+            if 'chunk_threshold_ms' in qwen1_params:
+                qwen1_params['chunk_threshold'] = float(qwen1_params.pop('chunk_threshold_ms')) / 1000.0
             if pass1.get('framer'):
                 qwen1_params['framer'] = pass1['framer']
             if pass1.get('isAnimeWhisper'):
+                # anime-whisper takes the same timing defaults as Qwen3-ASR: since 1.10.1 VAD Only and no
+                # timing model (owner W498 D1; in 1.10.0 the aligner and timing model, design note 2026-10-28
+                # section 7). Its step-down rule of before 1.10.0 is gone.
                 qwen1_params['generator_backend'] = 'anime-whisper'
-                qwen1_params.setdefault('timestamp_mode', 'vad_only')
                 qwen1_params.setdefault('assembly_cleaner', 'passthrough')
-                qwen1_params.setdefault('stepdown', False)
             elif pass1.get('isCohere'):
                 qwen1_params['generator_backend'] = 'cohere'
-                qwen1_params.setdefault('assembly_cleaner', 'passthrough')  # D3
-                # ChronosJAV-style VAD-only timing is the Cohere default (the
-                # ForcedAligner benchmarked ~0% native alignment on JAV audio
-                # and emitted scene-sized blocks). Triple-flip enforcement at
-                # pack time keeps timestamp_mode/stepdown/aligner consistent
-                # in BOTH directions: aligner_backend='qwen3' (explicit
-                # Customize choice) restores the aligner trio; anything else
-                # (default, or explicit 'none') stamps the vad_only trio so a
-                # manually-edited preset cannot leave them in conflict.
-                if qwen1_params.get('aligner_backend') == 'qwen3':
+                qwen1_params.setdefault('assembly_cleaner', 'passthrough')         # D3
+                # Fork default (kept over 1.10.x's aligner default): VAD-only timing for
+                # Cohere unless Customize picked an aligner backend. Stamped in both
+                # directions so a manually-edited preset cannot leave them in conflict.
+                if qwen1_params.get('aligner_backend') in ('crispasr', 'qwen3'):
                     qwen1_params.setdefault('timestamp_mode', 'aligner_vad_fallback')
-                    qwen1_params.setdefault('stepdown', True)
                 else:
                     qwen1_params['timestamp_mode'] = 'vad_only'
                     qwen1_params['stepdown'] = False
@@ -3118,6 +3921,15 @@ class WhisperJAVAPI:
                 # (batch_size=1); on lets batch_size flow (worker default 8).
                 if qwen1_params.pop('batched', True) is False:
                     qwen1_params['batch_size'] = 1
+            # Triple-flip enforcement (plan §4.6), for every ChronosJAV model since 1.10.0:
+            # when the user disables the aligner via Customize Parameters →
+            # aligner_backend='none', three downstream fields must flip together to keep
+            # the orchestrator consistent: timestamp_mode → vad_only, stepdown → False, and
+            # the aligner choice stays 'none'. We enforce here at pack time so a
+            # manually-edited preset cannot leave the trio in conflict.
+            if qwen1_params.get('aligner_backend') == 'none':
+                qwen1_params['timestamp_mode'] = 'vad_only'
+                qwen1_params['stepdown'] = False
             if qwen1_params:
                 args += ["--pass1-qwen-params", json.dumps(qwen1_params)]
         else:
@@ -3126,56 +3938,81 @@ class WhisperJAVAPI:
             if pass1.get('customized') and pass1.get('params'):
                 args += ["--pass1-params", json.dumps(pass1['params'])]
 
-        # Pass 1: Scene Detector
-        # Note: All pipelines use --pass1-scene-detector. For Qwen, pass_worker.py
-        # translates this to qwen_scene parameter.
-        scene1 = pass1.get('sceneDetector')
-        if scene1 and scene1 != 'none':
-            args += ["--pass1-scene-detector", scene1]
+        # Pass 1: Scene/Segmenter/Enhancer/Model — a CrispASR pass and an XXL pass (an
+        # external tool) sent their own above.
+        if not (crispasr_p1 or xxl_p1):
+            # Pass 1: Scene Detector
+            # Note: All pipelines use --pass1-scene-detector. For Qwen, pass_worker.py
+            # translates this to qwen_scene parameter.
+            scene1 = pass1.get('sceneDetector')
+            if scene1 and scene1 != 'none':
+                args += ["--pass1-scene-detector", scene1]
 
-        # Pass 1: Speech Segmenter
-        # - Transformers: Skip (uses HF internal chunking)
-        # - Qwen/Legacy: Use --pass1-speech-segmenter (pass_worker.py translates to qwen_segmenter for Qwen)
-        segmenter1 = pass1.get('speechSegmenter')
-        if pass1.get('isTransformers'):
-            # Transformers: HF internal chunking — no external segmenter.
-            pass
-        elif pass1.get('isSenseVoice'):
-            # SenseVoice: the segmenter dropdown toggles its internal fsmn-vad.
-            # Pass it through so the worker can disable VAD when "none".
-            if segmenter1:
-                args += ["--pass1-speech-segmenter", segmenter1]
-        else:
-            # Both Qwen and Legacy use --pass1-speech-segmenter
-            # For Qwen: pass_worker.py translates to qwen_segmenter (post-ASR VAD filter)
-            # For Legacy: used as pre-ASR speech segmentation
-            if segmenter1:  # Pass any value including "none" to disable
-                args += ["--pass1-speech-segmenter", segmenter1]
-
-        # Pass 1: Speech Enhancer
-        # Note: All pipelines use --pass1-speech-enhancer. For Qwen, pass_worker.py
-        # translates this to qwen_enhancer parameter.
-        enhancer1 = pass1.get('speechEnhancer')
-        if enhancer1 and enhancer1 != 'none':
-            # Handle FFmpeg DSP with selected effects
-            if enhancer1 == 'ffmpeg-dsp':
-                dsp_effects = pass1.get('dspEffects', ['loudnorm'])
-                effects_str = ','.join(dsp_effects) if dsp_effects else 'loudnorm'
-                args += ["--pass1-speech-enhancer", f"ffmpeg-dsp:{effects_str}"]
+            # Pass 1: Speech Segmenter
+            # - Transformers: Skip (uses HF internal chunking)
+            # - Qwen/Legacy: Use --pass1-speech-segmenter (pass_worker.py translates to qwen_segmenter for Qwen)
+            segmenter1 = pass1.get('speechSegmenter')
+            if pass1.get('isTransformers'):
+                # Transformers: Skip segmenter entirely (HF internal chunking)
+                pass
+            elif pass1.get('isSenseVoice'):
+                # SenseVoice: the segmenter dropdown toggles its internal fsmn-vad.
+                # Pass it through so the worker can disable VAD when "none".
+                if segmenter1:
+                    args += ["--pass1-speech-segmenter", segmenter1]
             else:
-                args += ["--pass1-speech-enhancer", enhancer1]
+                # Both Qwen and Legacy use --pass1-speech-segmenter
+                # For Qwen: pass_worker.py translates to qwen_segmenter (post-ASR VAD filter)
+                # For Legacy: used as pre-ASR speech segmentation
+                #
+                # v1.9.2 (S2/S9): a BALANCED pass has no external segmenter -- it runs
+                # faster-whisper's built-in VAD, and main.py rejects
+                # --pass1-speech-segmenter for it. What the user picks in that row is
+                # the Silero VERSION, sent as --pass1-vad-version instead.
+                if pass1.get('pipeline') == 'balanced':
+                    version1 = str(pass1.get('vadVersion') or '').strip()
+                    if version1:
+                        args += ["--pass1-vad-version", version1]
+                elif segmenter1:  # Pass any value including "none" to disable
+                    args += ["--pass1-speech-segmenter", segmenter1]
 
-        # Pass 1: Enhance-for-VAD (dual-track: enhanced audio for VAD, original for ASR)
-        # Only effective for Qwen pipeline; pass_worker.py silently ignores for others.
-        if pass1.get('enhanceForVad') and enhancer1 and enhancer1 not in ('none', ''):
-            args += ["--pass1-enhance-for-vad"]
+            # Pass 1: Speech Enhancer
+            # Note: All pipelines use --pass1-speech-enhancer. For Qwen, pass_worker.py
+            # translates this to qwen_enhancer parameter.
+            enhancer1 = pass1.get('speechEnhancer')
+            if enhancer1 and enhancer1 != 'none':
+                # Handle FFmpeg DSP with selected effects
+                if enhancer1 == 'ffmpeg-dsp':
+                    dsp_effects = pass1.get('dspEffects', ['loudnorm'])
+                    effects_str = ','.join(dsp_effects) if dsp_effects else 'loudnorm'
+                    args += ["--pass1-speech-enhancer", f"ffmpeg-dsp:{effects_str}"]
+                else:
+                    args += ["--pass1-speech-enhancer", enhancer1]
 
-        # Pass 1: Model
-        # Note: All pipelines use --pass1-model. For Qwen, pass_worker.py
-        # translates this to qwen_model_id parameter.
-        model1 = pass1.get('model')
-        if model1:
-            args += ["--pass1-model", model1]
+            # Pass 1: Enhance-for-VAD (dual-track: enhanced audio for VAD, original for ASR)
+            # What each pipeline does with it, checked 2026-09-17:
+            #   qwen (and the decoupled pipeline behind it) -- dual-track as described.
+            #   fidelity -- dual-track since v1.9.3: the enhanced scenes go to the
+            #     external segmenter, the originals (resampled) to the recogniser.
+            #   balanced -- the flag is read and ACKNOWLEDGED IN THE LOG, but the
+            #     enhanced audio goes to both. Its speech detection is inside
+            #     faster-whisper's own transcribe(vad_filter=True) call, on the same
+            #     buffer it recognises, so there is no second track to feed without
+            #     changing what the balanced pipeline is. Owner's to decide.
+            #   fast, faster, transformers -- never read: silently ignored,
+            #     which the owner accepted on 2026-09-17; documented in --help.
+            #   parakeet-crispasr, cohere-crispasr -- dual-track since design 22.9.1 (sent by
+            #     _crispasr_pass_args).
+            if (pass1.get('enhanceForVad') and enhancer1 and enhancer1 not in ('none', '')
+                    and pass1.get('pipeline') != 'balanced'):
+                args += ["--pass1-enhance-for-vad"]
+
+            # Pass 1: Model
+            # Note: All pipelines use --pass1-model. For Qwen, pass_worker.py
+            # translates this to qwen_model_id parameter.
+            model1 = pass1.get('model')
+            if model1:
+                args += ["--pass1-model", model1]
 
         # Pass 2 configuration
         pass2 = config.get('pass2', {})
@@ -3187,14 +4024,22 @@ class WhisperJAVAPI:
                 p2_pipeline = 'qwen'
             args += ["--pass2-pipeline", p2_pipeline]
 
-            # BYOP XXL: external tool — only needs exe path.
+            # BYOP XXL: external tool — needs the exe path and the model.
             # Extra args are read from persisted BYOP preferences in asr_config.json
             # (set via the GUI extra args text field), not passed as a CLI flag.
             if pass2.get('isXxl') or p2_pipeline == 'xxl':
                 xxl_exe = pass2.get('xxlExe', '')
-                if xxl_exe:
+                # Both passes XXL (owner W271 3): one program, sent once.
+                if xxl_exe and "--xxl-exe" not in args:
                     args += ["--xxl-exe", xxl_exe]
-                # Skip all pipeline-specific args — XXL handles everything internally
+                # The model chosen in the Model column reaches XXL (#449; before 1.10.0
+                # none was sent and XXL ran large-v3).
+                if pass2.get('model'):
+                    args += ["--pass2-model", pass2['model']]
+                # Skip all other pipeline-specific args — XXL handles everything internally
+            elif p2_pipeline in CRISPASR_PIPELINES:
+                # As pass 1.
+                args += self._crispasr_pass_args(2, pass2)
             elif pass2.get('isTransformers'):
                 # Transformers pass: no sensitivity, handle HF params
                 if pass2.get('customized') and pass2.get('params'):
@@ -3210,22 +4055,21 @@ class WhisperJAVAPI:
                     args += ["--pass2-sensitivity", pass2['sensitivity']]
                 # Always inject framer from state (even when not customized)
                 qwen2_params = dict(pass2.get('params') or {}) if pass2.get('customized') else {}
+                # v1.9.0: GUI stores Frame Gap in ms; convert to seconds at pack time.
+                if 'chunk_threshold_ms' in qwen2_params:
+                    qwen2_params['chunk_threshold'] = float(qwen2_params.pop('chunk_threshold_ms')) / 1000.0
                 if pass2.get('framer'):
                     qwen2_params['framer'] = pass2['framer']
                 if pass2.get('isAnimeWhisper'):
                     qwen2_params['generator_backend'] = 'anime-whisper'
-                    qwen2_params.setdefault('timestamp_mode', 'vad_only')
                     qwen2_params.setdefault('assembly_cleaner', 'passthrough')
-                    qwen2_params.setdefault('stepdown', False)
                 elif pass2.get('isCohere'):
                     qwen2_params['generator_backend'] = 'cohere'
-                    qwen2_params.setdefault('assembly_cleaner', 'passthrough')  # D3
-                    # Bidirectional triple-flip enforcement (mirror of pass 1):
-                    # vad_only timing is the default; aligner_backend='qwen3'
-                    # restores the aligner trio.
-                    if qwen2_params.get('aligner_backend') == 'qwen3':
+                    qwen2_params.setdefault('assembly_cleaner', 'passthrough')         # D3
+                    # Fork default (mirror of pass 1): VAD-only timing for Cohere unless
+                    # Customize picked an aligner backend.
+                    if qwen2_params.get('aligner_backend') in ('crispasr', 'qwen3'):
                         qwen2_params.setdefault('timestamp_mode', 'aligner_vad_fallback')
-                        qwen2_params.setdefault('stepdown', True)
                     else:
                         qwen2_params['timestamp_mode'] = 'vad_only'
                         qwen2_params['stepdown'] = False
@@ -3233,6 +4077,10 @@ class WhisperJAVAPI:
                     # (batch_size=1); on lets batch_size flow (worker default 8).
                     if qwen2_params.pop('batched', True) is False:
                         qwen2_params['batch_size'] = 1
+                # Triple-flip enforcement (mirror of pass 1), for every ChronosJAV model.
+                if qwen2_params.get('aligner_backend') == 'none':
+                    qwen2_params['timestamp_mode'] = 'vad_only'
+                    qwen2_params['stepdown'] = False
                 if qwen2_params:
                     args += ["--pass2-qwen-params", json.dumps(qwen2_params)]
             else:
@@ -3241,8 +4089,10 @@ class WhisperJAVAPI:
                 if pass2.get('customized') and pass2.get('params'):
                     args += ["--pass2-params", json.dumps(pass2['params'])]
 
-            # Pass 2: Scene/Segmenter/Enhancer/Model — skip for BYOP XXL (external tool)
-            if not (pass2.get('isXxl') or p2_pipeline == 'xxl'):
+            # Pass 2: Scene/Segmenter/Enhancer/Model — skip for BYOP XXL (an external
+            # tool) and for a CrispASR pass (which sent its own above)
+            if not (pass2.get('isXxl') or p2_pipeline == 'xxl'
+                    or p2_pipeline in CRISPASR_PIPELINES):
                 # Pass 2: Scene Detector
                 # Note: All pipelines use --pass2-scene-detector. For Qwen, pass_worker.py
                 # translates this to qwen_scene parameter.
@@ -3265,7 +4115,16 @@ class WhisperJAVAPI:
                     # Both Qwen and Legacy use --pass2-speech-segmenter
                     # For Qwen: pass_worker.py translates to qwen_segmenter (post-ASR VAD filter)
                     # For Legacy: used as pre-ASR speech segmentation
-                    if segmenter2:  # Pass any value including "none" to disable
+                    #
+                    # v1.9.2 (S2/S9): a BALANCED pass has no external segmenter -- it runs
+                    # faster-whisper's built-in VAD, and main.py rejects
+                    # --pass2-speech-segmenter for it. What the user picks in that row is
+                    # the Silero VERSION, sent as --pass2-vad-version instead.
+                    if pass2.get('pipeline') == 'balanced':
+                        version2 = str(pass2.get('vadVersion') or '').strip()
+                        if version2:
+                            args += ["--pass2-vad-version", version2]
+                    elif segmenter2:  # Pass any value including "none" to disable
                         args += ["--pass2-speech-segmenter", segmenter2]
 
                 # Pass 2: Speech Enhancer
@@ -3282,7 +4141,11 @@ class WhisperJAVAPI:
                         args += ["--pass2-speech-enhancer", enhancer2]
 
                 # Pass 2: Enhance-for-VAD (dual-track: enhanced audio for VAD, original for ASR)
-                if pass2.get('enhanceForVad') and enhancer2 and enhancer2 not in ('none', ''):
+                # The program refuses this flag on a balanced pass (v1.9.3), so a
+                # stale value from another pipeline must not be sent: the run would
+                # stop with a usage error the user could not act on.
+                if (pass2.get('enhanceForVad') and enhancer2 and enhancer2 not in ('none', '')
+                        and pass2.get('pipeline') != 'balanced'):
                     args += ["--pass2-enhance-for-vad"]
 
                 # Pass 2: Model
@@ -3297,7 +4160,7 @@ class WhisperJAVAPI:
         args += ["--merge-strategy", merge_strategy]
 
         # Output directory
-        output_dir = config.get('output_dir', self.default_output)
+        output_dir = self._output_dir(config)
         args += ["--output-dir", output_dir]
 
         # Subtitle language mode
@@ -3317,6 +4180,27 @@ class WhisperJAVAPI:
 
         if config.get('keep_temp', False):
             args += ["--keep-temp"]
+
+        if config.get('skip_existing', False):
+            args += ["--skip-existing"]
+
+        # Run-outcome contract: same words and same rule as the CLI's --fail-on.
+        _fail_on = [s for s in ("empty", "suspect") if config.get(f"fail_on_{s}", False)]
+        if _fail_on:
+            args += ["--fail-on", ",".join(_fail_on)]
+
+        # Per-scene ASR telemetry is on by default; the checkbox only opts out.
+        if config.get('asr_telemetry', True) is False:
+            args += ["--no-asr-telemetry"]
+
+        # #415: downloaded Hugging Face models only (HF_HUB_OFFLINE=1 in the child and its workers).
+        if config.get('offline_mode', False):
+            args += ["--offline"]
+
+        # v1.9.2 (CFF1): recogniser refresh budget in minutes of scene audio (0 = never).
+        _mr = config.get('model_refresh_audio_minutes')
+        if _mr not in (None, ''):
+            args += ["--model-refresh-audio-minutes", str(_mr)]
 
         # Debug logging
         if config.get('debug', False):
@@ -3728,6 +4612,61 @@ class WhisperJAVAPI:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def saved_local_provider_notice(self, seen_in_browser: bool = False) -> Dict[str, Any]:
+        """v1.10.0: the owner's line for a saved llama-cpp choice, for the GUI console.
+
+        {text: ''} unless a saved 'local' choice was read as Ollama -- from the
+        translate settings file (settings.py) or, when seen_in_browser, from the
+        GUI's browser storage. The backend console gets the line once as well.
+        """
+        try:
+            from whisperjav.translate.settings import saved_local_provider_notice
+            return {"success": True, "text": saved_local_provider_notice(bool(seen_in_browser))}
+        except Exception as e:
+            return {"success": False, "text": "", "error": str(e)}
+
+    # #435: the choices on the Ensemble translation row and the AI SRT Translate tab.
+    # They lived only in browser storage, which private_mode (main.py, #236/#240)
+    # clears at every launch, so they were forgotten. Kept in the translate settings
+    # file under "gui_tab_state", a key the translate command line does not read.
+    # Per-film fields (title, names, plot) and the AI SRT Translate API key are not kept.
+    _TRANSLATION_TAB_FIELDS = {
+        "ensemble": ("provider", "model", "modelOverride"),
+        "srt": ("provider", "model", "customModel", "sourceLang", "targetLang", "tone",
+                "customEndpoint", "maxBatchSize", "maxRetries", "rateLimit", "sceneThreshold"),
+    }
+
+    def get_translation_tab_state(self) -> Dict[str, Any]:
+        """Saved translation choices per tab: {success, state: {ensemble: {...}, srt: {...}}}."""
+        try:
+            from whisperjav.translate.settings import load_settings
+            saved = load_settings().get("gui_tab_state") or {}
+            state = {}
+            for tab, fields in self._TRANSLATION_TAB_FIELDS.items():
+                values = saved.get(tab) if isinstance(saved.get(tab), dict) else {}
+                state[tab] = {k: str(values[k]) for k in fields if values.get(k) not in (None, "")}
+            return {"success": True, "state": state}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def save_translation_tab_state(self, tab: str, values: Dict[str, Any]) -> Dict[str, Any]:
+        """Replace the saved choices of one tab ('ensemble' or 'srt'); unknown keys are ignored."""
+        try:
+            fields = self._TRANSLATION_TAB_FIELDS.get(tab)
+            if fields is None:
+                return {"success": False, "error": f"unknown tab: {tab}"}
+            from whisperjav.translate.settings import load_settings, save_settings
+            existing = load_settings()
+            tabs = existing.get("gui_tab_state") if isinstance(existing.get("gui_tab_state"), dict) else {}
+            tabs[tab] = {k: str(values[k]) for k in fields
+                         if isinstance(values, dict) and values.get(k) not in (None, "")}
+            existing["gui_tab_state"] = tabs
+            if not save_settings(existing):
+                return {"success": False, "error": "could not write the translate settings file"}
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     def save_translation_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
         """
         Save translation settings from GUI (camelCase) to file (snake_case).
@@ -3825,8 +4764,14 @@ class WhisperJAVAPI:
         "debug_logging":             "debugLogging",
         "output_format":             "outputFormat",
         "keep_temp":                 "keepTemp",
+        "skip_existing":             "skipExisting",
+        "remember_settings":         "rememberSettings",
+        "fail_on_empty":             "failOnEmpty",
+        "fail_on_suspect":           "failOnSuspect",
+        "asr_telemetry":             "asrTelemetry",
+        "model_refresh_audio_minutes": "modelRefreshAudioMinutes",
         "temp_dir":                  "tempDir",
-        "accept_cpu_mode":           "acceptCpuMode",
+        "offline_mode":              "offlineMode",
         "async_processing":          "asyncProcessing",
         "pass1_pipeline":            "pass1Pipeline",
         "pass1_sensitivity":         "pass1Sensitivity",
@@ -3842,8 +4787,12 @@ class WhisperJAVAPI:
         "pass2_speech_segmenter":    "pass2SpeechSegmenter",
         "pass2_model":               "pass2Model",
         "merge_strategy":            "mergeStrategy",
+        "ensemble_serial":           "ensembleSerial",   # "Finish each file" (owner W501)
         "pass1_preset":              "pass1Preset",
         "pass2_preset":              "pass2Preset",
+        # 1.10.0 (item 6): read and saved through get_ui_language / set_ui_language, not
+        # with the form; mapped so get_gui_settings reports it like every other key.
+        "ui_language":               "uiLanguage",
     }
     # Reverse mapping (camelCase → snake_case)
     _GUI_SETTINGS_MAP_REV = {v: k for k, v in _GUI_SETTINGS_MAP.items()}
@@ -3883,6 +4832,51 @@ class WhisperJAVAPI:
             return {"success": False, "error": str(e)}
 
     # ------------------------------------------------------------------
+    # Interface language (1.10.0, item 6, #448; owner W283)
+    # ------------------------------------------------------------------
+
+    UI_LANGUAGES = ("en", "zh-CN")
+
+    @staticmethod
+    def _display_language_is_chinese() -> bool:
+        """True when the computer's display language is Chinese (any kind)."""
+        try:
+            if sys.platform == "win32":
+                import ctypes
+                langid = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+                return (langid & 0x3FF) == 0x04  # primary language: Chinese
+            import locale
+            name = (locale.getlocale()[0] or os.environ.get("LC_ALL")
+                    or os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or "")
+            return name.lower().startswith("zh")
+        except Exception:
+            return False
+
+    def get_ui_language(self) -> Dict[str, Any]:
+        """The language the GUI shows: the saved choice, or at the first start the
+        computer's display language (Chinese -> "zh-CN", anything else -> "en")."""
+        try:
+            from whisperjav.settings.gui_settings import load_gui_settings
+            saved = load_gui_settings().get("ui_language", "")
+        except Exception:
+            saved = ""
+        if saved in self.UI_LANGUAGES:
+            return {"success": True, "language": saved, "saved": True}
+        language = "zh-CN" if self._display_language_is_chinese() else "en"
+        return {"success": True, "language": language, "saved": False}
+
+    def set_ui_language(self, language: str) -> Dict[str, Any]:
+        """Save the language the user switched to. Kept whether Remember settings is
+        on or off: save_gui_settings merges this one key into the file."""
+        if language not in self.UI_LANGUAGES:
+            return {"success": False, "error": f"Unknown interface language: {language!r}"}
+        try:
+            from whisperjav.settings.gui_settings import save_gui_settings
+            return {"success": bool(save_gui_settings({"ui_language": language}))}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    # ------------------------------------------------------------------
     # Ensemble Parameter Presets
     # ------------------------------------------------------------------
 
@@ -3894,6 +4888,7 @@ class WhisperJAVAPI:
         "scene_detector":    "sceneDetector",
         "speech_enhancer":   "speechEnhancer",
         "speech_segmenter":  "speechSegmenter",
+        "vad_version":       "vadVersion",
         "model":             "model",
         "customized":        "customized",
         "params":            "params",       # nested dict — passed as-is
@@ -3903,6 +4898,7 @@ class WhisperJAVAPI:
         "is_cohere":         "isCohere",
         "framer":            "framer",
         "dsp_effects":       "dspEffects",
+        "word_timestamps":   "wordTimestamps",  # a CrispASR pass's Timing tab (1.10.1; owner W418 3)
         "created_at":        "createdAt",
         "updated_at":        "updatedAt",
         "schema_version":    "schemaVersion",
@@ -4006,12 +5002,11 @@ class WhisperJAVAPI:
                 except Exception as e:
                     return {"success": False, "error": f"Ollama check failed: {e}"}
 
-            # Local/Custom providers don't require API keys
-            if provider in ('local', 'custom'):
+            # Custom providers don't require API keys
+            if provider == 'custom':
                 return {
                     "success": True,
-                    "message": f"{provider.capitalize()} provider - no API key required",
-                    "local": provider == 'local'
+                    "message": "Custom provider - no API key required",
                 }
 
             # Get API key
@@ -4060,8 +5055,17 @@ class WhisperJAVAPI:
 
     # ── Ollama-specific API methods ──────────────────────────────────────
 
+    # Served when config/ollama_models.json cannot be read.  Must mirror that
+    # file's instruct-only curation: v1.8.11 removed Qwen3-family *thinking*
+    # models from the curated list because they emit chain-of-thought into the
+    # SRT and break the format, but this fallback kept leading with
+    # Shisa-v2.1-Qwen3-8B — so any user whose config failed to load was handed
+    # the known-bad recommendation as option one.  #305's reporter was running
+    # exactly that model when they reported English output in a Chinese
+    # translation.  Kept in step by test_v192_small_fixes.py.
     _CURATED_MODELS_FALLBACK = [
-        {"model": "hf.co/mradermacher/shisa-v2.1-qwen3-8b-GGUF:Q8_0", "size": "8.7 GB", "label": "Shisa-v2.1-Qwen3-8B Q8"},
+        {"model": "gemma3:12b", "size": "8.1 GB", "label": "Gemma 3 12B (instruct)"},
+        {"model": "qwen2.5:7b-instruct", "size": "4.7 GB", "label": "Qwen2.5-7B Instruct"},
         {"model": "huihui_ai/qwen2.5-abliterate:7b-instruct-q4_K_M", "size": "4.7 GB", "label": "Qwen2.5-7B-Abliterated Q4"},
         {"model": "dolphin-llama3:8b-256k-v2.9-q4_K_M", "size": "4.8 GB", "label": "Dolphin-Llama3-8B-256K Q4"},
     ]
@@ -4449,12 +5453,12 @@ class WhisperJAVAPI:
                 if self._translate_status != "cancelled":
                     if exit_code == 0:
                         self._translate_status = "completed"
-                        self._translate_log_queue.put("\n[SUCCESS] Translation completed.\n")
+                        self._translate_log_queue.put("\n[FINISHED] Translation completed (exit status 0).\n")
                     else:
                         self._translate_status = "error"
                         if not self._translate_error:
                             self._translate_error = f"Translation process exited with code {exit_code}"
-                        self._translate_log_queue.put(f"\n[ERROR] Exit code: {exit_code}\n")
+                        self._translate_log_queue.put(f"\n[FINISHED WITH FAILURES] Translation exit status {exit_code}.\n")
 
         files_total = getattr(self, '_translate_files_total', 0)
         files_completed = getattr(self, '_translate_files_completed', 0)

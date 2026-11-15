@@ -9,7 +9,7 @@ works.  No base class inheritance required.
 """
 
 from pathlib import Path
-from typing import Any, Optional, runtime_checkable
+from typing import Any, Optional, Union, runtime_checkable
 
 import numpy as np
 from typing_extensions import Protocol
@@ -72,26 +72,41 @@ class TextGenerator(Protocol):
 
     Manages its own model lifecycle via load()/unload().  The orchestrator
     calls load() before generation and unload() after to enable VRAM swaps.
+
+    Optional attribute ``accepts_array: bool`` (treated as False when absent):
+    when True, generate()/generate_batch() accept in-memory numpy arrays (mono
+    float32, 16kHz) in place of file paths. The orchestrator uses this flag to
+    skip writing one temp WAV per VAD group when no aligner is present.
     """
 
     def generate(
         self,
-        audio_path: Path,
+        audio_path: Union[Path, np.ndarray],
         language: str = "ja",
         context: Optional[str] = None,
         **kwargs: Any,
     ) -> TranscriptionResult:
-        """Transcribe a single audio file."""
+        """
+        Transcribe a single audio source.
+
+        ``audio_path`` may be a file path OR an in-memory numpy array (mono
+        float32, 16kHz) for generators that set ``accepts_array = True``.
+        """
         ...
 
     def generate_batch(
         self,
-        audio_paths: list[Path],
+        audio_paths: list[Union[Path, np.ndarray]],
         language: str = "ja",
         contexts: Optional[list[str]] = None,
         **kwargs: Any,
     ) -> list[TranscriptionResult]:
-        """Transcribe a batch of audio files."""
+        """
+        Transcribe a batch of audio sources.
+
+        Each entry may be a file path OR an in-memory numpy array (mono float32,
+        16kHz) — see generate().
+        """
         ...
 
     def load(self) -> None:
@@ -176,4 +191,39 @@ class TextAligner(Protocol):
 
     def cleanup(self) -> None:
         """Final cleanup — called when the aligner is no longer needed."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# SpeechTimer
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class SpeechTimer(Protocol):
+    """
+    Says where speech starts in a frame and where a new sentence starts (1.10.0, item 12 C3).
+
+    Optional. Returns timing_rules.TimedSegment entries, onsets in seconds from the frame's start;
+    the rules in timing_rules.py move the subtitle's start and split it. Its text is never used.
+
+    Manages its own model lifecycle via load()/unload().
+    """
+
+    accepts_array: bool
+
+    def time(self, audio: Any) -> list:
+        """Timed segments of one frame's audio (a path or a 16 kHz array)."""
+        ...
+
+    def load(self) -> None:
+        """Load the timing model."""
+        ...
+
+    def unload(self) -> None:
+        """Unload the timing model and release memory."""
+        ...
+
+    def cleanup(self) -> None:
+        """Final cleanup — called when the timer is no longer needed."""
         ...

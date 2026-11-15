@@ -165,7 +165,21 @@ class SRTPostProcessor:
 
         # Process
         result = self.cjk_sanitizer.process(srt_path)
-        
+
+        # Non-linguistic utterance filter (Japanese only): drop subtitle entries
+        # composed solely of sound-effect kana (moaning, breathing, etc.).
+        nonlinguistic_stats = None
+        if self.language == 'ja':
+            from whisperjav.modules.subtitle_pipeline.cleaners.nonlinguistic_utterance_filter import (
+                NonlinguisticUtteranceFilter,
+            )
+            logger.info("Post-processing: looking for non-linguistic lines")
+            nonlinguistic_stats = NonlinguisticUtteranceFilter().filter_srt_file(
+                result.sanitized_path
+            )
+            dropped = (nonlinguistic_stats or {}).get('dropped_nonlinguistic', 0)
+            logger.info(f"Post-processing: dropped {dropped} non-linguistic lines")
+
         # Return in expected format
         stats = result.statistics
         
@@ -188,6 +202,9 @@ class SRTPostProcessor:
                 'empty_removed': stats.get('removals', 0)
             }
         
+        if nonlinguistic_stats and nonlinguistic_stats["dropped_nonlinguistic"]:
+            old_stats['nonlinguistic_dropped'] = nonlinguistic_stats['dropped_nonlinguistic']
+
         return result.sanitized_path, old_stats
         
     
@@ -203,10 +220,19 @@ class SRTPostProcessor:
         
         # Create temporary working directory for EnglishSubtitleCleaner
         temp_dir = target_dir / "temp_english_clean"
+        logger.debug("English post-processing: preparing work dir %s", temp_dir)
         temp_dir.mkdir(exist_ok=True)
         
         try:
-            # Initialize English cleaner with extracted parameters
+            # NOTE (#372): every step below was previously silent, so a stall
+            # anywhere in this stage produced a log that simply stopped after
+            # stitching with no indication of where. Each step is now announced
+            # before it runs, so the last line written names the operation that
+            # did not return. Constructing the cleaner performs a network fetch,
+            # and the moves below can block indefinitely on a network or sleeping
+            # drive when output is written next to the source.
+            logger.info("Tidying up the English subtitles: fetching the list of junk phrases "
+                        "to remove (needs the internet; may pause here)")
             cleaner = EnglishSubtitleCleaner(
                 source_file=str(srt_path),
                 target_dir=str(temp_dir),
@@ -220,10 +246,12 @@ class SRTPostProcessor:
             )
             
             # Process
+            logger.info("Tidying up the English subtitles: removing junk lines and fixing timings")
             clean_path, log_path = cleaner.clean()
             
             # Move cleaned file to final destination
             final_clean_path = target_dir / final_name
+            logger.info("Tidying up the English subtitles: saving the finished file to %s", final_clean_path)
             shutil.move(clean_path, final_clean_path)
             
             # Move log file to raw_subs folder
@@ -232,6 +260,7 @@ class SRTPostProcessor:
             
             # Copy original to raw_subs as backup
             original_backup = raw_subs_dir / f"{srt_path.stem}.original{srt_path.suffix}"
+            logger.debug("English post-processing: backing up original to %s", original_backup)
             shutil.copy2(srt_path, original_backup)
             
             # Move log file to raw_subs

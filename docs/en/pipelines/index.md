@@ -15,6 +15,7 @@ WhisperJAV offers multiple processing pipelines, each trading speed for accuracy
 | **Transformers** | HuggingFace | Yes | Yes | Medium | Good | ~4 GB |
 | **Qwen3-ASR** | Qwen3 | Assembly | Assembly | Medium | Excellent text | ~4-8 GB |
 | **ChronosJAV** | anime-whisper / Kotoba | TEN VAD | TEN VAD | Medium | Best for anime/JAV | ~4-8 GB |
+| **GGUF pipelines**: parakeet, cohere, reazonspeech, kotoba, whisper-turbo, whisper-large, MOSS (Ensemble only) | CrispASR (Parakeet, Cohere, ReazonSpeech, Kotoba-Whisper, Whisper, MOSS models) | Yes (Semantic by default) | Yes (TEN VAD / FireRedVAD) | Not measured | Not measured | Not measured |
 
 ---
 
@@ -26,7 +27,7 @@ WhisperJAV offers multiple processing pipelines, each trading speed for accuracy
 | Processing many files quickly | **Faster** |
 | Anime or JAV content | **ChronosJAV** with anime-whisper |
 | Maximum accuracy, don't mind waiting | **Ensemble**: Balanced + Qwen3-ASR with Smart Merge |
-| No GPU / CPU only | **Faster** with CPU-only mode |
+| No GPU (CPU only install) | **Faster** |
 | Apple Silicon Mac | **Transformers** (MPS acceleration) |
 
 ---
@@ -39,3 +40,4 @@ Run two passes with different pipelines and merge the results. See [Ensemble Mod
 
 - [ChronosJAV](chronosjav.md) — anime-whisper and Kotoba models for anime/JAV content
 - [Qwen3-ASR](qwen3-asr.md) — alternative ASR engine with strong Japanese text quality
+- [GGUF pipelines (CrispASR)](crispasr.md) — seven pipelines, GGUF models through CrispASR, installed with WhisperJAV; Ensemble Mode, Japanese, experimental

@@ -31,6 +31,23 @@ import soundfile as sf
 from whisperjav.utils.logger import logger
 
 
+class _EngineLog:
+    """The vendored engine's step and diagnosis lines (added for #267) go to DEBUG, so they are in the log file
+    and on the console with --debug (owner W509, console item 1); its environment warning ("*** WARNING")
+    stays a warning."""
+
+    def __init__(self, target):
+        self.target = target
+
+    def log(self, level, msg, *args, **kwargs):
+        if level <= logging.INFO:
+            level = logging.WARNING if "*** WARNING" in str(msg) else logging.DEBUG
+        self.target.log(level, msg, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.target, name)
+
+
 @dataclass
 class SemanticClusteringConfig:
     """
@@ -42,8 +59,11 @@ class SemanticClusteringConfig:
     Attributes:
         min_duration: Minimum segment duration in seconds (segments shorter
                       than this will be merged with neighbors)
-        max_duration: Maximum segment duration in seconds (segments longer
-                      than this will be split at lowest energy points)
+        max_duration: Scene ceiling in seconds, honoured while the engine
+                      stitches its 0.5 s clusters upward (merges past it are
+                      declined). No splitter: only a raw cluster longer than
+                      the ceiling or the final clean-up absorbing a sub-minimum
+                      neighbour can exceed it, and the engine logs a warning.
         snap_window: Window size in seconds for snapping boundaries to silence
         clustering_threshold: Distance threshold for agglomerative clustering
                               (lower = more segments, higher = fewer segments)
@@ -51,8 +71,14 @@ class SemanticClusteringConfig:
     """
     min_duration: float = 20.0
     max_duration: float = 420.0
-    snap_window: float = 5.0
-    clustering_threshold: float = 18.0
+    # v1.9.2 (owner O1): 6.0 / 22.0 on every sensitivity. These are the engine's
+    # last-resort fallbacks, used when a caller supplies no value at all
+    # (semantic_backend.py:66-90, scene_detection.py:263-272). They are kept equal to
+    # the shipped presets so a caller that falls through cannot silently run on a
+    # value the product no longer uses -- the exact trap that made every semantic run
+    # before v1.9.2 use 20/420 (see scene_detection.py:434-440).
+    snap_window: float = 6.0
+    clustering_threshold: float = 22.0
     sample_rate: int = 16000
 
     # Additional options for WhisperJAV integration
@@ -84,17 +110,22 @@ SEMANTIC_PRESETS = {
         snap_window=8.0,
         clustering_threshold=22.0,
     ),
+    # v1.9.2 (owner O1): snap_window and clustering_threshold are uniform, so these
+    # two entries carry only the scene-length bounds, matching the shipped presets in
+    # config/components/features/scene_detection.py.
+    #
+    # NOTE: this whole table is UNREACHABLE from the pipeline. Both production call
+    # sites pass a fully built ``config=`` (semantic_backend.py:91-94 and
+    # scene_detection.py:275-278), so the ``if config is None`` branch below that
+    # consults it never runs. It survives only for direct instantiation. It is a
+    # duplicate of two other preset stores and is a candidate for deletion.
     "conservative": SemanticClusteringConfig(
         min_duration=30.0,
         max_duration=420.0,
-        snap_window=6.0,
-        clustering_threshold=22.0,
     ),
     "aggressive": SemanticClusteringConfig(
         min_duration=10.0,
         max_duration=180.0,
-        snap_window=2.0,
-        clustering_threshold=10.0,
     ),
 }
 
@@ -209,7 +240,7 @@ class SemanticClusteringAdapter:
             self._engine = process_movie_v7
             self._engine_config_class = SegmentationConfig
 
-            logger.info(
+            logger.debug(
                 f"SemanticAudioClustering engine loaded (v{engine_version})"
             )
 
@@ -257,7 +288,7 @@ class SemanticClusteringAdapter:
             - Saves JSON metadata to temp_dir (or output_dir)
             - Populates self.scenes_detected, self.semantic_metadata, etc.
         """
-        logger.info(f"Starting Semantic Audio Clustering for: {audio_path}")
+        logger.debug(f"Starting Semantic Audio Clustering for: {audio_path}")
 
         # Reset data contract fields
         self.scenes_detected = []
@@ -301,7 +332,7 @@ class SemanticClusteringAdapter:
                 output_path=str(json_output_path),
                 config=engine_config,
                 visualize=self.config.visualize,
-                logger=self.logger,
+                logger=_EngineLog(self.logger) if self.logger is not None else None,
                 progress_callback=self._wrap_progress_callback(0.1, 0.7),
             )
         except Exception as e:
@@ -331,7 +362,7 @@ class SemanticClusteringAdapter:
         if self.progress_callback:
             self.progress_callback(1.0, "Semantic scene detection complete")
 
-        logger.info(
+        logger.debug(
             f"Semantic clustering complete: {len(scene_tuples)} scenes extracted"
         )
 

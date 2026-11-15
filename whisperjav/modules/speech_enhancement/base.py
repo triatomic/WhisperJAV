@@ -5,7 +5,7 @@ This module defines the core data structures and interface that all
 speech enhancement backends must implement.
 
 Design Decisions (v1.7.3):
-- Single backend entry with model parameter (e.g., clearvoice with model selection)
+- Single backend entry with model parameter (e.g., bs-roformer with stem selection)
 - Graceful degradation: failures log warning and return original audio
 - In-memory processing for scene-level chunks (memory-efficient)
 - Sample rate negotiation via get_preferred_sample_rate() / get_output_sample_rate()
@@ -20,6 +20,27 @@ import logging
 logger = logging.getLogger("whisperjav")
 
 
+class SpeechEnhancerUnavailable(RuntimeError):
+    """
+    A speech enhancer cannot do what the user asked for, and carrying on would
+    mislead them.
+
+    Most backends here degrade quietly: if they cannot run, the pipeline helper
+    logs a warning, falls back to "none", and the run produces subtitles from
+    un-enhanced audio. That is the right answer for a clean-up that only helps
+    a little. It is the wrong answer for one the user chose because their audio
+    needs it -- they would get a poor subtitle file from a run that exited 0,
+    with nothing but a warning in the log to explain it.
+
+    A backend raises this when its own absence changes the result. The pipeline
+    helper deliberately does NOT catch it, and whisperjav.utils.preflight_check
+    turns it into a plain-language stop before any audio is read.
+
+    Owner's decision, 2026-09-17, about htdemucs: "I think it should fail with
+    good user communication."
+    """
+
+
 @dataclass
 class EnhancementResult:
     """
@@ -30,7 +51,7 @@ class EnhancementResult:
     Attributes:
         audio: Enhanced audio data (float32, mono)
         sample_rate: Sample rate of output audio
-        method: Backend name with model info (e.g., "clearvoice-MossFormer2_SE_48K")
+        method: Backend name with model info (e.g., "bs-roformer-vocals")
         parameters: Parameters used for enhancement
         processing_time_sec: Time taken to process (seconds)
         metadata: Backend-specific metadata (SNR improvement, etc.)
@@ -101,7 +122,7 @@ class SpeechEnhancer(Protocol):
         """
         Unique backend identifier.
 
-        Examples: "clearvoice", "bs-roformer", "none"
+        Examples: "zipenhancer", "bs-roformer", "none"
         """
         ...
 
@@ -110,7 +131,7 @@ class SpeechEnhancer(Protocol):
         """
         Human-readable name for GUI display.
 
-        Examples: "ClearerVoice (48kHz)", "BS-RoFormer Vocal Isolation"
+        Examples: "ZipEnhancer 16kHz", "BS-RoFormer Vocal Isolation"
         """
         ...
 
@@ -177,7 +198,7 @@ class SpeechEnhancer(Protocol):
         """
         Return list of supported model variants.
 
-        Examples for ClearerVoice: ["FRCRN_SE_16K", "MossFormer2_SE_48K", "MossFormerGAN_SE_16K"]
+        Examples for BS-RoFormer: ["vocals", "other"]
 
         Returns:
             List of model identifiers
@@ -197,7 +218,6 @@ class SpeechEnhancer(Protocol):
 
         Examples:
             - ZipEnhancer (2.04M params, ~500MB): True
-            - ClearVoice MossFormer2 (100M+ params, 9-16GB): False
             - BS-RoFormer: False
 
         Returns:
@@ -239,12 +259,10 @@ def resolve_torch_device(requested: Optional[str] = None) -> str:
         # Unknown device string — fall through to auto-detect
         logger.debug(f"Unknown device '{requested}', auto-detecting")
 
-    # Auto-detect: CUDA > MPS > CPU
-    if torch.cuda.is_available():
-        return "cuda"
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+    # Auto-detect: CUDA > MPS > CPU, through the device detector as every other PyTorch part
+    # (design 22.3.1): a card this PyTorch has no code for (#411) is not used (review P7 finding 3).
+    from whisperjav.utils.device_detector import get_best_device
+    return get_best_device()
 
 
 def load_audio_to_array(

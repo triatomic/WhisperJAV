@@ -37,6 +37,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import stable_whisper
 
 from whisperjav.modules.audio_extraction import AudioExtractor
+from whisperjav.config.anime_whisper_vad import anime_leading_silence_default
+from whisperjav.modules.audio_integrity import apply_to_run as apply_audio_integrity
+from whisperjav.modules.analytics import report as report_audio_analytics
 from whisperjav.modules.speech_enhancement import (
     create_enhancer_direct,
     enhance_scenes,
@@ -44,10 +47,11 @@ from whisperjav.modules.speech_enhancement import (
     is_passthrough_backend,
     resample_scenes,
 )
-from whisperjav.modules.srt_postprocessing import SRTPostProcessor, normalize_language_code
+from whisperjav.modules.srt_postprocessing import normalize_language_code
 from whisperjav.modules.srt_stitching import SRTStitcher
 from whisperjav.modules.subtitle_pipeline.types import TimestampMode
 from whisperjav.pipelines.base_pipeline import BasePipeline
+from whisperjav.utils.device_detector import pass_device
 from whisperjav.utils.logger import logger
 
 # Lazy imports to avoid loading heavy modules until needed:
@@ -98,6 +102,7 @@ class QwenPipeline(BasePipeline):
         qwen_safe_chunking: bool = True,  # Enforce 12-48s scene boundaries for ForcedAligner
         scene_min_duration: Optional[float] = None,  # Override min scene duration (default: 12s)
         scene_max_duration: Optional[float] = None,  # Override max scene duration (default: 48s)
+        scene_clustering_threshold: Optional[float] = None,  # v1.9.2: semantic clustering distance (None = the engine default, 22 since O1)
 
         # Temporal framing for assembly mode (GAP-5)
         qwen_framer: str = "vad-grouped",  # "vad-grouped", "full-scene", "srt-source"
@@ -116,8 +121,10 @@ class QwenPipeline(BasePipeline):
         # Speech segmentation / VAD (Phase 4)
         # v1.8.13: default flipped silero-v6.2 -> whisperseg (system-wide default flip).
         speech_segmenter: str = "whisperseg",
-        segmenter_max_group_duration: float = 6.0,  # Max group size in seconds (CLI: --qwen-max-group-duration)
-        segmenter_chunk_threshold: float = 1.0,  # Silence gap threshold for VAD frame grouping
+        segmenter_max_group_duration: float = 3.0,  # v1.9.0 JAV retune (300/3.0 grouping, owner Option B). CLI: --qwen-max-group-duration
+        segmenter_chunk_threshold: float = 0.3,  # v1.9.0 JAV retune: group only if gap < 0.3s/300ms
+        segmenter_start_pad_ms: int = 100,  # v1.9.0 asymmetric pad before speech onset
+        segmenter_end_pad_ms: int = 100,    # v1.9.0 JAV retune: symmetric 100/100 (owner-validated end pad)
         segmenter_config: Optional[Dict[str, Any]] = None,  # GUI/CLI custom segmenter params
 
         # Qwen ASR (Phase 5)
@@ -128,13 +135,28 @@ class QwenPipeline(BasePipeline):
         max_new_tokens: int = 4096,
         language: str = "Japanese",
         timestamps: str = "word",
-        aligner_id: str = "Qwen/Qwen3-ForcedAligner-0.6B",
+        # 1.10.0 (item 12, C1): a CrispASR aligner short name (manifest.ALIGNER_MODELS; wav2vec2-ja the
+        # default) or a PyTorch model ID (Qwen/Qwen3-ForcedAligner-0.6B). aligner_backend None follows
+        # from the value ("crispasr" / "qwen3"); "none" loads no aligner.
+        aligner_id: str = "wav2vec2-ja",
+        aligner_backend: Optional[str] = None,
+        # Whisper small through CrispASR, step 8 of the orchestrator (1.10.0, item 12, C3); "none" = off.
+        # The run's value always comes from the caller: main.py and ensemble/pass_worker.py pass it (since 1.10.1
+        # "none" for Qwen3-ASR and anime-whisper, owner W498 D1). This constructor default is read by no caller;
+        # it stays at 1.10.0's value, with which tests/test_cohere_generator.py builds the pipeline directly.
+        timing_model: str = "whisper-small",
         context: str = "",
         context_file: Optional[str] = None,
         attn_implementation: str = "auto",
 
         # Timestamp resolution (bridges Phase 4 VAD and Phase 5 ASR)
-        timestamp_mode: str = "aligner_interpolation",  # Pipeline default; CLI overrides to aligner_vad_fallback
+        # 1.10.0 (item 12, design note 2026-10-28 section 7, owner W254 Q6): aligner_vad_fallback — the 230 MB
+        # CrispASR aligner times the text; a VAD group it cannot align keeps its VAD times. The run's value always
+        # comes from the caller: main.py and ensemble/pass_worker.py pass it (since 1.10.1 vad_only for Qwen3-ASR
+        # and anime-whisper, owner W498 D1: no aligner, no timing model). This constructor default is read by no
+        # caller; it stays at 1.10.0's value, with which tests/test_cohere_generator.py builds the pipeline
+        # directly. vad_only loads no aligner.
+        timestamp_mode: str = "aligner_vad_fallback",
 
         # Japanese post-processing — DISABLED for Qwen3 (C2 fix, ADR-006).
         # Qwen3 uses AssemblyTextCleaner, not the Whisper-era JapanesePostProcessor.
@@ -148,8 +170,24 @@ class QwenPipeline(BasePipeline):
         # Assembly text cleaner (Step 4 of assembly mode)
         assembly_cleaner: bool = True,  # Enable/disable pre-alignment text cleaning
 
-        # Adaptive Step-Down
-        stepdown_enabled: bool = True,
+        # v1.9.0: Phase-8 nonverbal single-token line filter (all Qwen backends).
+        # Drops lone ASR-artifact lines ("あ。", "は。", "え。", "切。" ...) that the
+        # sensitive VAD/decoding captures. Whole-line exact match — safe. CLI:
+        # --qwen-drop-nonverbal-lines / --no-qwen-drop-nonverbal-lines.
+        drop_nonverbal_lines: bool = True,
+        anime_leading_silence_ms: Optional[int] = None,  # None: 200 ms, 0 with Silero
+
+        # v1.9.0: Phase-8 scene-overlap timestamp resolver. Semantic scene
+        # detection extracts scenes with a ±0.35s buffer (~0.7s overlap between
+        # adjacent scenes), which surfaces as overlapping / nested-duplicate
+        # subtitle timestamps at scene boundaries after stitching. This resolver
+        # drops nested-duplicate fragments and clips partial overlaps. No-op when
+        # scenes don't overlap. Default on for all qwen backends.
+        resolve_scene_overlaps: bool = True,
+
+        # Adaptive Step-Down: off by default since 1.10.0 (owner W266 1). A collapsed scene
+        # under aligner_vad_fallback takes the aligner-free times instead of a retry.
+        stepdown_enabled: bool = False,
         stepdown_initial_group: float = 6.0,
         stepdown_fallback_group: float = 6.0,
 
@@ -212,6 +250,7 @@ class QwenPipeline(BasePipeline):
         self.safe_chunking = qwen_safe_chunking
         self.scene_min_override = scene_min_duration  # None = use default (12s)
         self.scene_max_override = scene_max_duration  # None = use default (48s)
+        self.scene_clustering_threshold = scene_clustering_threshold  # None = the engine default (22 since O1)
 
         # Temporal framing for assembly mode (GAP-5)
         self.framer_backend = qwen_framer
@@ -229,6 +268,8 @@ class QwenPipeline(BasePipeline):
         self.segmenter_backend = speech_segmenter
         self.segmenter_max_group_duration = segmenter_max_group_duration
         self.segmenter_chunk_threshold = segmenter_chunk_threshold
+        self.segmenter_start_pad_ms = segmenter_start_pad_ms
+        self.segmenter_end_pad_ms = segmenter_end_pad_ms
         self.segmenter_config = segmenter_config or {}
 
         # Adaptive Step-Down config
@@ -241,10 +282,10 @@ class QwenPipeline(BasePipeline):
             self.timestamp_mode = TimestampMode(timestamp_mode)
         except ValueError:
             logger.warning(
-                "Unknown timestamp_mode '%s', defaulting to 'aligner_interpolation'",
+                "Unknown timestamp_mode '%s', defaulting to 'aligner_vad_fallback'",
                 timestamp_mode,
             )
-            self.timestamp_mode = TimestampMode.ALIGNER_WITH_INTERPOLATION
+            self.timestamp_mode = TimestampMode.ALIGNER_WITH_VAD_FALLBACK
 
         # Deprecation warning: japanese_postprocess is always False for Qwen3
         if japanese_postprocess:
@@ -268,12 +309,25 @@ class QwenPipeline(BasePipeline):
         # Assembly text cleaner toggle (for --qwen-assembly-cleaner on|off)
         self.assembly_cleaner_enabled = assembly_cleaner
 
+        # v1.9.0: Phase-8 nonverbal single-token line filter toggle.
+        self.drop_nonverbal_lines = drop_nonverbal_lines
+        # v1.9.4: silence before every anime-whisper window (0 = off); see config/anime_whisper_vad.py.
+        # Not set by the user: 200 ms, or 0 with Silero (owner, 2026-10-09).
+        if anime_leading_silence_ms is None:
+            anime_leading_silence_ms = anime_leading_silence_default(speech_segmenter)
+        self.anime_leading_silence_ms = max(0, int(anime_leading_silence_ms or 0))
+
+        # v1.9.0: Phase-8 scene-overlap timestamp resolver toggle.
+        self.resolve_scene_overlaps = resolve_scene_overlaps
+
         # Generator backend selection (v1.8.6+)
         self.generator_backend = generator_backend
 
-        # anime-whisper preset: vad_only (skip ForcedAligner, save ~1GB VRAM),
-        # passthrough cleaner, no step-down (no aligner = no collapse),
-        # tighter grouping for anime speech patterns.
+        # anime-whisper preset: passthrough cleaner. Until 1.10.0 it was also forced
+        # to vad_only with step-down off (43f60d1: skip the ~1 GB ForcedAligner; no
+        # aligner, no collapse). Neither reason holds for the 230 MB CrispASR aligner,
+        # so anime-whisper now takes the same timing as Qwen3-ASR (design note
+        # 2026-10-28 section 7, owner W254 Q6).
         #
         # v1.8.13 (post-acceptance test): segmenter_backend is NO LONGER
         # overridden here. Earlier versions hard-stamped "ten" (or after
@@ -284,15 +338,21 @@ class QwenPipeline(BasePipeline):
         # that anime-whisper takes whisperseg by default when the user
         # doesn't pass an explicit segmenter, so removing this override
         # preserves the default behavior while honoring explicit choices.
-        # The other anime-whisper presets (timestamp_mode, cleaner,
-        # stepdown, chunk/max_group) remain because they are tightly
-        # coupled to the anime-whisper generator's expectations.
+        # The anime-whisper cleaner preset remains because it is tightly coupled
+        # to the anime-whisper generator's expectations.
+        #
+        # v1.9.0: the chunk_threshold/max_group override that used to live here
+        # (0.5/5.0) was REMOVED. It unconditionally clobbered the constructor
+        # kwarg AFTER lines 232-233 assigned it, silently defeating the GUI
+        # "Frame Gap"/"Max Group" sliders, the --qwen-chunk-threshold/
+        # --qwen-max-group-duration CLI flags, and the ensemble anime-branch
+        # default — anime-whisper always grouped at 0.5/5.0 regardless of input.
+        # Those two values now flow purely from the constructor kwargs (default
+        # 0.3/3.0, lines 119-120), so upstream config finally takes effect.
+        # Cohere keeps its override below (its standalone path has no CLI branch
+        # to supply the value, and the owner scoped this retune to qwen3+anime).
         if generator_backend == "anime-whisper":
-            self.timestamp_mode = TimestampMode.VAD_ONLY
             self.assembly_cleaner_enabled = False
-            self.stepdown_enabled = False
-            self.segmenter_chunk_threshold = 0.5
-            self.segmenter_max_group_duration = 5.0
         elif generator_backend == "cohere":
             # ChronosJAV-style VAD-only timing is the system-wide Cohere
             # default (main.py + pass_worker.py default chain): the Qwen3
@@ -305,6 +365,8 @@ class QwenPipeline(BasePipeline):
             # clobbered the GUI aligner='none' triple-flip. Explicit caller
             # choices (--qwen-timestamp-mode, GUI aligner_backend='qwen3')
             # are honored via the constructor args.
+            # (Upstream 1.10.0 makes aligner_vad_fallback the ChronosJAV-wide
+            # default; this fork keeps vad_only for Cohere via the callers.)
             self.assembly_cleaner_enabled = False  # D3: passthrough cleaner
             self.segmenter_chunk_threshold = 1.0    # Cohere prefers fewer cuts
             self.segmenter_max_group_duration = 6.0
@@ -320,6 +382,8 @@ class QwenPipeline(BasePipeline):
             "timestamps": timestamps,
             "use_aligner": timestamps == "word",
             "aligner_id": aligner_id,
+            "aligner_backend": self._aligner_backend_for(aligner_backend, aligner_id),
+            "timing_model": timing_model or "none",
             "context": self._resolve_context(context, context_file),
             "attn_implementation": attn_implementation,
             "japanese_postprocess": False,  # C2 fix: Qwen3 uses AssemblyTextCleaner, not JapanesePostProcessor
@@ -332,22 +396,26 @@ class QwenPipeline(BasePipeline):
         # Output config
         self.subs_language = subs_language
         self.lang_code = normalize_language_code(language or "ja")
+        # The raw copy (requirement R-RAW, owner W334 D1, W514 6): the joined subtitles before Phase 8, kept in
+        # raw_subs/ as the GGUF pipelines keep theirs. An Ensemble pass points both at its own output folder and
+        # names the pass (ensemble/pass_worker.py: _configure_trace).
+        self.raw_subs_dir: Optional[str] = None
+        self.pass_tag: Optional[str] = None
 
         # Shared modules (lightweight, safe to create in __init__)
         # v1.8.5+: Extract at 16kHz when enhancer is "none", 48kHz for real enhancers
         extraction_sr = get_extraction_sample_rate(self.enhancer_backend)
         self.audio_extractor = AudioExtractor(sample_rate=extraction_sr)
         self.stitcher = SRTStitcher()
-        self.postprocessor = SRTPostProcessor(language=self.lang_code)
 
         # Decoupled Subtitle Pipeline (ADR-006) — always constructed
         # Components are lightweight — no model loading until process() time
         self._subtitle_pipeline = self._build_subtitle_pipeline()
 
         logger.debug(
-            "[QwenPipeline PID %s] Initialized (model=%s, input_mode=%s, safe_chunking=%s, "
+            "Initialized (model=%s, input_mode=%s, safe_chunking=%s, "
             "scene=%s, enhancer=%s, segmenter=%s, timestamps=%s)",
-            os.getpid(), model_id, self.input_mode.value, self.safe_chunking,
+            model_id, self.input_mode.value, self.safe_chunking,
             scene_detector, speech_enhancer, speech_segmenter, self.timestamp_mode.value,
         )
 
@@ -366,6 +434,17 @@ class QwenPipeline(BasePipeline):
 
     def get_mode_name(self) -> str:
         return "qwen"
+
+    @staticmethod
+    def _aligner_backend_for(aligner_backend: Optional[str], aligner_id: Optional[str]) -> str:
+        """Which aligner backend runs: the one named, else the one the model value belongs to — a CrispASR
+        short name (manifest.ALIGNER_MODELS) means "crispasr", anything else (a PyTorch model ID) "qwen3"."""
+        if aligner_backend:
+            return aligner_backend
+        if not aligner_id:
+            return "none"
+        from whisperjav.crispasr.manifest import ALIGNER_MODELS
+        return "crispasr" if aligner_id in ALIGNER_MODELS else "qwen3"
 
     # ------------------------------------------------------------------
     # Context resolution
@@ -404,7 +483,7 @@ class QwenPipeline(BasePipeline):
         from whisperjav.modules.subtitle_pipeline.cleaners.factory import TextCleanerFactory
         from whisperjav.modules.subtitle_pipeline.framers.factory import TemporalFramerFactory
         from whisperjav.modules.subtitle_pipeline.generators.factory import TextGeneratorFactory
-        from whisperjav.modules.subtitle_pipeline.orchestrator import DecoupledSubtitlePipeline
+        from whisperjav.modules.subtitle_pipeline.orchestrator import DecoupledSubtitlePipeline, line_filter_test
         from whisperjav.modules.subtitle_pipeline.types import HardeningConfig, StepDownConfig
 
         cfg = self._asr_config
@@ -412,11 +491,28 @@ class QwenPipeline(BasePipeline):
         # TemporalFramer: selected by --qwen-framer (default: full-scene)
         framer_kwargs = {}
         if self.framer_backend == "vad-grouped":
+            _framer_segmenter_config = dict(self.segmenter_config or {})
+            # v1.9.0: under VAD_ONLY the framer's OWN segmenter (built inside
+            # VadGroupedFramer._ensure_segmenter) produces the binding subtitle
+            # boundaries, and it reads padding from segmenter_config only. The
+            # pipeline's start/end pad SCALARS are injected into the Phase-4 segmenter
+            # (process(), Phase 4) but do NOT reach the framer segmenter — so without
+            # this forward, the per-sensitivity Start/End Pad would silently use the
+            # backend's speech_pad_ms fallback instead of the tuned values.
+            # v1.9.0 fix (code-review): originally anime-scoped; with vad_only now
+            # the DEFAULT for qwen3 too, the same forward must apply to qwen3 —
+            # otherwise --qwen-vad-start-pad/--qwen-vad-end-pad and the GUI pad
+            # sliders have zero effect on qwen3 subtitle timing (a silent
+            # regression of the v1.8.15 100/100ms pad retune). Cohere stays
+            # excluded: it runs aligner-first and was scoped out of the retune.
+            if self.generator_backend in ("anime-whisper", "qwen3"):
+                _framer_segmenter_config["start_pad_ms"] = self.segmenter_start_pad_ms
+                _framer_segmenter_config["end_pad_ms"] = self.segmenter_end_pad_ms
             framer_kwargs = {
                 "segmenter_backend": self.segmenter_backend,
                 "max_group_duration_s": self.segmenter_max_group_duration,
                 "chunk_threshold_s": self.segmenter_chunk_threshold,
-                "segmenter_config": self.segmenter_config,
+                "segmenter_config": _framer_segmenter_config,
             }
         elif self.framer_backend == "srt-source":
             if not self.framer_srt_path:
@@ -443,6 +539,12 @@ class QwenPipeline(BasePipeline):
                 dtype=cfg["dtype"],
                 no_repeat_ngram_size=cfg.get("no_repeat_ngram_size", 0),
                 max_new_tokens=aw_max_tokens,
+                # v1.9.4 (owner, 2026-10-06): silence before every window, 200 ms by
+                # default (anime-whisper only; it lowered the character error rate on
+                # the reference clips, Qwen3-ASR got worse); 0 with Silero (owner,
+                # 2026-10-09). Window edges and so the subtitle start/end do not move.
+                # 0 turns it off (CLI, ensemble, GUI).
+                leading_silence_ms=self.anime_leading_silence_ms,
             )
         elif self.generator_backend == "cohere":
             # Cohere Transcribe-03-2026 — gated HF repo, AutoModel + trust_remote_code.
@@ -490,22 +592,40 @@ class QwenPipeline(BasePipeline):
         else:
             cleaner = TextCleanerFactory.create("passthrough")
 
-        # TextAligner: Qwen3 ForcedAligner (or None if timestamps disabled)
-        # G1 fix: vad_only mode has no use for the 0.6B aligner — skip loading
+        # TextAligner: the CrispASR aligner (1.10.0 default, wav2vec2-ja), the Qwen3
+        # ForcedAligner (PyTorch), or None if timestamps are disabled.
+        # G1 fix: vad_only mode has no use for an aligner — skip loading
         # entirely so we save VRAM and take Branch B (aligner-free) in the
         # orchestrator's _step9_reconstruct_and_harden().
         aligner = None
-        if self.timestamp_mode == TimestampMode.VAD_ONLY:
+        if self.timestamp_mode == TimestampMode.VAD_ONLY or cfg["aligner_backend"] == "none":
             # No aligner → Branch B; no collapse possible → step-down irrelevant
             pass
         elif cfg.get("use_aligner", True):
-            aligner = TextAlignerFactory.create(
-                "qwen3",
-                aligner_id=cfg["aligner_id"],
-                device=cfg["device"],
-                dtype=cfg["dtype"],
-                language=cfg["language"],
-            )
+            if cfg["aligner_backend"] == "crispasr":
+                aligner = TextAlignerFactory.create(
+                    "crispasr",
+                    model=cfg["aligner_id"],
+                    device=cfg["device"],
+                    language=cfg["language"] or "ja",
+                    temp_dir=self.temp_dir,
+                )
+            else:
+                aligner = TextAlignerFactory.create(
+                    "qwen3",
+                    aligner_id=cfg["aligner_id"],
+                    device=cfg["device"],
+                    dtype=cfg["dtype"],
+                    language=cfg["language"],
+                )
+
+        # Timing model (step 8): where speech starts in each VAD group and where a new
+        # sentence starts (design note 2026-10-28 section 5). It also runs without an
+        # aligner: then it moves the subtitle's start only (rule T5).
+        timer = None
+        if cfg["timing_model"] != "none":
+            from whisperjav.modules.subtitle_pipeline.timers.crispasr import CrispASRTimer
+            timer = CrispASRTimer(model=cfg["timing_model"], device=cfg["device"], temp_dir=self.temp_dir)
 
         # Step-down retry config (uses existing Qwen pipeline params)
         # Disabled when aligner is None (no alignment = no collapse = nothing to step-down)
@@ -528,11 +648,77 @@ class QwenPipeline(BasePipeline):
             language=cfg.get("language", "ja"),
             context=cfg.get("context", ""),
             stepdown_config=stepdown_cfg,
+            timer=timer,
+            # T9 (owner W296 2, W300 3): the Phase 8 line filters this run applies.
+            line_filter=line_filter_test(
+                ellipsis_filter=self.generator_backend == "anime-whisper",
+                nonverbal_filter=self.drop_nonverbal_lines,
+            ),
         )
 
     # ------------------------------------------------------------------
     # Main processing
     # ------------------------------------------------------------------
+
+    SAVE_POINT_SUFFIX = ".savepoint.srt"
+    SAVE_POINT_STAGE_SUFFIX = ".savepoint.json"   # {"stage": ..., "subtitles": n}, read by the Ensemble
+    # Set by the Ensemble pass worker (owner W462, W463 C1): only an Ensemble pass keeps a failed pass's save-point.
+    save_points = False
+
+    def _clear_save_point(self, media_basename: str) -> None:
+        """No earlier save-point may pass for this run's (a cancelled or crashed run, --keep-temp)."""
+        for suffix in (self.SAVE_POINT_SUFFIX, self.SAVE_POINT_STAGE_SUFFIX):
+            (self.temp_dir / f"{media_basename}{suffix}").unlink(missing_ok=True)
+
+    def _write_save_point(self, draft: list, scene_paths: list, media_basename: str, stage: str) -> None:
+        """The save-point SRT (owner W462, W463 C1): the orchestrator's scene results (``stage``: before the timing
+        model, or after it and before Phases 6-8), as scene SRTs stitched into ``<temp>/<basename>.savepoint.srt``,
+        each replacing the one before. Not cleaned (Phase 8 has not run)."""
+        out_dir = self.temp_dir / "savepoint_srts"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        scene_srt_info: List[Tuple[Path, float]] = []
+        for idx, (result, _diag) in enumerate(draft):
+            if result is None or not result.segments:
+                continue
+            scene_srt_path = out_dir / f"{media_basename}_scene_{idx:04d}.srt"
+            try:
+                # The text, written here: stable-ts prints "Saved: <path>" for every file it writes (owner
+                # W509, console item 5).
+                scene_srt_path.write_text(result.to_srt_vtt(word_level=False, segment_level=True, strip=True),
+                                          encoding="utf-8")
+            except Exception as e:  # noqa: BLE001 -- one scene less in the safety copy
+                logger.debug(f"Save-point: scene {idx + 1} SRT not written: {e}")
+                continue
+            if scene_srt_path.exists() and scene_srt_path.stat().st_size > 0:
+                scene_srt_info.append((scene_srt_path, scene_paths[idx][1]))
+        target = self.temp_dir / f"{media_basename}{self.SAVE_POINT_SUFFIX}"
+        if scene_srt_info:
+            count = self.stitcher.stitch(scene_srt_info, target)
+        else:
+            target.write_text("", encoding="utf-8")
+            count = 0
+        import json as _json
+        (self.temp_dir / f"{media_basename}{self.SAVE_POINT_STAGE_SUFFIX}").write_text(
+            _json.dumps({"stage": stage, "subtitles": count}), encoding="utf-8")
+        logger.info("Save-point (%s): %d subtitles in %s", stage, count, target)
+
+    def _keep_raw_copy(self, stitched: Path, media_basename: str) -> Optional[Path]:
+        """Copy the joined subtitles, before Phase 8 cleans them in place, to raw_subs/ (requirement R-RAW, owner
+        W334 D1, W514 6): <name>.qwen_stitched.original.srt, in an Ensemble pass <name>.pass<N>.qwen_stitched
+        .original.srt beside the pass's file -- the GGUF pipelines' names (crispasr/cleanup.py: file_stem). An
+        earlier run's copy of the same name is replaced. A copy that cannot be written never stops the run."""
+        from whisperjav.crispasr.cleanup import RAW_SUBS, file_stem
+
+        folder = Path(self.raw_subs_dir) if self.raw_subs_dir else self.output_dir / RAW_SUBS
+        target = folder / f"{file_stem(media_basename, 'qwen', self.pass_tag)}.original.srt"
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(stitched, target)
+        except OSError as e:
+            logger.warning("Phase 8: the copy of the subtitles before clean-up could not be saved (%s)", e)
+            return None
+        logger.info("Phase 8: saving a copy of the original to %s", target)
+        return target
 
     def process(self, media_info: Dict) -> Dict:
         """
@@ -544,13 +730,18 @@ class QwenPipeline(BasePipeline):
         Returns:
             Master metadata dictionary with paths, stats, quality metrics.
         """
+        # Cross-cutting rule of the agreed error-handling table (2026-09-17):
+        # anything that quietly fell short is reported in the run summary rather
+        # than only in the log. Reset per file -- the pipeline object is reused
+        # across the whole run.
+        self.degradations = []
         input_file = Path(media_info["path"])
         media_basename = media_info["basename"]
         pipeline_start = time.time()
 
         logger.info(
-            "[QwenPipeline PID %s] Processing: %s (model=%s)",
-            os.getpid(), input_file.name, self.model_id,
+            "Processing: %s (model=%s)",
+            input_file.name, self.model_id,
         )
 
         master_metadata = {
@@ -570,11 +761,17 @@ class QwenPipeline(BasePipeline):
         # ==============================================================
         # PHASE 1: AUDIO EXTRACTION
         # ==============================================================
-        logger.info("[QwenPipeline PID %s] Phase 1: Extracting audio from %s", os.getpid(), input_file.name)
+        if self.save_points:
+            self._clear_save_point(media_basename)
+        logger.info("Phase 1: Extracting audio from %s", input_file.name)
         phase1_start = time.time()
 
         audio_path = self.temp_dir / f"{media_basename}_extracted.wav"
         extracted_audio, duration = self.audio_extractor.extract(input_file, audio_path)
+        # 1.9.4 (REQ1): a damaged audio track makes this file 'suspect', or
+        # stops it here with --fail-on suspect.
+        apply_audio_integrity(self.audio_extractor.last_integrity, self.degradations,
+                              in_summary=self.audio_integrity_in_summary)
 
         master_metadata["duration_seconds"] = duration
         master_metadata["stages"]["extraction"] = {
@@ -583,7 +780,7 @@ class QwenPipeline(BasePipeline):
             "sample_rate": self.audio_extractor.sample_rate,
             "time_sec": time.time() - phase1_start,
         }
-        logger.info("[QwenPipeline PID %s] Phase 1: Complete (%.1fs audio)", os.getpid(), duration)
+        logger.info("Phase 1: Complete (%.1fs audio)", duration)
 
         # ==============================================================
         # PHASE 2: SCENE DETECTION (optional, default: none)
@@ -591,8 +788,8 @@ class QwenPipeline(BasePipeline):
         # When safe_chunking is enabled, enforce scene boundaries
         # to stay within the ForcedAligner's 180s architectural limit.
         logger.info(
-            "[QwenPipeline PID %s] Phase 2: Scene detection (method=%s, safe_chunking=%s)",
-            os.getpid(), self.scene_method, self.safe_chunking,
+            "Phase 2: Scene detection (method=%s, safe_chunking=%s)",
+            self.scene_method, self.safe_chunking,
         )
         phase2_start = time.time()
 
@@ -615,27 +812,44 @@ class QwenPipeline(BasePipeline):
             scene_detector_kwargs["min_duration"] = min_dur
             scene_detector_kwargs["max_duration"] = max_dur
             logger.info(
-                "[QwenPipeline PID %s] Phase 2: Safe chunking "
-                "(min=%ss, max=%ss, aligner limit=180s)",
-                os.getpid(), min_dur, max_dur,
+                "Phase 2: Safe chunking "
+                "(min=%ss, max=%ss)",
+                min_dur, max_dur,
             )
+
+        # v1.9.2 (CFF2): semantic clustering threshold, independent of safe chunking.
+        if self.scene_clustering_threshold is not None:
+            scene_detector_kwargs["clustering_threshold"] = float(self.scene_clustering_threshold)
 
         scene_detector = SceneDetectorFactory.safe_create_from_legacy_kwargs(**scene_detector_kwargs)
         result = scene_detector.detect_scenes(extracted_audio, scenes_dir, media_basename)
         scene_paths = result.to_legacy_tuples()
+
+        # Tell the user which scenes look acoustically difficult. vad_threshold is
+        # None because this pipeline segments with WhisperSeg by default, not with
+        # Silero at a threshold -- so the quiet check, and the setting it would
+        # recommend, do not apply here. Reads and prints only; never raises.
+        _analytics = report_audio_analytics(
+            extracted_audio,
+            [(i, s.start_sec, s.end_sec) for i, s in enumerate(result.scenes)],
+            scene_method=result.method,
+            vad_threshold=None,
+        )
+        if _analytics is not None:
+            master_metadata.setdefault("audio_analytics", _analytics.to_dict())
+
         scene_detector.cleanup()
         logger.info(
-            "[QwenPipeline PID %s] Phase 2: Detected %d scenes (method=%s)",
-            os.getpid(), len(scene_paths), self.scene_method,
+            "Phase 2: Detected %d scenes (method=%s)",
+            len(scene_paths), self.scene_method,
         )
 
         # Scene duration statistics
         if scene_paths:
             durations = [sp[3] for sp in scene_paths]
             logger.info(
-                "[QwenPipeline PID %s] Phase 2: Scene durations — "
+                "Phase 2: Scene durations — "
                 "total %.0fs, range %.0f–%.0fs, mean %.0fs",
-                os.getpid(),
                 sum(durations),
                 min(durations),
                 max(durations),
@@ -664,7 +878,7 @@ class QwenPipeline(BasePipeline):
         # only for VAD (Phase 4) and framing (Phase 5 orchestrator).
         # ASR reads from the original audio resampled to 16kHz.
         # ==============================================================
-        logger.info("[QwenPipeline PID %s] Phase 3: Speech enhancement (backend=%s)", os.getpid(), self.enhancer_backend)
+        logger.info("Phase 3: Speech enhancement (backend=%s)", self.enhancer_backend)
         phase3_start = time.time()
 
         # Dual-track paths (populated only when --enhance-for-vad is active)
@@ -675,24 +889,24 @@ class QwenPipeline(BasePipeline):
             # v1.8.5+: Scenes already at 16kHz — skip enhancement entirely
             if self._enhance_for_vad:
                 logger.warning(
-                    "[QwenPipeline PID %s] Phase 3: --enhance-for-vad ignored — "
+                    "Phase 3: --enhance-for-vad ignored — "
                     "no speech enhancer configured (backend=%s)",
-                    os.getpid(), self.enhancer_backend,
+                    self.enhancer_backend,
                 )
-            logger.info(
-                "[QwenPipeline PID %s] Phase 3: Passthrough — %d scenes at 16kHz, skipping enhancement",
-                os.getpid(), len(scene_paths),
+            logger.debug(
+                "Phase 3: Passthrough — %d scenes at 16kHz, skipping enhancement",
+                len(scene_paths),
             )
         elif self._enhance_for_vad:
             # Dual-track: enhanced audio → VAD/framing, original → ASR
             logger.info(
-                "[QwenPipeline PID %s] Phase 3: Dual-track mode — "
+                "Phase 3: Dual-track mode — "
                 "enhanced audio for VAD/framing, original for ASR",
-                os.getpid(),
-            )
+                )
             enhancer = create_enhancer_direct(
                 backend=self.enhancer_backend,
                 model=self.enhancer_model,
+                device=pass_device(self._asr_config.get("device")),  # --device, as every part (22.3.1)
             )
 
             def _enhancement_progress(scene_num, total, scene_name):
@@ -701,6 +915,7 @@ class QwenPipeline(BasePipeline):
             enhanced_paths = enhance_scenes(
                 scene_paths, enhancer, self.temp_dir,
                 progress_callback=_enhancement_progress,
+                degradations=self.degradations,
             )
             original_16k_paths = resample_scenes(scene_paths, self.temp_dir)
 
@@ -719,6 +934,7 @@ class QwenPipeline(BasePipeline):
             enhancer = create_enhancer_direct(
                 backend=self.enhancer_backend,
                 model=self.enhancer_model,
+                device=pass_device(self._asr_config.get("device")),  # --device, as every part (22.3.1)
             )
 
             def _enhancement_progress(scene_num, total, scene_name):
@@ -727,6 +943,7 @@ class QwenPipeline(BasePipeline):
             scene_paths = enhance_scenes(
                 scene_paths, enhancer, self.temp_dir,
                 progress_callback=_enhancement_progress,
+                degradations=self.degradations,
             )
 
             # VRAM Block 1 cleanup — release enhancer before loading ASR
@@ -744,7 +961,7 @@ class QwenPipeline(BasePipeline):
             "dual_track": _orch_vad_paths is not None,
             "time_sec": time.time() - phase3_start,
         }
-        logger.info("[QwenPipeline PID %s] Phase 3: Complete (%.1fs)", os.getpid(), time.time() - phase3_start)
+        logger.info("Phase 3: Complete (%.1fs)", time.time() - phase3_start)
 
         # ==============================================================
         # PHASE 4: SPEECH SEGMENTATION / VAD (optional)
@@ -752,17 +969,26 @@ class QwenPipeline(BasePipeline):
         speech_regions_per_scene = {}  # scene_idx -> SegmentationResult
 
         if self.segmenter_backend != "none":
-            logger.info("[QwenPipeline PID %s] Phase 4: Speech segmentation (backend=%s)", os.getpid(), self.segmenter_backend)
+            logger.info("Phase 4: Speech segmentation (backend=%s)", self.segmenter_backend)
             phase4_start = time.time()
 
             from whisperjav.modules.speech_segmentation import SpeechSegmenterFactory
             segmenter_kwargs = dict(self.segmenter_config or {})
             segmenter_kwargs["max_group_duration_s"] = self.segmenter_max_group_duration
-            # v1.8.12: forward chunk_threshold_s so anime-mode override (0.5) and
-            # any pipeline-constructor override actually reach the factory.
-            # Prior to this, only max_group_duration_s was injected and the
-            # chunk_threshold from segmenter_config (YAML) silently won.
+            # v1.8.12: forward chunk_threshold_s so the constructor value (GUI
+            # slider / CLI flag / ensemble default / default 0.3) reaches the
+            # factory. Injected AFTER copying segmenter_config so the scalar wins
+            # over any chunk_threshold_s that rode in via the YAML/sensitivity.
+            # (v1.9.0: the old anime 0.5 clobber that fed this was removed — see
+            # the __init__ note near the generator_backend branch.)
             segmenter_kwargs["chunk_threshold_s"] = self.segmenter_chunk_threshold
+            # v1.9.0: asymmetric padding — the pipeline owns the qwen/anime defaults
+            # (start 100 / end 200 ms). Same scalar-injection pattern as group/chunk:
+            # GUI/CLI overrides populate these scalars, segmenter_config carries only
+            # threshold/min-duration. Backends that lack start/end_pad_ms strip them
+            # via the factory's _sanitize_params; whisperseg consumes them.
+            segmenter_kwargs["start_pad_ms"] = self.segmenter_start_pad_ms
+            segmenter_kwargs["end_pad_ms"] = self.segmenter_end_pad_ms
             segmenter = SpeechSegmenterFactory.create(
                 self.segmenter_backend,
                 **segmenter_kwargs,
@@ -789,20 +1015,25 @@ class QwenPipeline(BasePipeline):
                 "scenes_with_vad": len(speech_regions_per_scene),
                 "time_sec": time.time() - phase4_start,
             }
-            logger.info("[QwenPipeline PID %s] Phase 4: Complete (%.1fs)", os.getpid(), time.time() - phase4_start)
+            logger.info("Phase 4: Complete (%.1fs)", time.time() - phase4_start)
         else:
-            logger.info("[QwenPipeline PID %s] Phase 4: Skipped (segmenter=none)", os.getpid())
+            logger.info("Phase 4: Skipped (segmenter=none)")
 
         # ==============================================================
         # PHASE 5: ASR TRANSCRIPTION (VRAM Block 2)
         # ==============================================================
-        logger.info("[QwenPipeline PID %s] Phase 5: ASR transcription (model=%s, mode=%s)",
-                    os.getpid(), self.model_id, self.input_mode.value)
+        logger.info("Phase 5: ASR transcription (model=%s, mode=%s)",
+                    self.model_id, self.input_mode.value)
         phase5_start = time.time()
 
         # Debug artifacts directory (master text, timestamps, merged words)
-        raw_subs_dir = self.temp_dir / "raw_subs"
-        raw_subs_dir.mkdir(exist_ok=True)
+        # One folder per file: the run summary (Phase 9) reads every scene record in it, and
+        # a batch shares temp_dir, so one shared folder made the second and later files count
+        # the scenes of the files before them (since 1.9.5; owner W300 2).
+        raw_subs_dir = self.temp_dir / "raw_subs" / media_basename
+        raw_subs_dir.mkdir(parents=True, exist_ok=True)
+        for stale in raw_subs_dir.glob("scene_*_diagnostics.json"):
+            stale.unlink(missing_ok=True)
 
         scene_results: List[Tuple[Optional[stable_whisper.WhisperResult], int]] = []
 
@@ -816,6 +1047,12 @@ class QwenPipeline(BasePipeline):
 
         # Set artifacts directory for debug output
         self._subtitle_pipeline.artifacts_dir = raw_subs_dir
+        # The save-points (owner W462, W463 C1), in an Ensemble pass only (the pass worker sets save_points): the
+        # subtitles after the ASR, after the aligner and after the timing model, each written over the one before as
+        # <temp>/<basename>.savepoint.srt; the Ensemble keeps the last one when this pass does not finish.
+        self._subtitle_pipeline.save_point = (
+            (lambda draft, stage: self._write_save_point(draft, scene_paths, media_basename, stage))
+            if self.save_points else None)
 
         # Prepare orchestrator inputs from scene_paths tuples
         orch_audio_paths = [Path(sp[0]) for sp in scene_paths]
@@ -848,6 +1085,26 @@ class QwenPipeline(BasePipeline):
             vad_audio_paths=orch_vad_paths,
         )
 
+        # A failed aligner load no longer ends the job (#436); say so in the summary.
+        if getattr(self._subtitle_pipeline, "alignment_unavailable", None):
+            self.degradations.append(self._subtitle_pipeline.alignment_unavailable)
+        # The aligner loaded but gave no times for some VAD groups (1.10.0, item 12).
+        if getattr(self._subtitle_pipeline, "alignment_partial", None):
+            self.degradations.append(self._subtitle_pipeline.alignment_partial)
+        # The same for the timing model (1.10.0, item 12): the subtitles are kept, unsplit.
+        if getattr(self._subtitle_pipeline, "timing_unavailable", None):
+            self.degradations.append(self._subtitle_pipeline.timing_unavailable)
+
+        # The last save-point (owner W462, W463 C1): the subtitles before the clean-up (Phases 6-8), so a failure
+        # there keeps them too. It replaces the earlier ones.
+        if self.save_points:
+            try:
+                self._write_save_point(orch_results, scene_paths, media_basename,
+                                       stage="before the clean-up" + (", after the timing model"
+                                                                      if self._subtitle_pipeline.timer else ""))
+            except Exception:  # noqa: BLE001 -- a safety copy, never a reason to stop
+                logger.warning("[QwenPipeline] Save-point could not be written; the run goes on", exc_info=True)
+
         # Convert to Phase 6 format: (WhisperResult, scene_idx)
         for idx, (result, _diag) in enumerate(orch_results):
             scene_results.append((result, idx))
@@ -875,7 +1132,7 @@ class QwenPipeline(BasePipeline):
         n_empty = sum(1 for r, _ in orch_results if r is not None and not r.segments)
         n_failed = sum(1 for r, _ in orch_results if r is None)
         _total_segs = sum(len(r.segments) for r, _ in orch_results if r is not None and r.segments)
-        logger.info("[QwenPipeline] Phase 5 assembly summary:")
+        logger.info("Phase 5 assembly summary:")
         logger.info(
             "  Scenes:    %d success, %d empty, %d failed (of %d)",
             n_success, n_empty, n_failed, len(orch_results),
@@ -896,6 +1153,10 @@ class QwenPipeline(BasePipeline):
             "model_id": self.model_id,
             "input_mode": self.input_mode.value,
             "timestamp_mode": self.timestamp_mode.value,
+            "aligner": (f"{self._asr_config['aligner_backend']}:{self._asr_config['aligner_id']}"
+                        if self._subtitle_pipeline is not None and self._subtitle_pipeline.aligner is not None
+                        else "none"),
+            "timing_model": self._asr_config["timing_model"],
             "safe_chunking": self.safe_chunking,
             "scenes_transcribed": sum(1 for r, _ in scene_results if r is not None and r.segments),
             "scenes_empty": sum(1 for r, _ in scene_results if r is not None and not r.segments),
@@ -904,12 +1165,12 @@ class QwenPipeline(BasePipeline):
             "alignment_recoveries": sentinel_stats.get("alignment_recoveries", 0),
             "time_sec": time.time() - phase5_start,
         }
-        logger.info("[QwenPipeline PID %s] Phase 5: Complete (%.1fs)", os.getpid(), time.time() - phase5_start)
+        logger.info("Phase 5: Complete (%.1fs)", time.time() - phase5_start)
 
         # ==============================================================
         # PHASE 6: SCENE SRT GENERATION (micro-subs)
         # ==============================================================
-        logger.info("[QwenPipeline PID %s] Phase 6: Generating scene SRT files", os.getpid())
+        logger.info("Phase 6: Generating scene SRT files")
 
         scene_srts_dir = self.temp_dir / "scene_srts"
         scene_srts_dir.mkdir(exist_ok=True)
@@ -923,11 +1184,11 @@ class QwenPipeline(BasePipeline):
             scene_srt_path = scene_srts_dir / f"{media_basename}_scene_{idx:04d}.srt"
 
             try:
-                result.to_srt_vtt(
-                    str(scene_srt_path),
-                    word_level=False,
-                    segment_level=True,
-                    strip=True,
+                # The text, written here: stable-ts prints "Saved: <path>" for every file it writes (owner
+                # W509, console item 5).
+                scene_srt_path.write_text(
+                    result.to_srt_vtt(word_level=False, segment_level=True, strip=True),
+                    encoding="utf-8",
                 )
 
                 if scene_srt_path.exists() and scene_srt_path.stat().st_size > 0:
@@ -941,23 +1202,29 @@ class QwenPipeline(BasePipeline):
         # ==============================================================
         # PHASE 7: STITCHING
         # ==============================================================
-        logger.info("[QwenPipeline PID %s] Phase 7: Stitching %d scene SRTs", os.getpid(), len(scene_srt_info))
+        logger.info("Phase 7: Stitching %d scene SRTs", len(scene_srt_info))
 
         stitched_srt_path = self.temp_dir / f"{media_basename}_stitched.srt"
 
         if scene_srt_info:
             num_subtitles = self.stitcher.stitch(scene_srt_info, stitched_srt_path)
-            logger.info("[QwenPipeline PID %s] Phase 7: Stitched %d subtitles", os.getpid(), num_subtitles)
+            logger.info("Phase 7: Stitched %d subtitles", num_subtitles)
         else:
             # No valid scene SRTs — create empty file
             stitched_srt_path.write_text("", encoding="utf-8")
             num_subtitles = 0
-            logger.warning("[QwenPipeline PID %s] Phase 7: No scene SRTs to stitch (0 subtitles)", os.getpid())
+            logger.warning("Phase 7: No scene SRTs to stitch (0 subtitles)")
 
         master_metadata["stages"]["stitching"] = {
             "total_subtitles": num_subtitles,
             "scenes_contributed": len(scene_srt_info),
         }
+
+        # The raw copy before Phase 8 cleans the joined file in place (requirement R-RAW, owner W514 6).
+        if num_subtitles > 0:
+            raw_copy = self._keep_raw_copy(stitched_srt_path, media_basename)
+            if raw_copy:
+                master_metadata["stages"]["stitching"]["original_srt"] = str(raw_copy)
 
         # ==============================================================
         # PHASE 8: SANITISATION
@@ -982,19 +1249,108 @@ class QwenPipeline(BasePipeline):
             )
             anime_filter_stats = AnimeWhisperCleaner().filter_srt_file(stitched_srt_path)
             num_subtitles = anime_filter_stats["final_count"]
-            logger.info(
-                "[QwenPipeline PID %s] Phase 8: anime SRT filter — %d → %d entries "
+            logger.debug(
+                "Phase 8: anime SRT filter — %d → %d entries "
                 "(-%d ellipsis-only, -%d empty)",
-                os.getpid(),
                 anime_filter_stats["original_count"],
                 anime_filter_stats["final_count"],
                 anime_filter_stats["dropped_ellipsis"],
                 anime_filter_stats["dropped_empty"],
             )
-        else:
+
+        # v1.9.0: nonverbal single-token line filter — ALL Qwen backends
+        # (qwen3 / cohere / anime-whisper). Drops lone ASR-artifact lines
+        # ("あ。", "は。", "え。", "切。" ...) produced by the sensitive VAD/
+        # decoding. Runs IN PLACE on stitched_srt_path (after the anime filter,
+        # if any) BEFORE the copy to final. Owner-curated, whole-line exact
+        # match (see NonverbalLineFilter for the token set + validation).
+        nonverbal_filter_stats = None
+        if self.drop_nonverbal_lines and num_subtitles > 0:
+            from whisperjav.modules.subtitle_pipeline.cleaners.nonverbal_line_filter import (
+                NonverbalLineFilter,
+            )
+            nonverbal_filter_stats = NonverbalLineFilter().filter_srt_file(stitched_srt_path)
+            num_subtitles = nonverbal_filter_stats["final_count"]
+            logger.debug(
+                "Phase 8: nonverbal line filter - %d -> %d entries "
+                "(-%d nonverbal, -%d empty)",
+                nonverbal_filter_stats["original_count"],
+                nonverbal_filter_stats["final_count"],
+                nonverbal_filter_stats["dropped_nonverbal"],
+                nonverbal_filter_stats["dropped_empty"],
+            )
+        elif anime_filter_stats is None:
             logger.info(
-                "[QwenPipeline PID %s] Phase 8: Skipped (legacy sanitizer disabled for Qwen)",
-                os.getpid(),
+                "Phase 8: no SRT filter applied "
+                "(nonverbal filter disabled, legacy sanitizer N/A for Qwen)",
+                )
+
+        # v1.9.0: non-linguistic utterance filter — ALL Qwen backends.
+        # Two-layer evidence+sound-kana check drops subtitle entries composed
+        # solely of moaning/breathing/sucking kana with no real dialogue.
+        # Runs after the single-token NonverbalLineFilter for broader coverage.
+        nonlinguistic_stats = None
+        if num_subtitles > 0:
+            from whisperjav.modules.subtitle_pipeline.cleaners.nonlinguistic_utterance_filter import (
+                NonlinguisticUtteranceFilter,
+            )
+            nonlinguistic_stats = NonlinguisticUtteranceFilter().filter_srt_file(stitched_srt_path)
+            num_subtitles = nonlinguistic_stats["final_count"]
+            if nonlinguistic_stats["dropped_nonlinguistic"] or nonlinguistic_stats["dropped_empty"]:
+                logger.debug(
+                    "Phase 8: non-linguistic utterance filter - %d -> %d entries "
+                    "(-%d non-linguistic, -%d empty)",
+                    nonlinguistic_stats["original_count"],
+                    nonlinguistic_stats["final_count"],
+                    nonlinguistic_stats["dropped_nonlinguistic"],
+                    nonlinguistic_stats["dropped_empty"],
+                )
+
+        # v1.9.0: CPS-anomaly start retimer — ALL Qwen backends. Qwen sometimes
+        # emits subtitles whose duration is far too long for their text (start
+        # smeared backwards over non-speech; end correct). Ports the legacy
+        # TimingAdjuster rule: end fixed, start moved to end - expected duration
+        # (text length at language reading speed). Starts only move LATER, so
+        # this creates no overlaps and must run BEFORE SceneOverlapResolver.
+        retime_stats = None
+        if num_subtitles > 0:
+            from whisperjav.modules.subtitle_pipeline.cleaners.cps_start_retimer import (
+                CpsStartRetimer,
+            )
+            retime_stats = CpsStartRetimer(language=self.lang_code).retime_srt_file(
+                stitched_srt_path
+            )
+            if retime_stats["retimed_total"]:
+                logger.debug(
+                    "Phase 8: CPS start retimer - %d/%d entries "
+                    "retimed (%d duration hallucination, %d slow CPS; ends unchanged)",
+                    retime_stats["retimed_total"],
+                    retime_stats["original_count"],
+                    retime_stats["retimed_long_duration"],
+                    retime_stats["retimed_slow_cps"],
+                )
+
+        # v1.9.0: scene-overlap timestamp resolver — ALL Qwen backends. Semantic
+        # scene detection extracts scenes with a ±0.35s buffer (~0.7s overlap
+        # between adjacent scenes), so stitched subs collide at scene boundaries:
+        # nested-duplicate fragments (a scene's trailing pad catching only an
+        # utterance onset) and partial ~0.7s tail overlaps. Runs LAST in Phase 8
+        # (after the line-drop filters, so it resolves the final entry set) IN
+        # PLACE on stitched_srt_path. No-op when scenes don't overlap.
+        overlap_stats = None
+        if self.resolve_scene_overlaps and num_subtitles > 0:
+            from whisperjav.modules.subtitle_pipeline.cleaners.scene_overlap_resolver import (
+                SceneOverlapResolver,
+            )
+            overlap_stats = SceneOverlapResolver().resolve_srt_file(stitched_srt_path)
+            num_subtitles = overlap_stats["final_count"]
+            logger.debug(
+                "Phase 8: scene-overlap resolver - %d -> %d entries "
+                "(-%d nested duplicate, %d starts shifted)",
+                overlap_stats["original_count"],
+                overlap_stats["final_count"],
+                overlap_stats["dropped_nested"],
+                overlap_stats["shifted_starts"],
             )
 
         final_srt_path = self.output_dir / f"{media_basename}.{self.lang_code}.whisperjav.srt"
@@ -1007,10 +1363,23 @@ class QwenPipeline(BasePipeline):
                 # quality_metrics block below can report them.
                 stats["anime_ellipsis_dropped"] = anime_filter_stats["dropped_ellipsis"]
                 stats["anime_empty_dropped"] = anime_filter_stats["dropped_empty"]
+            if nonverbal_filter_stats:
+                # v1.9.0: surface nonverbal-filter counters (feeds nonverbal_filtered).
+                stats["nonverbal_dropped"] = nonverbal_filter_stats["dropped_nonverbal"]
+                stats["nonverbal_empty_dropped"] = nonverbal_filter_stats["dropped_empty"]
+            if nonlinguistic_stats and nonlinguistic_stats["dropped_nonlinguistic"]:
+                stats["nonlinguistic_dropped"] = nonlinguistic_stats["dropped_nonlinguistic"]
+            if retime_stats and retime_stats["retimed_total"]:
+                # v1.9.0: surface CPS-retimer tally (feeds duration_adjustments).
+                stats["duration_adjustments"] = retime_stats["retimed_total"]
+            if overlap_stats:
+                # v1.9.0: surface scene-overlap resolver counters.
+                stats["scene_overlap_nested_dropped"] = overlap_stats["dropped_nested"]
+                stats["scene_overlap_shifted"] = overlap_stats["shifted_starts"]
             processed_path = final_srt_path
             logger.info(
-                "[QwenPipeline PID %s] Phase 8: %d subtitles in final output",
-                os.getpid(), num_subtitles,
+                "Phase 8: %d subtitles in final output",
+                num_subtitles,
             )
         else:
             # Copy empty stitched file as final output
@@ -1038,7 +1407,7 @@ class QwenPipeline(BasePipeline):
             "empty_removed": stats.get("empty_removed", 0),
             "cps_filtered": stats.get("cps_filtered", 0),
             "logprob_filtered": 0,       # N/A for Qwen pipeline
-            "nonverbal_filtered": 0,     # N/A for Qwen pipeline
+            "nonverbal_filtered": stats.get("nonverbal_dropped", 0),  # v1.9.0 nonverbal line filter
         }
 
         # ==============================================================
@@ -1052,6 +1421,7 @@ class QwenPipeline(BasePipeline):
             )
             analytics = compute_analytics(
                 raw_subs_dir, final_srt_path, title=media_basename,
+                timestamp_mode=getattr(self.timestamp_mode, "value", self.timestamp_mode),
             )
             print_summary(analytics, title=media_basename)
 
@@ -1068,10 +1438,13 @@ class QwenPipeline(BasePipeline):
         total_time = time.time() - pipeline_start
         master_metadata["total_time_sec"] = total_time
         master_metadata["summary"]["total_processing_time_seconds"] = round(total_time, 2)
+        # Carried out with the rest of the summary so every caller sees it
+        # the same way: the plain path, the async path, and a pass running in
+        # its own process (agreed error-handling table, 2026-09-17).
+        master_metadata["summary"]["degradations"] = list(getattr(self, "degradations", None) or [])
 
         logger.info(
-            "[QwenPipeline PID %s] Complete: %s (%d subtitles in %s)",
-            os.getpid(),
+            "Complete: %s (%d subtitles in %s)",
             final_srt_path.name,
             master_metadata["summary"]["final_subtitles_refined"],
             str(timedelta(seconds=int(total_time))),

@@ -10,22 +10,37 @@ warnings.filterwarnings("ignore", message=".*chunk_length_s.*is very experimenta
 
 import shutil
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from whisperjav.config.legacy import resolve_legacy_pipeline
+from whisperjav.modules.audio_integrity import AudioIntegrityStop
+from whisperjav.config.chronosjav_vad import apply_chronosjav_segmenter_defaults, chronosjav_end_pad_default
+from whisperjav.config.anime_whisper_vad import anime_whisperseg_defaults
+from whisperjav.config.legacy import resolve_legacy_pipeline, apply_balanced_vad_defaults
 from whisperjav.pipelines.balanced_pipeline import BalancedPipeline
 from whisperjav.pipelines.fast_pipeline import FastPipeline
 from whisperjav.pipelines.faster_pipeline import FasterPipeline
 from whisperjav.pipelines.fidelity_pipeline import FidelityPipeline
-from whisperjav.pipelines.kotoba_faster_whisper_pipeline import (
-    KotobaFasterWhisperPipeline,
-)
 from whisperjav.pipelines.transformers_pipeline import TransformersPipeline
 from whisperjav.pipelines.qwen_pipeline import QwenPipeline
 from whisperjav.pipelines.sensevoice_pipeline import SenseVoicePipeline
-from whisperjav.utils.logger import logger, setup_logger
+from whisperjav.pipelines.parakeet_crispasr_pipeline import ParakeetCrispASRPipeline
+from whisperjav.pipelines.cohere_crispasr_pipeline import CohereCrispASRPipeline
+from whisperjav.pipelines.reazonspeech_crispasr_pipeline import ReazonSpeechCrispASRPipeline
+from whisperjav.pipelines.kotoba_crispasr_pipeline import KotobaCrispASRPipeline
+from whisperjav.pipelines.whisper_turbo_crispasr_pipeline import WhisperTurboCrispASRPipeline
+from whisperjav.pipelines.whisper_large_crispasr_pipeline import WhisperLargeCrispASRPipeline
+from whisperjav.pipelines.moss_crispasr_pipeline import MossCrispASRPipeline
+from whisperjav.crispasr.errors import FAILURE_PREFIX as CRISPASR_FAILURE_PREFIX, CrispASRRunError, CrispASRSetupError
+from whisperjav.modules.qwen_errors import QwenModelUnusable
+from whisperjav.crispasr.manifest import CRISPASR_PIPELINES
+from whisperjav.crispasr.pass_settings import (ignored_hardware_message, ignored_hardware_settings,
+                                               speech_pad_ignored as crispasr_speech_pad_ignored,
+                                               unused_by_other_pipelines, unused_pass_settings,
+                                               unused_settings_message)
+from whisperjav.utils.device_detector import pass_device
+from whisperjav.utils.logger import logger, quiet_library_loggers, setup_logger
 from whisperjav.utils.parameter_tracer import create_tracer, NullTracer
 
 from .utils import resolve_language_code
@@ -35,11 +50,28 @@ PIPELINE_CLASSES = {
     "fast": FastPipeline,
     "faster": FasterPipeline,
     "fidelity": FidelityPipeline,
-    "kotoba-faster-whisper": KotobaFasterWhisperPipeline,
     "transformers": TransformersPipeline,
     "qwen": QwenPipeline,  # Dedicated Qwen3-ASR pipeline (ADR-004)
     "sensevoice": SenseVoicePipeline,  # FunASR SenseVoice (issue #350)
+    # CrispASR through its Python binding, Ensemble passes only (1.10.0; route B, W176). They
+    # replace the 1.9.x "crispasr" pipeline, whose name main.py now stops (exit status 2).
+    "parakeet-crispasr": ParakeetCrispASRPipeline,
+    "cohere-crispasr": CohereCrispASRPipeline,
+    # 1.10.1 (owner W397, W401).
+    "reazonspeech-crispasr": ReazonSpeechCrispASRPipeline,
+    "kotoba-crispasr": KotobaCrispASRPipeline,
+    "whisper-turbo-crispasr": WhisperTurboCrispASRPipeline,
+    "whisper-large-crispasr": WhisperLargeCrispASRPipeline,
+    "moss-crispasr": MossCrispASRPipeline,
 }
+
+# Pipelines whose constructors never read enhance_for_vad. Verified against their
+# source on 2026-09-17, not against their docstrings. The two CrispASR pipelines read it
+# since 1.10.0 (design 22.9.1, owner W232 8). Kept in step by
+# tests/test_speech_enhancer_spec.py, which greps the pipeline modules.
+ENHANCE_FOR_VAD_IGNORED_BY = frozenset({
+    "fast", "faster", "transformers",
+})
 
 DEFAULT_HF_PARAMS = {
     "hf_model_id": "kotoba-tech/kotoba-whisper-bilingual-v1.0",
@@ -83,44 +115,20 @@ DECODER_PARAMS = {
     "max_initial_timestamp",
 }
 
-# Segmenter params - routed to speech segmentation backends, not passed to Whisper ASR
-# Covers all backends: Silero, TEN, Whisper VAD, and shared grouping params
-SEGMENTER_PARAMS = {
-    # Core VAD (Silero, shared)
-    "threshold",
-    "min_speech_duration_ms",
-    "max_speech_duration_s",   # Keep for CLI backward compat (not in GUI)
-    "min_silence_duration_ms",
-    "speech_pad_ms",
-    # Grouping (shared across backends)
-    "chunk_threshold_s",
-    "max_group_duration_s",
-    # TEN-specific
-    "hop_size",
-    "start_pad_ms",
-    "end_pad_ms",
-    # Whisper VAD-specific
-    "cache_results",
-}
-
-# Backend name → YAML tool name mapping for ConfigManager.get_tool_config()
-# Used by resolve_qwen_sensitivity() to resolve sensitivity presets
-_SEGMENTER_TOOL_NAMES = {
-    "silero-v6.2": "silero-v6-speech-segmentation",
-    "silero": "silero-speech-segmentation",
-    "silero-v4.0": "silero-speech-segmentation",
-    "silero-v3.1": "silero-speech-segmentation",
-    "ten": "ten-speech-segmentation",
-    "nemo": "nemo-speech-segmentation",
-    "nemo-lite": "nemo-speech-segmentation",
-    "whisper-vad": "whisper-vad-speech-segmentation",
-    "whisper-vad-tiny": "whisper-vad-speech-segmentation",
-    "whisper-vad-base": "whisper-vad-speech-segmentation",
-    "whisper-vad-small": "whisper-vad-speech-segmentation",
-    "whisper-vad-medium": "whisper-vad-speech-segmentation",
-    "whisperseg": "whisperseg-speech-segmentation",
-    "firered": "firered-speech-segmentation",
-}
+# Segmenter params and the backend→YAML tool-name map live in the light module
+# whisperjav.config.segmenter_presets (v1.9.2) so main.py can resolve presets on the
+# single-pass path without importing every pipeline. Re-exported here under the
+# names this module and its tests have always used.
+from whisperjav.config.segmenter_presets import (  # noqa: E402
+    SEGMENTER_PARAMS,
+    BALANCED_DEFAULT_SEGMENTER,
+    DEFAULT_SCENE_DETECTOR,
+    SEGMENTER_TOOL_NAMES as _SEGMENTER_TOOL_NAMES,
+    resolve_segmenter_sensitivity as resolve_qwen_sensitivity,
+    effective_segmenter_for_pass,
+    segmenter_accepts,
+)
+from whisperjav.modules.silero_vad_adapter import DEFAULT_VAD_VERSION  # noqa: E402
 
 # Provider params - common transcriber options shared by all backends
 PROVIDER_PARAMS_COMMON = {
@@ -262,7 +270,6 @@ PIPELINE_BACKENDS = {
     "fast": "stable_ts",
     "faster": "stable_ts",
     "fidelity": "openai_whisper",
-    "kotoba-faster-whisper": "kotoba_faster_whisper",
 }
 
 
@@ -280,7 +287,7 @@ def get_valid_provider_params(pipeline_name: str) -> set:
 
     valid = PROVIDER_PARAMS_COMMON.copy()
 
-    if backend in ("faster_whisper", "kotoba_faster_whisper"):
+    if backend == "faster_whisper":
         valid.update(PROVIDER_PARAMS_FASTER_WHISPER)
     elif backend == "openai_whisper":
         valid.update(PROVIDER_PARAMS_OPENAI_WHISPER)
@@ -303,6 +310,7 @@ class WorkerPayload:
     language_code: str
     log_level: str = "INFO"  # Propagate log level to subprocess workers
     trace_file_path: Optional[str] = None  # Path for parameter tracer output
+    log_file: Optional[str] = None  # this pass's log file beside the run's --log-file (owner W509, way B)
 
 
 @dataclass
@@ -313,6 +321,17 @@ class FileResult:
     subtitles: int = 0
     processing_time: float = 0.0
     error: Optional[str] = None
+    # Anything that quietly fell short in this pass, in plain language -- today,
+    # scenes a chosen clean-up could not clean. A pass runs in its own process,
+    # so without carrying these back the run summary would never learn of them
+    # and the user would be told nothing (agreed error-handling table,
+    # 2026-09-17, cross-cutting rule 1).
+    degradations: List[str] = field(default_factory=list)
+    # Routine notes from this pass, in plain language (owner Q21, CrispASR master plan
+    # 2.6): printed in the run summary, and they change nothing -- no state, no exit
+    # status. Carried back the same way as degradations, but kept apart from them,
+    # because any degradation makes the file "suspect".
+    notes: List[str] = field(default_factory=list)
 
 
 def prepare_transformers_params(pass_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -450,7 +469,11 @@ DEFAULT_QWEN_PARAMS = {
     "qwen_max_tokens": 4096,
     "qwen_language": "Japanese",  # WhisperJAV is purpose-built for Japanese
     "qwen_timestamps": "word",
-    "qwen_aligner": "Qwen/Qwen3-ForcedAligner-0.6B",
+    "qwen_aligner": "wav2vec2-ja",  # 1.10.0: the CrispASR aligner (design note 2026-10-28)
+    # The timing model and timestamp mode below are the shared 1.10.0 values (owner W254), still taken by the dormant
+    # Cohere-in-ChronosJAV branch, which this change leaves as it was. Qwen3-ASR and anime-whisper default to no
+    # timing model and vad_only since 1.10.1 (owner W498 D1): set in their branches of _build_pipeline.
+    "qwen_timing_model": "whisper-small",  # the CrispASR timing model, step 8
     "qwen_scene": "semantic",
     "qwen_context": "",
     "qwen_context_file": None,
@@ -464,11 +487,11 @@ DEFAULT_QWEN_PARAMS = {
     "qwen_input_mode": "assembly",
     "qwen_framer": "vad-grouped",  # Preserve previous VAD_SLICING behavior for ensemble
     "qwen_safe_chunking": True,
-    "qwen_timestamp_mode": "aligner_vad_fallback",
+    "qwen_timestamp_mode": "aligner_vad_fallback",  # see the note above qwen_timing_model
     "qwen_assembly_cleaner": True,
     "qwen_repetition_penalty": 1.1,
     "qwen_max_tokens_per_second": 20.0,
-    "qwen_stepdown": True,
+    "qwen_stepdown": False,  # 1.10.0: off (owner W266 1); a collapsed scene takes the VAD groups' times
     "qwen_generator_backend": "qwen3",
     "qwen_regroup_mode": "off",
     # NOTE: qwen_max_group_duration, qwen_chunk_threshold,
@@ -507,7 +530,9 @@ def prepare_qwen_params(pass_config: Dict[str, Any]) -> Dict[str, Any]:
         "safe_chunking": "qwen_safe_chunking",
         "scene_min_duration": "qwen_scene_min_duration",
         "scene_max_duration": "qwen_scene_max_duration",
+        "scene_clustering_threshold": "qwen_scene_clustering_threshold",  # v1.9.2 CFF2
         "aligner_backend": "qwen_aligner_backend",
+        "timing_model": "qwen_timing_model",
         "timestamp_mode": "qwen_timestamp_mode",
         "assembly_cleaner": "qwen_assembly_cleaner",
         "repetition_penalty": "qwen_repetition_penalty",
@@ -520,7 +545,14 @@ def prepare_qwen_params(pass_config: Dict[str, Any]) -> Dict[str, Any]:
         "chunk_threshold": "qwen_chunk_threshold",
         "generator_backend": "qwen_generator_backend",
         "vad_threshold": "qwen_vad_threshold",
-        "vad_padding": "qwen_vad_padding",
+        "vad_padding": "qwen_vad_padding",        # legacy symmetric padding (back-compat)
+        "vad_start_pad": "qwen_vad_start_pad",     # v1.9.0 asymmetric: pad before onset
+        "vad_end_pad": "qwen_vad_end_pad",         # v1.9.0 asymmetric: pad after offset
+        "vad_decoder": "qwen_vad_decoder",         # v1.9.0 offline decoder: hysteresis|offline
+        "vad_grow_floor": "qwen_vad_grow_floor",   # v1.9.0 offline decoder: edge-growth floor
+        "vad_gap_merge_ms": "qwen_vad_gap_merge_ms",  # v1.9.0 offline decoder: dialog-cut gap (ms)
+        "max_speech_duration": "qwen_max_speech_duration",  # v1.9.0: single-segment ceiling (s)
+        "leading_silence_ms": "qwen_leading_silence_ms",  # v1.9.4: anime-whisper lead-in silence (0 = off)
     }
 
     # Track which qwen_* keys were explicitly set by user
@@ -538,12 +570,27 @@ def prepare_qwen_params(pass_config: Dict[str, Any]) -> Dict[str, Any]:
     if qwen_params.get("use_aligner") is False:
         params["qwen_aligner"] = None
 
-    # Handle aligner_backend: "none" → disable aligner, "qwen3" → keep existing
+    # Handle aligner_backend: "none" → disable aligner; "crispasr" / "qwen3" → that
+    # backend, with its default model when the aligner named is not one of its own
+    # (an older GUI preset may pair "qwen3" with nothing, or "crispasr" with the HF id).
     aligner_backend = qwen_params.get("aligner_backend")
-    if aligner_backend == "none":
+    if aligner_backend == "none" or qwen_params.get("use_aligner") is False:
         params["qwen_aligner"] = None
         params["qwen_timestamps"] = "none"  # Pipeline derives use_aligner from timestamps
-    # ("qwen3" or absent → no change, use existing aligner_id)
+        # The GUI's triple flip, for qwen_params written by hand too: no aligner means
+        # VAD-group times and no step-down, unless the pass names them itself.
+        if "timestamp_mode" not in qwen_params and "qwen_timestamp_mode" not in qwen_params:
+            params["qwen_timestamp_mode"] = "vad_only"
+        if "stepdown" not in qwen_params and "qwen_stepdown" not in qwen_params:
+            params["qwen_stepdown"] = False
+    elif aligner_backend in ("crispasr", "qwen3"):
+        from whisperjav.crispasr.manifest import ALIGNER_MODELS, DEFAULT_ALIGNER
+        is_crispasr_name = params.get("qwen_aligner") in ALIGNER_MODELS
+        if aligner_backend == "crispasr" and not is_crispasr_name:
+            params["qwen_aligner"] = DEFAULT_ALIGNER
+        elif aligner_backend == "qwen3" and (is_crispasr_name or not params.get("qwen_aligner")):
+            params["qwen_aligner"] = "Qwen/Qwen3-ForcedAligner-0.6B"
+    # (absent → the backend follows from qwen_aligner: a CrispASR short name or a PyTorch ID)
 
     # Handle assembly_cleaner string values (GUI sends "qwen3"/"passthrough",
     # CLI sends bool via store_true/store_false)
@@ -554,54 +601,25 @@ def prepare_qwen_params(pass_config: Dict[str, Any]) -> Dict[str, Any]:
     return params
 
 
-def resolve_qwen_sensitivity(
-    segmenter_backend: str,
-    sensitivity: str,
-    user_overrides: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """
-    Resolve sensitivity preset into segmenter_config for Qwen pipeline.
+def partial_result_file(result_file: str) -> str:
+    """Where the worker writes the results of the files finished so far (owner W462, W463 step 3)."""
+    return result_file + ".partial"
 
-    Layering: backend YAML spec < sensitivity preset < user overrides.
-    Uses ConfigManager.get_tool_config() which already implements this
-    exact layering.
 
-    Args:
-        segmenter_backend: Speech segmenter backend name (e.g., "silero-v6.2", "ten")
-        sensitivity: Sensitivity level ("aggressive", "balanced", "conservative")
-        user_overrides: Optional user custom params (win over preset)
+def _write_partial_results(result_file: str, results: List["FileResult"]) -> None:
+    """Each file's result as soon as it is known, so that a crash later in the pass (a native abort, which no
+    Python handler sees) does not lose the files already done. Written whole, then renamed; a failure to write it
+    is logged and changes nothing else."""
+    import pickle
 
-    Returns:
-        Dict of segmenter config params (filtered to SEGMENTER_PARAMS keys)
-    """
-    if segmenter_backend == "none" or not segmenter_backend:
-        return {}
-
-    tool_name = _SEGMENTER_TOOL_NAMES.get(segmenter_backend)
-    if not tool_name:
-        logger.warning(
-            "Unknown segmenter backend '%s' for sensitivity resolution; "
-            "passing user overrides only",
-            segmenter_backend,
-        )
-        return {k: v for k, v in (user_overrides or {}).items() if k in SEGMENTER_PARAMS}
-
+    target = partial_result_file(result_file)
     try:
-        from whisperjav.config.v4 import ConfigManager
-
-        cm = ConfigManager()
-        resolved = cm.get_tool_config(tool_name, sensitivity, user_overrides)
-
-        # Filter to SEGMENTER_PARAMS only — ConfigManager returns full tool config
-        # including metadata keys we don't want to pass to the backend
-        return {k: v for k, v in resolved.items() if k in SEGMENTER_PARAMS}
-    except Exception as e:
-        logger.warning(
-            "ConfigManager failed for '%s' sensitivity '%s': %s. "
-            "Falling back to user overrides only.",
-            tool_name, sensitivity, e,
-        )
-        return {k: v for k, v in (user_overrides or {}).items() if k in SEGMENTER_PARAMS}
+        tmp = target + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump({"results": [r.__dict__ for r in results], "worker_error": None}, f)
+        os.replace(tmp, target)
+    except Exception as e:  # noqa: BLE001 -- a safety copy only
+        logger.debug("[Worker %s] Could not write the per-file results: %s", os.getpid(), e)
 
 
 def _write_dropbox_and_exit(result_file: str, result: Dict[str, Any], tracer, exit_code: int) -> None:
@@ -688,7 +706,8 @@ def run_pass_worker(payload: WorkerPayload, result_file: str) -> None:
 
     # Reconfigure logger with the log level from main process
     # (subprocess starts fresh with default INFO level due to 'spawn' context)
-    setup_logger("whisperjav", payload.log_level)
+    setup_logger("whisperjav", payload.log_level, payload.log_file)
+    quiet_library_loggers(debug=payload.log_level.upper() == "DEBUG")   # owner W509, console item 4
 
     # Create parameter tracer if trace file path is provided
     # Use append=True since the main process already created the file
@@ -712,8 +731,7 @@ def run_pass_worker(payload: WorkerPayload, result_file: str) -> None:
     language_code = payload.language_code or resolve_language_code(pass_config, payload.subs_language)
 
     logger.info(
-        "[Worker %s] Starting pass %s for %s file(s)",
-        os.getpid(),
+        "Starting pass %s for %s file(s)",
         pass_number,
         len(media_files),
         extra={'color': 'blue'},
@@ -724,6 +742,13 @@ def run_pass_worker(payload: WorkerPayload, result_file: str) -> None:
         _write_dropbox_and_exit(result_file, {"results": [], "worker_error": None}, tracer, 0)
 
     pass_temp_dir = Path(payload.temp_dir) / f"pass{pass_number}_worker"
+
+    # --passN-word-timestamps is used by the CrispASR pipelines only (1.10.1, Part B; owner W413): for any
+    # other pipeline, XXL included, the same "does not use" line the CrispASR passes log names it.
+    _other_unused = unused_by_other_pipelines(pass_config, pass_number)
+    if _other_unused:
+        # e.g. "The balanced pipeline does not use: --pass1-word-timestamps"
+        logger.info(unused_settings_message(f"The {pass_config.get('pipeline')} pipeline", _other_unused))
 
     # =========================================================================
     # BYOP XXL: External subprocess — bypasses _build_pipeline() entirely.
@@ -745,6 +770,20 @@ def run_pass_worker(payload: WorkerPayload, result_file: str) -> None:
         # This line should never be reached, but guard against it
         return  # pragma: no cover
 
+    # v1.10.0 (item 3, owner W75): a speech enhancer WhisperJAV no longer includes
+    # (ClearVoice) stops the pass here, before any audio is read. main.py checks the
+    # command line; this covers whatever else builds a pass configuration.
+    removed = _removed_enhancer_in_pass(pass_config, pass_number)
+    if removed:
+        logger.error("[Worker %s] Pass %s: %s", os.getpid(), pass_number, removed)
+        _write_dropbox_and_exit(result_file, {
+            "results": [
+                FileResult(basename=info["basename"], status="failed", error=removed).__dict__
+                for info in media_files
+            ],
+            "worker_error": removed,
+        }, tracer, 1)
+
     try:
         pipeline = _build_pipeline(
             pass_config=pass_config,
@@ -756,6 +795,10 @@ def run_pass_worker(payload: WorkerPayload, result_file: str) -> None:
             pass_temp_dir=pass_temp_dir,
             tracer=tracer,
         )
+        # 1.9.4 (REQ1): both passes read the same file; only pass 1 names a
+        # damaged audio track in the run summary (the stop switch acts in both).
+        if pass_number != 1:
+            pipeline.audio_integrity_in_summary = False
     except Exception:  # pragma: no cover - fatal config issues propagated
         logger.exception("[Worker %s] Failed to initialize pipeline", os.getpid())
         if not payload.keep_temp_files and pass_temp_dir.exists():
@@ -778,8 +821,7 @@ def run_pass_worker(payload: WorkerPayload, result_file: str) -> None:
         for media_info in media_files:
             basename = media_info["basename"]
             logger.info(
-                "[Worker %s] Pass %s processing %s",
-                os.getpid(),
+                "Pass %s processing %s",
                 pass_number,
                 basename,
                 extra={'color': 'blue'},
@@ -787,6 +829,19 @@ def run_pass_worker(payload: WorkerPayload, result_file: str) -> None:
             logger.debug(
                 "[Worker %s] Pass %s: File details - path=%s, basename_len=%d",
                 os.getpid(), pass_number, media_info.get("path"), len(basename)
+            )
+            # #394 per-scene telemetry goes beside this file's pass output,
+            # tagged with the pass number so two Balanced passes do not
+            # overwrite each other. Pipelines that do not record it ignore it.
+            # The CrispASR pipelines' raw copy and artifacts file, and ChronosJAV's raw copy (1.10.1, R-RAW), go to
+            # the same folder.
+            _configure_trace(pipeline, pass_number, Path(media_info.get('output_dir', payload.output_dir)))
+            # An Ensemble pass keeps its save-points (owner W462, W463 C1); pipelines without them ignore this.
+            if hasattr(pipeline, "save_points"):
+                pipeline.save_points = True
+            _configure_telemetry(
+                pipeline, pass_config, pass_number,
+                Path(media_info.get('output_dir', payload.output_dir)),
             )
             try:
                 result = pipeline.process({
@@ -869,6 +924,11 @@ def run_pass_worker(payload: WorkerPayload, result_file: str) -> None:
                         srt_path=str(pass_output),
                         subtitles=result["summary"].get("final_subtitles_refined", 0),
                         processing_time=result["summary"].get("total_processing_time_seconds", 0.0),
+                        # From the metadata this file's run returned, so the
+                        # worker reads the same channel everything else does.
+                        degradations=list(
+                            result.get("summary", {}).get("degradations") or []),
+                        notes=list(result.get("summary", {}).get("notes") or []),
                     )
                 )
                 logger.debug(
@@ -877,6 +937,25 @@ def run_pass_worker(payload: WorkerPayload, result_file: str) -> None:
                     result["summary"].get("final_subtitles_refined", 0),
                     result["summary"].get("total_processing_time_seconds", 0.0)
                 )
+            except AudioIntegrityStop as stop:
+                # --fail-on suspect: a requested stop, not a crash.
+                logger.error("[Worker %s] Pass %s: %s: %s", os.getpid(), pass_number, basename, stop)
+                results.append(FileResult(basename=basename, status="failed", error=str(stop)))
+            except QwenModelUnusable as stop:
+                # The pass's Qwen3-ASR model cannot give real text for any file (R-QFT, #494; owner W491 2): the pass
+                # stops here, and every file not yet done fails with the same plain reason, without a new load.
+                logger.error("[Worker %s] Pass %s: %s: %s", os.getpid(), pass_number, basename, stop)
+                position = next(k for k, m in enumerate(media_files) if m is media_info)
+                results.extend(FileResult(basename=m["basename"], status="failed", error=str(stop))
+                               for m in media_files[position:])
+                _write_partial_results(result_file, results)
+                break
+            except (CrispASRRunError, CrispASRSetupError) as failure:
+                # CrispASR or its model failed, with the reason in plain words: the run summary
+                # shows it, prefixed, instead of a traceback.
+                logger.error("[Worker %s] Pass %s: %s: %s", os.getpid(), pass_number, basename, failure)
+                results.append(FileResult(basename=basename, status="failed",
+                                          error=f"{CRISPASR_FAILURE_PREFIX}{failure}"))
             except Exception:
                 logger.exception(
                     "[Worker %s] Pass %s failed for %s", os.getpid(), pass_number, basename
@@ -888,6 +967,8 @@ def run_pass_worker(payload: WorkerPayload, result_file: str) -> None:
                         error=traceback.format_exc(),
                     )
                 )
+            # Step 3 (owner W462, W463): this file's result is on disk before the next file starts.
+            _write_partial_results(result_file, results)
     finally:
         # Defensive cleanup: Use BaseException to catch more error types.
         # On Windows, CUDA driver crashes during cleanup can terminate the process
@@ -907,8 +988,10 @@ def run_pass_worker(payload: WorkerPayload, result_file: str) -> None:
                 os.getpid(), e
             )
 
-        # Temp directory cleanup - also make defensive
-        if not payload.keep_temp_files and pass_temp_dir.exists():
+        # Temp directory cleanup - also make defensive. Not when a file failed (owner W462, W463 step 1): the
+        # Ensemble keeps that file's save-point and the pass's working files (ensemble/orchestrator.py).
+        if (not payload.keep_temp_files and pass_temp_dir.exists()
+                and not any(r.status == "failed" for r in results)):
             try:
                 shutil.rmtree(pass_temp_dir, ignore_errors=True)
             except BaseException:
@@ -921,7 +1004,7 @@ def run_pass_worker(payload: WorkerPayload, result_file: str) -> None:
     total_time = sum(r.processing_time for r in results if r.status == 'completed')
 
     if completed_count > 0:
-        logger.info(
+        logger.debug(
             "[Worker %s] Pass %s completed: %d file(s), %d subtitles, %.1fs",
             os.getpid(), pass_number, completed_count, total_subs, total_time
         )
@@ -931,7 +1014,7 @@ def run_pass_worker(payload: WorkerPayload, result_file: str) -> None:
             os.getpid(), pass_number, failed_count
         )
 
-    logger.info("[Worker %s] Worker exiting via Nuclear Exit", os.getpid())
+    logger.debug("[Worker %s] Worker exiting via Nuclear Exit", os.getpid())
 
     # Write result to Drop-Box and Nuclear Exit
     final_result = {"results": [r.__dict__ for r in results], "worker_error": None}
@@ -961,7 +1044,8 @@ def _run_xxl_pass(
     """
     import time as _time
 
-    from whisperjav.byop.xxl_runner import run_xxl
+    from whisperjav.byop.xxl_runner import (DEFAULT_XXL_MODEL, failure_note, failure_reason,
+                                            model_override_note, run_xxl)
 
     pass_config = payload.pass_config
     xxl_exe = pass_config.get("xxl_exe") if pass_config else None
@@ -986,19 +1070,25 @@ def _run_xxl_pass(
 
     pass_temp_dir.mkdir(parents=True, exist_ok=True)
     xxl_extra_args = pass_config.get("xxl_args", "")
-    xxl_model = pass_config.get("model") or "large-v3"
+    xxl_model = pass_config.get("model") or DEFAULT_XXL_MODEL
     asr_task = "translate" if payload.subs_language == "direct-to-english" else "transcribe"
 
     logger.info(
-        "[Worker %s] Pass %s: BYOP XXL (exe=%s, model=%s)",
-        os.getpid(), pass_number, xxl_exe, xxl_model,
+        "Pass %s: BYOP XXL (exe=%s, model=%s)",
+        pass_number, xxl_exe, xxl_model,
     )
+
+    # A model named in the extra arguments is not used (#272); say so once per pass worker --
+    # once per pass, or once per file and pass with --ensemble-serial (owner W271 4).
+    override_note = model_override_note(pass_number, xxl_model, xxl_extra_args, xxl_exe)
+    if override_note:
+        logger.warning(override_note)
 
     for media_info in media_files:
         basename = media_info["basename"]
         logger.info(
-            "[Worker %s] Pass %s [XXL] processing %s",
-            os.getpid(), pass_number, basename,
+            "Pass %s [XXL] processing %s",
+            pass_number, basename,
             extra={'color': 'blue'},
         )
         file_start = _time.monotonic()
@@ -1045,11 +1135,14 @@ def _run_xxl_pass(
                 )
             )
             logger.info(
-                "[Worker %s] Pass %s [XXL] %s -> %d subtitles in %.1fs",
-                os.getpid(), pass_number, basename, subtitle_count, elapsed,
+                "Pass %s [XXL] %s -> %d subtitles in %.1fs",
+                pass_number, basename, subtitle_count, elapsed,
             )
-        except Exception:
+        except Exception as xxl_error:
             elapsed = _time.monotonic() - file_start
+            # An XXL failure is never silent (owner W92); see failure_note.
+            failure_line = failure_note(pass_number, basename, xxl_error)
+            logger.error(failure_line)
             logger.exception(
                 "[Worker %s] Pass %s [XXL] failed for %s (%.1fs)",
                 os.getpid(), pass_number, basename, elapsed,
@@ -1058,7 +1151,8 @@ def _run_xxl_pass(
                 FileResult(
                     basename=basename,
                     status="failed",
-                    error=traceback.format_exc(),
+                    # The plain reason first: the Ensemble summary shows the start of the first line.
+                    error=f"{failure_reason(xxl_error)}\n{traceback.format_exc()}",
                 )
             )
 
@@ -1074,13 +1168,43 @@ def _run_xxl_pass(
     failed_count = sum(1 for r in results if r.status == 'failed')
     total_subs = sum(r.subtitles for r in results if r.status == 'completed')
     logger.info(
-        "[Worker %s] Pass %s [XXL] done: %d completed, %d failed, %d subtitles",
-        os.getpid(), pass_number, completed_count, failed_count, total_subs,
+        "Pass %s [XXL] done: %d completed, %d failed, %d subtitles",
+        pass_number, completed_count, failed_count, total_subs,
     )
 
     # Write Drop-Box and Nuclear Exit (same pattern as normal passes)
     final_result = {"results": [r.__dict__ for r in results], "worker_error": None}
     _write_dropbox_and_exit(result_file, final_result, tracer, 0)
+
+
+def _configure_trace(pipeline: Any, pass_number: int, file_output_dir: Path) -> None:
+    """Point a CrispASR pipeline's raw copy and artifacts file, and ChronosJAV's raw copy (1.10.1, requirement R-RAW;
+    crispasr/cleanup.py, qwen_pipeline.py: _keep_raw_copy) at this file's pass output folder, named with the pass. As for the telemetry below: in ``--output-dir source`` mode
+    the pipeline's own ``output_dir`` is the temp directory, which is removed. Other pipelines are left alone."""
+    if hasattr(pipeline, "raw_subs_dir") and hasattr(pipeline, "pass_tag"):
+        pipeline.raw_subs_dir = str(Path(file_output_dir) / "raw_subs")
+        pipeline.pass_tag = f"pass{pass_number}"
+
+
+def _configure_telemetry(pipeline: Any, pass_config: Dict[str, Any],
+                         pass_number: int, file_output_dir: Path) -> None:
+    """Point the pipeline's #394 telemetry at this file's pass output folder.
+
+    The pipeline resolves the final path itself (see
+    ``whisperjav.utils.asr_telemetry.resolve_telemetry_path``): with no user
+    override it is ``<file_output_dir>/raw_subs/<name>.pass<N>.asr_telemetry.jsonl``.
+    The pipeline's own ``output_dir`` cannot be used for this, because in
+    ``--output-dir source`` mode the orchestrator points it at the temp
+    directory and moves only the SRT out afterwards.
+    """
+    enabled = bool(pass_config.get("asr_telemetry_enabled", True))
+    override = pass_config.get("asr_telemetry")
+    setattr(pipeline, "asr_telemetry_enabled", enabled)
+    setattr(pipeline, "asr_telemetry_tag", f"pass{pass_number}")
+    # No override: a directory, so the pipeline names the file; the pass tag
+    # is applied by the pipeline in both cases.
+    setattr(pipeline, "asr_telemetry_path",
+            override if override else str(Path(file_output_dir) / "raw_subs"))
 
 
 def _build_pipeline(
@@ -1097,10 +1221,34 @@ def _build_pipeline(
     pipeline_class = PIPELINE_CLASSES.get(pipeline_name)
     if not pipeline_class:
         raise ValueError(f"Unknown pipeline: {pipeline_name}")
+    is_crispasr = pipeline_name in CRISPASR_PIPELINES
 
-    # Pass enhance_for_vad flag to all pipelines via extra_kwargs
+    # Pass enhance_for_vad flag to all pipelines via extra_kwargs.
+    #
+    # What each pipeline then does with it, read from the code on 2026-09-17:
+    #   qwen (and the decoupled pipeline behind it) -- the real dual track: the
+    #     enhanced audio drives the segmenter, the original goes to the recogniser.
+    #   balanced, fidelity -- the flag is read and reported in an INFO line, but
+    #     the enhanced audio goes to BOTH; separating them needs recogniser-side
+    #     changes (balanced_pipeline.py, fidelity_pipeline.py).
+    #   fast, faster, transformers -- never read.
+    #     The owner accepted that on 2026-09-17; it is stated here and in --help
+    #     so it is not mistaken for an oversight.
+    #   parakeet-crispasr, cohere-crispasr (1.10.0) -- never read either: they run
+    #     no audio clean-up at all (CrispASR master plan 2.2). A user who set it on
+    #     such a pass is told below, in one line naming every pass setting the pass
+    #     does not use; the reason the line here gives would be wrong for them.
+    #
+    # A user who asked for it and is getting nothing is told so once, rather than
+    # being left to infer it from the absence of any mention.
     if pass_config.get("enhance_for_vad"):
         extra_kwargs = {**extra_kwargs, "enhance_for_vad": True}
+        if pipeline_name in ENHANCE_FOR_VAD_IGNORED_BY and not is_crispasr:
+            logger.info(
+                "Pass %s: --pass%s-enhance-for-vad has no effect on the %s pipeline, "
+                "which does not run a separate speech segmenter. The audio clean-up "
+                "still runs; it is simply not split between detection and recognition.",
+                pass_number, pass_number, pipeline_name)
 
     pass_temp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1154,6 +1302,8 @@ def _build_pipeline(
             if enhancer_model:
                 hf_defaults["hf_speech_enhancer_model"] = enhancer_model
             logger.debug("Pass %s: Override hf_speech_enhancer = %s, model = %s", pass_number, enhancer_backend, enhancer_model)
+        # --device governs every pipeline (design 22.3.1, owner W237 1); --device cpu is absolute.
+        hf_defaults["hf_device"] = pass_device(pass_config.get("device"), hf_defaults.get("hf_device"))
         logger.debug(
             "[Worker %s] Pass %s: Creating TransformersPipeline with hf_model_id=%s, hf_task=%s, hf_language=%s",
             os.getpid(), pass_number,
@@ -1225,8 +1375,8 @@ def _build_pipeline(
             qwen_defaults["qwen_segmenter"] = "whisperseg"
             logger.debug("Pass %s: %s default qwen_segmenter = whisperseg", pass_number, _aw_gen)
         elif _aw_gen == "cohere" and not pass_config.get("speech_segmenter"):
-            qwen_defaults["qwen_segmenter"] = "firered"
-            logger.debug("Pass %s: cohere default qwen_segmenter = firered", pass_number)
+            qwen_defaults["qwen_segmenter"] = "firered-vad"
+            logger.debug("Pass %s: cohere default qwen_segmenter = firered-vad", pass_number)
         # Resolve sensitivity preset into segmenter_config
         # Layering: YAML spec < sensitivity preset < user custom overrides
         qwen_sensitivity = (
@@ -1246,21 +1396,58 @@ def _build_pipeline(
         if _vad_thr is not None:
             user_segmenter_overrides["threshold"] = float(_vad_thr)
             logger.debug("Pass %s: VAD threshold slider override = %s", pass_number, _vad_thr)
-        _vad_pad = qwen_defaults.get("qwen_vad_padding")
-        if _vad_pad is not None:
-            user_segmenter_overrides["speech_pad_ms"] = int(_vad_pad)
-            logger.debug("Pass %s: VAD padding slider override = %s ms", pass_number, _vad_pad)
+        # v1.9.0: VAD padding (legacy symmetric qwen_vad_padding + new asymmetric
+        # start/end) is routed to the pipeline scalars after qwen_pipeline_params is
+        # built — the pipeline injects start_pad_ms/end_pad_ms at clobber time, so it
+        # must NOT go into segmenter_config here (it would be overwritten anyway).
         # CLI pass-level overrides (--pass1-vad-threshold, --pass1-speech-pad-ms)
         # Highest priority — overrides both GUI sliders and sensitivity presets
         _cli_vad_thr = pass_config.get("vad_threshold")
         if _cli_vad_thr is not None:
             user_segmenter_overrides["threshold"] = max(0.0, min(1.0, float(_cli_vad_thr)))
             logger.debug("Pass %s: CLI vad_threshold override = %s", pass_number, _cli_vad_thr)
-        _cli_pad = pass_config.get("speech_pad_ms")
-        if _cli_pad is not None:
-            user_segmenter_overrides["speech_pad_ms"] = max(0, int(_cli_pad))
-            logger.debug("Pass %s: CLI speech_pad_ms override = %s ms", pass_number, _cli_pad)
+        # v1.9.0 offline-decoder levers from the GUI Customize modal (mapped to
+        # qwen_* by prepare_qwen_params). Routed into segmenter_config as user
+        # overrides so they win over the anime table defaults below.
+        for _qk, _sk, _cast in (
+            ("qwen_vad_decoder", "segmentation_decoder", str),
+            ("qwen_vad_grow_floor", "grow_floor", float),
+            ("qwen_vad_gap_merge_ms", "gap_merge_ms", int),
+            ("qwen_max_speech_duration", "max_speech_duration_s", float),
+        ):
+            _qv = qwen_defaults.get(_qk)
+            if _qv is not None and _qv != "":
+                user_segmenter_overrides[_sk] = _cast(_qv)
+                logger.debug("Pass %s: GUI segmenter override %s = %s", pass_number, _sk, _qv)
+        # v1.9.0 JAV retune: default the segmenter config when the user set none
+        # via slider/CLI. DEFAULT only — the GUI slider / CLI override above wins.
+        #   anime-whisper -> per-sensitivity values from the owner table
+        #                    (config/anime_whisper_vad.py). The GUI Ensemble tab
+        #                    exposes a per-pass sensitivity selector for anime,
+        #                    so this gradient is live.
+        #   qwen3         -> flat threshold 0.25 (gradient scoped to anime only).
+        # Cohere excluded (keeps its sensitivity-resolved threshold). Layered as a
+        # user-override so it sits above the sensitivity preset.
+        # v1.9.0 fix (code-review): the anime table and the flat 0.25 are
+        # WhisperSeg-scale values — inject them ONLY when the segmenter
+        # actually is whisperseg. Injected as user-overrides they ride ABOVE
+        # the backend's own per-sensitivity YAML presets in
+        # resolve_qwen_sensitivity, so on the default GUI ensemble config
+        # (pass 2 = qwen + TEN) the flat 0.25 silently replaced TEN's tuned
+        # 0.42/0.32/0.22 gradient and made the sensitivity selector inert.
         segmenter_backend = qwen_defaults.get("qwen_segmenter", "whisperseg")
+        # One decision for every entry point (config/chronosjav_vad.py): for
+        # WhisperSeg only, inject ALL anime-table segmenter_config defaults
+        # (threshold, neg_threshold, min_silence_duration_ms, max_speech_duration_s,
+        # decoder, grow floor ...) or the Qwen3-ASR values (threshold 0.25, longest
+        # segment 4.0 s since v1.9.4; for TEN and FireRedVAD only that 4.0 s,
+        # owner 2026-10-08), so they reach the Phase-4 segmenter AND the
+        # vad-grouped framer. setdefault semantics: GUI custom params / sliders /
+        # CLI collected above always win.
+        apply_chronosjav_segmenter_defaults(
+            user_segmenter_overrides, _aw_gen, segmenter_backend, qwen_sensitivity)
+        # NOTE: --passN-speech-pad-ms (pass_config["speech_pad_ms"]) is applied to the
+        # pipeline padding scalars below, not to segmenter_config (see v1.9.0 note above).
         segmenter_config = resolve_qwen_sensitivity(
             segmenter_backend, qwen_sensitivity, user_segmenter_overrides or None
         )
@@ -1272,13 +1459,18 @@ def _build_pipeline(
         # Map qwen_* prefixed params to QwenPipeline's parameter names
         qwen_pipeline_params = {
             "model_id": qwen_defaults.get("qwen_model_id", "Qwen/Qwen3-ASR-1.7B"),
-            "device": qwen_defaults.get("qwen_device", "auto"),
+            # --device governs every pipeline (design 22.3.1, owner W237 1); --device cpu is absolute.
+            "device": pass_device(pass_config.get("device"), qwen_defaults.get("qwen_device")),
             "dtype": qwen_defaults.get("qwen_dtype", "auto"),
             "batch_size": qwen_defaults.get("qwen_batch_size", 1),
             "max_new_tokens": qwen_defaults.get("qwen_max_tokens", 4096),
             "language": (lambda _l: None if _l in (None, "null", "") else _l)(qwen_defaults.get("qwen_language", "Japanese")),
             "timestamps": qwen_defaults.get("qwen_timestamps", "word"),
-            "aligner_id": qwen_defaults.get("qwen_aligner", "Qwen/Qwen3-ForcedAligner-0.6B"),
+            "aligner_id": qwen_defaults.get("qwen_aligner", "wav2vec2-ja"),
+            "aligner_backend": (qwen_defaults.get("qwen_aligner_backend")
+                                if qwen_defaults.get("qwen_aligner_backend") in ("crispasr", "qwen3", "none")
+                                else None),
+            "timing_model": qwen_defaults.get("qwen_timing_model", "whisper-small"),
             "scene_detector": qwen_defaults.get("qwen_scene", "none"),
             "context": qwen_defaults.get("qwen_context", ""),
             "context_file": qwen_defaults.get("qwen_context_file", None),
@@ -1296,7 +1488,7 @@ def _build_pipeline(
             "assembly_cleaner": qwen_defaults.get("qwen_assembly_cleaner", True),
             "repetition_penalty": qwen_defaults.get("qwen_repetition_penalty", 1.1),
             "max_tokens_per_audio_second": qwen_defaults.get("qwen_max_tokens_per_second", 20.0),
-            "stepdown_enabled": qwen_defaults.get("qwen_stepdown", True),
+            "stepdown_enabled": qwen_defaults.get("qwen_stepdown", False),
             "generator_backend": qwen_defaults.get("qwen_generator_backend", "qwen3"),
             "regroup_mode": qwen_defaults.get("qwen_regroup_mode", "standard"),
             "segmenter_config": segmenter_config if segmenter_config else None,
@@ -1304,20 +1496,46 @@ def _build_pipeline(
         # When anime-whisper generator is selected, override model defaults
         # unless ensemble config explicitly set them
         _gen_backend = qwen_pipeline_params.get("generator_backend", "qwen3")
+        if _gen_backend in ("qwen3", "anime-whisper"):
+            # 1.10.1 (owner W498 D1): Qwen3-ASR and anime-whisper default to VAD Only with no timing model -- no
+            # aligner, no timing model -- unless the pass names a timestamp mode or a timing model itself. A pass
+            # that names an aligner but no timestamp mode gets aligner_vad_fallback (owner W501 1). One rule with
+            # main.py: config/chronosjav_timing.py.
+            from whisperjav.config.chronosjav_timing import DEFAULT_TIMING_MODEL, timestamp_mode_for_pass
+            _named = pass_config.get("qwen_params") or {}
+            _mode = timestamp_mode_for_pass(_named)
+            if _mode is not None:
+                qwen_pipeline_params["timestamp_mode"] = _mode
+            if "timing_model" not in _named and "qwen_timing_model" not in _named:
+                qwen_pipeline_params["timing_model"] = DEFAULT_TIMING_MODEL
         if _gen_backend == "anime-whisper":
             _user_qwen = pass_config.get("qwen_params") or {}
+            # v1.9.0: per-sensitivity WhisperSeg VAD defaults (owner table, single
+            # source of truth). Balanced is the fallback for unknown sensitivity.
+            # Each still gated on the user NOT having set it explicitly, so GUI
+            # sliders / CLI (applied below via qwen_defaults) win.
+            _aw_vad = anime_whisperseg_defaults(qwen_sensitivity)
             if "model_id" not in _user_qwen and not pass_config.get("model"):
                 qwen_pipeline_params["model_id"] = "litagin/anime-whisper"
-            if "timestamp_mode" not in _user_qwen:
-                qwen_pipeline_params["timestamp_mode"] = "vad_only"
+            # The timestamp mode and timing model follow the same defaults as Qwen3-ASR (since 1.10.1
+            # vad_only and none, owner W498 D1; in 1.10.0 the aligner and timing model, W254 Q6).
             if "assembly_cleaner" not in _user_qwen:
                 qwen_pipeline_params["assembly_cleaner"] = False
-            if "stepdown" not in _user_qwen:
-                qwen_pipeline_params["stepdown_enabled"] = False
             if "chunk_threshold" not in _user_qwen:
-                qwen_pipeline_params["segmenter_chunk_threshold"] = 0.5
+                qwen_pipeline_params["segmenter_chunk_threshold"] = _aw_vad["chunk_threshold_s"]
             if "max_group_duration" not in _user_qwen:
-                qwen_pipeline_params["segmenter_max_group_duration"] = 5.0
+                qwen_pipeline_params["segmenter_max_group_duration"] = _aw_vad["max_group_duration_s"]
+            if "vad_padding" not in _user_qwen and "vad_start_pad" not in _user_qwen:
+                qwen_pipeline_params["segmenter_start_pad_ms"] = int(_aw_vad["start_pad_ms"])
+            if "vad_padding" not in _user_qwen and "vad_end_pad" not in _user_qwen:
+                qwen_pipeline_params["segmenter_end_pad_ms"] = int(_aw_vad["end_pad_ms"])
+        elif _gen_backend == "qwen3":
+            # Qwen3-ASR + WhisperSeg: end pad 0 ms at every sensitivity (owner, 2026-10-09);
+            # config/chronosjav_vad.py. GUI sliders / qwen-params / speech_pad_ms (below) win.
+            _user_qwen = pass_config.get("qwen_params") or {}
+            _end_pad_default = chronosjav_end_pad_default(_gen_backend, qwen_pipeline_params["speech_segmenter"])
+            if _end_pad_default is not None and "vad_padding" not in _user_qwen and "vad_end_pad" not in _user_qwen:
+                qwen_pipeline_params["segmenter_end_pad_ms"] = _end_pad_default
         elif _gen_backend == "cohere":
             # Cohere Transcribe defaults: ChronosJAV-style vad_only timing
             # (ForcedAligner benchmarked ~0% native alignment on JAV audio →
@@ -1342,20 +1560,47 @@ def _build_pipeline(
             if "batch_size" not in _user_qwen:
                 # Batched frame transcription (speed default; see main.py)
                 qwen_pipeline_params["batch_size"] = 8
+            # v1.9.0: Cohere keeps pre-v1.9.0 SYMMETRIC padding (~300ms). The new
+            # asymmetric 100/200 default applies ONLY to qwen3 + anime-whisper, so
+            # pin cohere's pad scalars here (explicit user sliders still override below).
+            if "vad_padding" not in _user_qwen and "vad_start_pad" not in _user_qwen:
+                qwen_pipeline_params["segmenter_start_pad_ms"] = 300
+            if "vad_padding" not in _user_qwen and "vad_end_pad" not in _user_qwen:
+                qwen_pipeline_params["segmenter_end_pad_ms"] = 300
         # Pipeline-owned defaults: only forward when ensemble config explicitly overrides
         if "qwen_scene_min_duration" in qwen_defaults:
             qwen_pipeline_params["scene_min_duration"] = qwen_defaults["qwen_scene_min_duration"]
         if "qwen_scene_max_duration" in qwen_defaults:
             qwen_pipeline_params["scene_max_duration"] = qwen_defaults["qwen_scene_max_duration"]
+        if qwen_defaults.get("qwen_scene_clustering_threshold") is not None:
+            qwen_pipeline_params["scene_clustering_threshold"] = qwen_defaults["qwen_scene_clustering_threshold"]
         if "qwen_max_group_duration" in qwen_defaults:
             qwen_pipeline_params["segmenter_max_group_duration"] = qwen_defaults["qwen_max_group_duration"]
         _chunk_thr = qwen_defaults.get("qwen_chunk_threshold")
         if _chunk_thr is not None:
             qwen_pipeline_params["segmenter_chunk_threshold"] = float(_chunk_thr)
+        # v1.9.0: asymmetric VAD padding → pipeline scalars (qwen owns default 100/200).
+        # Precedence (low→high): legacy symmetric (GUI vad_padding / CLI speech_pad_ms)
+        # applied to BOTH sides, then explicit start/end pad sliders win per-side.
+        _legacy_pad = qwen_defaults.get("qwen_vad_padding")
+        if _legacy_pad is None:
+            _legacy_pad = pass_config.get("speech_pad_ms")
+        if _legacy_pad is not None:
+            qwen_pipeline_params["segmenter_start_pad_ms"] = max(0, int(_legacy_pad))
+            qwen_pipeline_params["segmenter_end_pad_ms"] = max(0, int(_legacy_pad))
+        _start_pad = qwen_defaults.get("qwen_vad_start_pad")
+        if _start_pad is not None:
+            qwen_pipeline_params["segmenter_start_pad_ms"] = max(0, int(_start_pad))
+        _end_pad = qwen_defaults.get("qwen_vad_end_pad")
+        if _end_pad is not None:
+            qwen_pipeline_params["segmenter_end_pad_ms"] = max(0, int(_end_pad))
         if "qwen_stepdown_initial_group" in qwen_defaults:
             qwen_pipeline_params["stepdown_initial_group"] = qwen_defaults["qwen_stepdown_initial_group"]
         if "qwen_stepdown_fallback_group" in qwen_defaults:
             qwen_pipeline_params["stepdown_fallback_group"] = qwen_defaults["qwen_stepdown_fallback_group"]
+        if qwen_defaults.get("qwen_leading_silence_ms") is not None:
+            # v1.9.4: anime-whisper lead-in silence from the GUI dialog / qwen-params (0 = off)
+            qwen_pipeline_params["anime_leading_silence_ms"] = max(0, int(qwen_defaults["qwen_leading_silence_ms"]))
         logger.debug(
             "[Worker %s] Pass %s: Creating QwenPipeline with model_id=%s, scene=%s, segmenter=%s",
             os.getpid(), pass_number,
@@ -1452,14 +1697,127 @@ def _build_pipeline(
                 os.getpid(), pass_number, type(e).__name__, e,
             )
             raise
+    # The CrispASR pipelines (1.10.0; route B design 4.1): Ensemble passes that run CrispASR
+    # through its Python binding. Built from the pass settings they use -- model, speech
+    # segmenter, sensitivity, source language, device -- and returned here, before resolve_legacy_pipeline(),
+    # which raises for any name outside LEGACY_PIPELINES (config/legacy.py). main.py has
+    # already refused a model they do not know and a language other than Japanese
+    # (whisperjav/crispasr/pass_settings.py); the segmenter "none" is accepted (owner W457, W458:
+    # each scene goes to the model whole). The pass settings they do
+    # not use are named in one line and otherwise left alone: the GUI and saved Ensemble
+    # presets carry them for every pipeline.
+    if is_crispasr:
+        unused = unused_pass_settings(pass_config, pass_number)
+        if unused:
+            logger.info(unused_settings_message(
+                getattr(pipeline_class, "LABEL", pipeline_name), unused))
+        # --compute-type is not used, with a logged warning; --device is (W194 1). The GUI sends
+        # neither for an Ensemble pass.
+        hardware = ignored_hardware_settings(pass_config)
+        if hardware:
+            logger.warning(ignored_hardware_message(
+                getattr(pipeline_class, "LABEL", pipeline_name), hardware))
+        crispasr_kwargs = {
+            "output_dir": output_dir,
+            "temp_dir": str(pass_temp_dir),
+            "keep_temp_files": keep_temp_files,
+            # --debug. The worker carries it in extra_kwargs (the orchestrator's own
+            # settings); pass_config never holds it.
+            "save_metadata_json": bool(extra_kwargs.get("save_metadata_json", False)),
+            "progress_display": None,
+            # None: the pipeline's default model (whisperjav/crispasr/manifest.py).
+            "model_name": pass_config.get("model") or None,
+            # The pipeline's default when the pass names none (TEN VAD for Parakeet, W344; FireRedVAD
+            # for Cohere, W202 3): the one rule main.py's start-up check uses.
+            "speech_segmenter": effective_segmenter_for_pass(
+                pipeline_name, pass_config.get("speech_segmenter")),
+            "language": pass_config.get("language") or "ja",
+            "subs_language": subs_language,
+            # Picks the speech segmenter's preset, as the fidelity or the qwen pipeline does
+            # (W199 DIR1, W202). main.py fills in balanced when the pass names none.
+            "sensitivity": pass_config.get("sensitivity"),
+            # --device (W194 1: A + Metal); None when the user gave none, as the GUI does.
+            "device": pass_config.get("device"),
+            # --passN-vad-threshold, --passN-speech-pad-ms, applied as fidelity (Parakeet) or the
+            # qwen pipeline (Cohere) applies them (W208; pass_settings.segmenter_settings).
+            "vad_threshold": pass_config.get("vad_threshold"),
+            "speech_pad_ms": pass_config.get("speech_pad_ms"),
+            # D3 (design 22.9.1; owner W212 D3, W214 2, W232 8): the scene detector (semantic when
+            # the pass names none), the speech enhancer, Enhance for VAD only, and the Customize
+            # values of the Segmenter and Scene tabs.
+            "scene_detector": pass_config.get("scene_detector") or None,
+            "enhance_for_vad": bool(pass_config.get("enhance_for_vad", False)),
+            # --passN-word-timestamps (1.10.1; owner W411-W414): "model", "aligner", or None for the pipeline's
+            # own default (manifest.word_timestamps_for).
+            "word_timestamps": pass_config.get("word_timestamps") or None,
+        }
+        if pass_config.get("speech_enhancer"):
+            enhancer_backend, enhancer_model = _parse_speech_enhancer(pass_config["speech_enhancer"])
+            crispasr_kwargs["speech_enhancer"] = enhancer_backend
+            crispasr_kwargs["speech_enhancer_model"] = enhancer_model
+        custom = pass_config.get("params") or {}
+        crispasr_kwargs["segmenter_overrides"] = {k: v for k, v in custom.items() if k in SEGMENTER_PARAMS}
+        # R-SCN's settings travel as rscn_<name> keys (owner W450 1; rscn/settings.py); the other scene detectors
+        # do not take them.
+        crispasr_kwargs["scene_params"] = {k: v for k, v in custom.items()
+                                           if k in SCENE_DETECTION_PARAMS or str(k).startswith("rscn_")}
+        # The model's own Customize values (1.10.1; MOSS-CrispASR's MOSS tab, owner W428 I1 4): the pipeline's
+        # MODEL_SETTINGS takes its keys from the whole dict; a pipeline without it ignores them.
+        crispasr_kwargs["model_params"] = dict(custom)
+        if crispasr_speech_pad_ignored(pipeline_name, crispasr_kwargs["speech_segmenter"],
+                                       crispasr_kwargs["speech_pad_ms"]):
+            # Fidelity's own warning, below, for the same case.
+            logger.warning(
+                "Pass %s: the speech pad of %dms is ignored -- the '%s' speech "
+                "segmenter has no speech-pad setting. It pads the start and end of "
+                "each segment separately, at the values this pass's sensitivity chose.",
+                pass_number, max(0, int(crispasr_kwargs["speech_pad_ms"])), crispasr_kwargs["speech_segmenter"],
+            )
+        logger.debug(
+            "[Worker %s] Pass %s: Creating %s with model=%s, speech_segmenter=%s, sensitivity=%s",
+            os.getpid(), pass_number, pipeline_class.__name__,
+            crispasr_kwargs["model_name"] or "(default)", crispasr_kwargs["speech_segmenter"],
+            crispasr_kwargs["sensitivity"],
+        )
+        try:
+            pipeline = pipeline_class(**crispasr_kwargs)
+        except Exception as e:
+            logger.error(
+                "[Worker %s] Pass %s: FAILED to create %s - %s: %s",
+                os.getpid(), pass_number, pipeline_class.__name__, type(e).__name__, e
+            )
+            raise
+        return pipeline
+
+    # v1.9.2: resolve the scene detector BEFORE the config. The resolved parameter NAMES
+    # depend on the backend that will run — semantic reads min_duration / max_duration,
+    # auditok and silero read the _s spellings — so choosing the backend afterwards (as
+    # _apply_gui_overrides does for the "method" key) is too late to fix the names. Same
+    # default as main.py's single-pass path, for the same reason the speech-segmenter
+    # default is mirrored below: the same pipeline+sensitivity must resolve identically
+    # at all three entry points. An explicit --passN-scene-detector still wins.
+    _scene_method = pass_config.get("scene_detector") or DEFAULT_SCENE_DETECTOR
+    if not pass_config.get("scene_detector"):
+        logger.debug(
+            "Pass %s: no scene detector passed; defaulting to %s",
+            pass_number, _scene_method,
+        )
+
+    # --device governs this pass as every other (design 22.3.1, 22.13 detail 15): --device cpu
+    # is absolute; otherwise the pass's Customize Device stands. Taken out of the Customize
+    # values here so apply_custom_params cannot put it back over --device cpu (review P7 finding 2),
+    # and given to the resolver so the CTranslate2 rule and the compute type follow it.
+    custom_params = dict(pass_config.get("params") or {})
+    legacy_device = pass_device(pass_config.get("device"), custom_params.pop("device", None))
 
     resolved_config = resolve_legacy_pipeline(
         pipeline_name=pipeline_name,
         sensitivity=pass_config.get("sensitivity", "balanced"),
         task=asr_task,  # Derived from subs_language above
         overrides=pass_config.get("overrides"),
-        device=pass_config.get("device"),  # None = auto-detect
+        device=legacy_device,  # "auto" = auto-detect
         compute_type=pass_config.get("compute_type"),  # None = auto
+        scene_method=_scene_method,
     )
 
     # Apply source language from pass_config (fixes Issue #104)
@@ -1474,10 +1832,10 @@ def _build_pipeline(
     # Apply GUI-specified overrides for legacy pipelines
     _apply_gui_overrides(resolved_config, pass_config, pass_number)
 
-    if pass_config.get("params"):
+    if custom_params:
         unknown_params = apply_custom_params(
             resolved_config=resolved_config,
-            custom_params=pass_config["params"],
+            custom_params=custom_params,
             pass_number=pass_number,
             pipeline_name=pipeline_name,
         )
@@ -1576,7 +1934,12 @@ def apply_custom_params(
                 # Silero backends read from params["vad"] (legacy path).
                 # Non-Silero backends read from params["speech_segmenter"].
                 seg_backend = params.get("speech_segmenter", {}).get("backend", "silero-v4.0")
-                if seg_backend.startswith("silero"):
+                # v1.9.2: "faster-whisper" is the recognizer's BUILT-IN VAD and its
+                # parameters ARE faster-whisper VadOptions, which FasterWhisperProASR
+                # reads from params["vad"] -- the same place the silero backends use.
+                # Routing them to params["speech_segmenter"] silently dropped every
+                # Customize > Segmenter edit on a balanced pass.
+                if seg_backend.startswith("silero") or seg_backend == "faster-whisper":
                     if "vad" not in params:
                         params["vad"] = {}
                     params["vad"][key] = value
@@ -1608,7 +1971,12 @@ def apply_custom_params(
             elif key in SEGMENTER_PARAMS:
                 # Route segmenter params based on backend type.
                 seg_backend = params.get("speech_segmenter", {}).get("backend", "silero-v4.0")
-                if seg_backend.startswith("silero"):
+                # v1.9.2: "faster-whisper" is the recognizer's BUILT-IN VAD and its
+                # parameters ARE faster-whisper VadOptions, which FasterWhisperProASR
+                # reads from params["vad"] -- the same place the silero backends use.
+                # Routing them to params["speech_segmenter"] silently dropped every
+                # Customize > Segmenter edit on a balanced pass.
+                if seg_backend.startswith("silero") or seg_backend == "faster-whisper":
                     vad_params[key] = value
                     logger.debug("Pass %s: Set vad.%s", pass_number, key)
                 else:
@@ -1639,17 +2007,23 @@ def apply_custom_params(
 
 # Map GUI speech enhancer values to factory-compatible backend names
 # Supports two formats:
-#   1. Legacy: "clearvoice" -> uses default model
-#   2. New:    "clearvoice:MossFormer2_SE_48K" -> backend + specific model
+#   1. Legacy: "bs-roformer" -> uses default model
+#   2. New:    "bs-roformer:vocals" -> backend + specific model
 #   3. FFmpeg DSP: "ffmpeg-dsp:loudnorm,denoise" -> backend + comma-separated effects
 SPEECH_ENHANCER_MAP = {
     "": "none",                 # Empty string -> disabled
     "ffmpeg-dsp": "ffmpeg-dsp", # FFmpeg DSP audio filters
     "none": "none",             # Explicit disable
     "zipenhancer": "zipenhancer",       # ZipEnhancer 16kHz (recommended, lightweight)
-    "clearvoice": "clearvoice", # Default ClearVoice (uses MossFormer2_SE_48K)
     "bs-roformer": "bs-roformer",       # BS-RoFormer vocal isolation
 }
+
+
+def _removed_enhancer_in_pass(pass_config: Dict[str, Any], pass_number: int) -> Optional[str]:
+    """The stop message when this pass names a removed speech enhancer (ClearVoice), else None."""
+    from whisperjav.modules.speech_enhancement.factory import removed_backend_in_pass
+
+    return removed_backend_in_pass(pass_config, pass_number)
 
 
 def _parse_speech_enhancer(enhancer_value: str) -> tuple:
@@ -1658,9 +2032,9 @@ def _parse_speech_enhancer(enhancer_value: str) -> tuple:
 
     Supports formats:
         - "none" -> ("none", None)
-        - "clearvoice" -> ("clearvoice", None)  # Uses factory default
-        - "clearvoice:MossFormer2_SE_48K" -> ("clearvoice", "MossFormer2_SE_48K")
+        - "bs-roformer" -> ("bs-roformer", None)  # Uses factory default
         - "bs-roformer:vocals" -> ("bs-roformer", "vocals")
+        - "ffmpeg-dsp:loudnorm,denoise" -> ("ffmpeg-dsp", "loudnorm,denoise")
 
     Returns:
         Tuple of (backend_name, model_name or None)
@@ -1700,6 +2074,7 @@ SPEECH_SEGMENTER_MAP = {
     "whisper-vad-medium": "whisper-vad-medium",
     "ten": "ten",
     "silero-v6.2": "silero-v6.2",
+    "firered-vad": "firered-vad",  # v1.9.0; installed by default since v1.9.2
     "none": "none",
 }
 
@@ -1753,6 +2128,53 @@ def _apply_gui_overrides(
     # Override speech segmenter if specified
     # Note: ASR modules read from params["speech_segmenter"]["backend"], not params["vad"]["backend"]
     speech_segmenter = pass_config.get("speech_segmenter")
+    # v1.9.0 fix (code-review): CLI ensemble (--passN-pipeline balanced with no
+    # --passN-speech-segmenter) previously skipped this whole block, leaving the
+    # resolver's external-whisperseg default — while `--mode balanced` and the
+    # GUI (which always sends an explicit segmenter) both default to
+    # faster-whisper's NATIVE VAD since the v1.9.0 throughput retune, and
+    # apply_balanced_vad_defaults below keyed off the wrong backend. Default it
+    # here so the same mode+sensitivity resolves identically at all three entry
+    # points. An explicit --passN-speech-segmenter still wins.
+    if pass_config.get("pipeline") == "balanced":
+        # v1.9.2 (S2/S9): a balanced pass has NO external speech segmenter. It runs
+        # faster-whisper's built-in VAD, and the user's choice is which Silero build
+        # that VAD uses (vad_version, below). main.py rejects an external segmenter
+        # for a balanced pass at parse time; this normalisation is what makes the
+        # behaviour true at the point it derives from, including for a stale saved
+        # preset or a hand-written pass_config that never went through argparse.
+        if speech_segmenter and speech_segmenter != BALANCED_DEFAULT_SEGMENTER:
+            logger.warning(
+                "Pass %s: speech segmenter '%s' is not available on the balanced "
+                "pipeline since v1.9.2 -- using faster-whisper's built-in VAD. "
+                "Select the Silero build with the VAD version option.",
+                pass_number, speech_segmenter,
+            )
+        speech_segmenter = BALANCED_DEFAULT_SEGMENTER
+        logger.debug(
+            "Pass %s: balanced pipeline uses %s (built-in VAD)",
+            pass_number, speech_segmenter,
+        )
+    elif effective_segmenter_for_pass(pass_config.get("pipeline"), speech_segmenter) \
+            != speech_segmenter:
+        # Owner, 2026-09-12: a fidelity pass defaults to FireRedVAD.
+        # Without this the block below was skipped entirely, resolve_legacy_pipeline
+        # leaves params["speech_segmenter"] unset, and WhisperProASR's own fallback
+        # decided the backend -- so an ensemble fidelity pass and `--mode fidelity`
+        # resolved to different segmenters. Setting it here also means the pass gets
+        # its per-sensitivity preset resolved below, which the fallback path never
+        # did. An explicit --passN-speech-segmenter still wins.
+        #
+        # The rule itself lives in config/segmenter_presets.effective_segmenter_for_pass
+        # so main.py's start-up model check cannot disagree with what runs here.
+        speech_segmenter = effective_segmenter_for_pass(
+            pass_config.get("pipeline"), speech_segmenter
+        )
+        logger.debug(
+            "Pass %s: fidelity pipeline uses %s (no segmenter specified)",
+            pass_number, speech_segmenter,
+        )
+
     if speech_segmenter is not None:  # Allow empty string for default
         segmenter_backend = SPEECH_SEGMENTER_MAP.get(speech_segmenter, speech_segmenter)
 
@@ -1787,6 +2209,34 @@ def _apply_gui_overrides(
                 "Pass %s: Override speech_segmenter = %s, resolved %d sensitivity params (%s)",
                 pass_number, segmenter_backend, len(segmenter_params), sensitivity,
             )
+
+    # v1.9.0: apply the SHARED balanced VAD defaults so the ensemble path matches
+    # the single-pass path — native faster_whisper_vad preset (scale-correct 0.40,
+    # not the silero 0.28 scale), or Test-D fine-grained grouping for an external
+    # segmenter on the balanced pipeline. Runs AFTER the segmenter backend is set
+    # above and BEFORE the explicit vad_threshold / speech_pad_ms overrides below
+    # (and apply_custom_params later), all of which still win.
+    apply_balanced_vad_defaults(
+        resolved_config,
+        sensitivity=pass_config.get("sensitivity", "balanced"),
+        is_balanced=(pass_config.get("pipeline") == "balanced"),
+    )
+
+    # v1.9.2 (S6-S8): which Silero build the built-in VAD runs for this pass.
+    # apply_balanced_vad_defaults above already put the preset's version
+    # (DEFAULT_VAD_VERSION, 4.0 since 2026-09-12) into
+    # params["vad"]; an explicit --passN-vad-version / GUI choice wins. Runs after
+    # that call for exactly that reason. FasterWhisperProASR reads it and installs
+    # the adapter inside the process that hosts the model.
+    vad_version = pass_config.get("vad_version")
+    if vad_version and pass_config.get("pipeline") == "balanced":
+        # Balanced ONLY. For any other pipeline params["vad"] is the external Silero
+        # segmenter's parameter block, which is merged into that segmenter's
+        # constructor config (whisper_pro_asr.py) -- and SileroSpeechSegmenter has a
+        # constructor parameter of its own literally called `version`. Writing a
+        # built-in-VAD key into a shared block is how that kind of collision starts.
+        resolved_config.setdefault("params", {}).setdefault("vad", {})["version"] = vad_version
+        logger.debug("Pass %s: Override vad_version = Silero v%s", pass_number, vad_version)
 
     # Override speech enhancer if specified
     speech_enhancer = pass_config.get("speech_enhancer")
@@ -1836,4 +2286,31 @@ def _apply_gui_overrides(
         if "speech_segmenter" not in resolved_config["params"]:
             resolved_config["params"]["speech_segmenter"] = {}
         resolved_config["params"]["speech_segmenter"]["speech_pad_ms"] = speech_pad_ms
-        logger.debug("Pass %s: Override speech_pad_ms = %s", pass_number, speech_pad_ms)
+        # Same check as main.py: the factory silently drops speech_pad_ms for a
+        # backend whose schema has no such key (firered-vad, ten), so a pass that
+        # carries the GUI's "Speech pad" value must say when it will not be used.
+        _seg_backend = (resolved_config["params"].get("speech_segmenter") or {}).get("backend")
+        if segmenter_accepts(_seg_backend, "speech_pad_ms"):
+            logger.debug("Pass %s: Override speech_pad_ms = %s", pass_number, speech_pad_ms)
+        else:
+            logger.warning(
+                "Pass %s: the speech pad of %dms is ignored -- the '%s' speech "
+                "segmenter has no speech-pad setting. It pads the start and end of "
+                "each segment separately, at the values this pass's sensitivity chose.",
+                pass_number, speech_pad_ms, _seg_backend,
+            )
+
+    # C11 (owner): ONE INFO line per pass naming the VAD that will run. Same reason as
+    # main.py -- the recognizer is rebuilt on every model refresh, so the line belongs at
+    # the entry point, not in the recognizer's constructor. Last in this function, so it
+    # reports the values after every override above.
+    if (resolved_config.get("params", {}).get("speech_segmenter") or {}).get("backend") == "faster-whisper":
+        _v = resolved_config.get("params", {}).get("vad") or {}
+        _thr = _v.get("threshold")
+        logger.info(
+            "Pass %s VAD: Silero v%s, threshold %s",
+            pass_number,
+            _v.get("version", DEFAULT_VAD_VERSION),
+            f"{_thr:.2f}" if isinstance(_thr, (int, float)) else "default",
+        )
+

@@ -201,11 +201,10 @@ def get_instruction_content(tone: str = 'standard', refresh: bool = False) -> Op
     """
     Get instruction content with fallback strategy.
 
-    Strategy:
+    Strategy (1.9.4 + user override):
     1. User custom file (settings dir /instructions/<tone>.txt) — always wins
-    2. Fetch from Gist (with ETag caching)
-    3. Load from cache (if fetch fails or not modified)
-    4. Load bundled default (if all else fails)
+    2. Load the bundled default
+    3. Only if it is missing: fetch from Gist (with ETag caching), then the cache
 
     Args:
         tone: Instruction tone (standard, pornify, etc.)
@@ -220,6 +219,14 @@ def get_instruction_content(tone: str = 'standard', refresh: bool = False) -> Op
     if user_content is not None:
         logger.info(f"Using user custom instructions: {get_user_instruction_path(tone)}")
         return user_content
+
+    # 1.9.4 (WP-001, owner 2026-10-06): the bundled file comes first. It carries
+    # {LANG}, which this version fills in (core.fill_target_language); the Gists
+    # stay as they are for 1.9.3, which reads them and would not fill it. The Gist
+    # and its cache are used only if the bundled file is missing.
+    bundled = load_bundled_default(tone)
+    if bundled:
+        return bundled
 
     # Get URL for this tone
     url = DEFAULT_INSTRUCTION_URLS.get(tone)

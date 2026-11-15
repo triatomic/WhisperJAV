@@ -22,7 +22,7 @@ Pipelines that:
 - Use the `resolve_legacy_pipeline()` function for configuration
 - Accept `resolved_config` parameter in their __init__
 - Rely on the v3 config structure with model, params, and features sections
-- Examples: balanced, fast, faster, fidelity, kotoba-faster-whisper
+- Examples: balanced, fast, faster, fidelity
 
 WHAT DOES NOT BELONG HERE
 -------------------------
@@ -49,6 +49,7 @@ for backward compatibility.
 from typing import Any, Dict, List, Optional
 
 from .resolver_v3 import resolve_config_v3
+from whisperjav.utils.logger import logger
 
 
 def _filter_none_values(params: Dict[str, Any]) -> Dict[str, Any]:
@@ -98,14 +99,35 @@ LEGACY_PIPELINES = {
         # NOTE: this `vad` field names a VAD Pydantic component (registry has
         # only "silero" — defines the preset values that flow into
         # params["vad"]). It is NOT the runtime speech-segmenter backend
-        # selector. The runtime segmenter default (v1.8.13: whisperseg) is
-        # set in whisper_pro_asr.py / faster_whisper_pro_asr.py fallbacks
-        # and gates params["vad"] via the firewall (clears silero presets
-        # for non-silero runtime backends). Keep this as silero-v3.1 so the
-        # resolver loads the v3.1 preset values; the firewall handles the
-        # rest when whisperseg becomes the runtime default.
+        # selector. The runtime segmenter default is decided by the entry point
+        # (main.py / ensemble/pass_worker.py) from the shared constants in
+        # config/segmenter_presets.py -- balanced: the built-in VAD; fidelity:
+        # firered-vad since 2026-09-12 -- with the ASR modules' own fallbacks
+        # behind them, and gates params["vad"] via the firewall (clears silero
+        # presets for non-silero runtime backends). Keep this as silero-v3.1 so
+        # the resolver loads the v3.1 preset values; the firewall handles the rest.
         "vad": "silero-v3.1",
         "features": ["auditok_scene_detection"],
+        # v1.9.2 (owner decision): Balanced scenes are at least 28 s and at most 240 s
+        # (4 minutes) on the semantic detector, at every sensitivity. The ceiling was 20
+        # minutes until 2026-09-11; measured on a 179-minute film, 1200 s left 60% of the
+        # film in scenes over 240 s, and each such scene is decoded as one long chain of
+        # 30 s recogniser windows. The keys differ by backend because the backends read
+        # different names, and 28 is only SAFE on semantic, whose min_duration merges. On
+        # auditok min_duration DISCARDS shorter regions, so only the ceiling is set there,
+        # and auditok's own ceiling deliberately stays at 20 minutes (owner decision:
+        # semantic first; other backends after user feedback). fast declares nothing here
+        # and keeps the backend's own defaults.
+        "scene_overrides": {
+            "semantic": {
+                "scene_detection.min_duration": 28.0,
+                "scene_detection.max_duration": 240.0,
+            },
+            "auditok": {
+                "scene_detection.max_duration_s": 1200.0,
+                "scene_detection.pass1_max_duration_s": 1200.0,
+            },
+        },
         "description": "Full feature set with scene detection and VAD. Best quality.",
     },
     "faster": {
@@ -122,22 +144,126 @@ LEGACY_PIPELINES = {
     },
     "fidelity": {
         "asr": "openai_whisper",
-        # See balanced note above — same architecture applies.
+        # See balanced note above — same architecture applies. Fidelity's RUNTIME
+        # segmenter is FIDELITY_DEFAULT_SEGMENTER (firered-vad since 2026-09-12),
+        # not this field.
         "vad": "silero-v3.1",
         "features": ["auditok_scene_detection"],
+        # v1.9.2 (owner decision 2026-09-11): Fidelity's semantic scenes are at least 28 s
+        # and at most 240 s at every sensitivity, the same bounds as Balanced, because
+        # OpenAI Whisper decodes a scene as the same chain of 30 s windows.
+        #
+        # The ceiling LOOSENS the aggressive preset (180 s -> 240 s) and tightens the other
+        # two (420 s -> 240 s). The floor replaces the semantic presets' 30/20/10 s.
+        # Measured on SNOS-388 (a 116-minute film) on 2026-09-11: at the aggressive floor
+        # of 10 s the pass cut 252 scenes, 187 of them under 30 s, and a scene under 30 s
+        # cost 0.36 s of compute per second of audio against 0.12 s for a scene over 120 s,
+        # so 47% of the audio took 64% of the pass. A short scene still costs a whole
+        # padded 30 s window.
+        #
+        # 28 is only SAFE on the semantic detector, whose min_duration merges short pieces
+        # into their neighbour. On auditok min_duration DISCARDS a shorter region, which
+        # would lose speech, so nothing is set for auditok here.
+        "scene_overrides": {
+            "semantic": {
+                "scene_detection.min_duration": 28.0,
+                "scene_detection.max_duration": 240.0,
+            },
+        },
         "description": "OpenAI Whisper with VAD and scene detection. Maximum fidelity.",
-    },
-    "kotoba-faster-whisper": {
-        "asr": "kotoba_faster_whisper",
-        "vad": "none",  # Uses internal VAD (faster-whisper built-in)
-        "features": ["auditok_scene_detection"],  # Scene detection always enabled
-        "description": "Japanese-optimized Kotoba Faster-Whisper with internal VAD.",
-        "use_v3_structure": True,  # Return V3 config, not legacy mapped
     },
     # NOTE: "transformers" mode is NOT listed here.
     # It uses dedicated --hf-* CLI arguments and bypasses legacy config resolution entirely.
     # See whisperjav/pipelines/transformers_pipeline.py for its implementation.
 }
+
+
+# Scene-detection feature component per runtime backend (v1.9.2).
+#
+# Before v1.9.2 every scene-detecting pipeline declared "auditok_scene_detection"
+# regardless of --scene-detection-method, so a semantic run was handed auditok's
+# parameter names (max_duration_s, min_duration_s, pass1_*) and silently fell back to
+# the engine's own hard-coded defaults -- the semantic backend reads min_duration /
+# max_duration without the _s suffix and ignores the rest.
+#
+# Resolving the feature from the effective method also closes a trap that appears once
+# a semantic component exists: the auditok backend falls back to the bare names when
+# the _s ones are absent, and its min_duration DISCARDS shorter regions, so handing
+# auditok a semantic min_duration of 28 would delete every region under 28 seconds.
+SCENE_FEATURE_BY_METHOD = {
+    "auditok": "auditok_scene_detection",
+    "silero": "silero_scene_detection",
+    "semantic": "semantic_scene_detection",
+    "none": None,          # no scene detection feature at all
+}
+
+_SCENE_FEATURE_NAMES = frozenset(
+    name for name in SCENE_FEATURE_BY_METHOD.values() if name
+)
+
+_METHOD_BY_SCENE_FEATURE = {
+    feature: method
+    for method, feature in SCENE_FEATURE_BY_METHOD.items()
+    if feature
+}
+
+
+def _select_scene_feature(
+    declared_features: List[str],
+    scene_method: Optional[str],
+) -> List[str]:
+    """Swap the declared scene-detection feature for the one matching ``scene_method``.
+
+    A pipeline that declares NO scene-detection feature (``faster``) never gains one,
+    whatever the method says -- it has no scene detector to configure. An unknown
+    method leaves the declaration untouched rather than guessing.
+
+    CONTRACT for ``scene_method="none"``: the scene feature is removed, so the resolved
+    config carries no ``features["scene_detection"]`` at all. The caller must then set
+    ``{"method": "none"}`` itself, because ``SceneDetectorFactory`` falls back to auditok
+    when no method is present. The ensemble worker does exactly that
+    (``_apply_gui_overrides``); ``--scene-detection-method`` deliberately does not offer
+    "none", so the single-pass path cannot reach this case.
+    """
+    if not scene_method:
+        return list(declared_features)
+
+    key = str(scene_method).strip().lower()
+    if key not in SCENE_FEATURE_BY_METHOD:
+        logger.warning(
+            "Unknown scene detection method '%s'; keeping the pipeline's declared "
+            "scene feature(s) %s", scene_method, list(declared_features),
+        )
+        return list(declared_features)
+
+    declares_scene = any(f in _SCENE_FEATURE_NAMES for f in declared_features)
+    if not declares_scene:
+        return list(declared_features)
+
+    kept = [f for f in declared_features if f not in _SCENE_FEATURE_NAMES]
+    target = SCENE_FEATURE_BY_METHOD[key]
+    if target:
+        kept.append(target)
+    return kept
+
+
+def _normalise_scene_method(
+    scene_method: Optional[str],
+    declared_features: List[str],
+) -> str:
+    """The method whose parameter names this resolution will produce.
+
+    Falls back to whatever the pipeline declares, so callers that pass no method keep
+    exactly the pre-v1.9.2 behaviour.
+    """
+    if scene_method:
+        key = str(scene_method).strip().lower()
+        if key in SCENE_FEATURE_BY_METHOD:
+            return key
+    for feature in declared_features:
+        if feature in _METHOD_BY_SCENE_FEATURE:
+            return _METHOD_BY_SCENE_FEATURE[feature]
+    return "none"
 
 
 def resolve_legacy_pipeline(
@@ -147,6 +273,7 @@ def resolve_legacy_pipeline(
     overrides: Optional[Dict[str, Any]] = None,
     device: Optional[str] = None,
     compute_type: Optional[str] = None,
+    scene_method: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Resolve configuration from legacy pipeline name.
@@ -154,12 +281,19 @@ def resolve_legacy_pipeline(
     This provides backward compatibility with the old CLI interface.
 
     Args:
-        pipeline_name: Legacy pipeline name ('balanced', 'faster', 'fast', 'fidelity', 'kotoba-faster-whisper')
+        pipeline_name: Legacy pipeline name ('balanced', 'faster', 'fast', 'fidelity')
         sensitivity: Sensitivity level
         task: Task type
         overrides: Parameter overrides
         device: Device override (None/'auto' = auto-detect, 'cuda'/'cpu' = explicit)
         compute_type: Compute type override (None/'auto' = provider-specific default)
+        scene_method: Scene-detection backend that will actually run ('auditok',
+            'silero', 'semantic', 'none'). v1.9.2: selects the matching scene feature
+            component so the resolved parameter NAMES are the ones that backend reads,
+            and selects the pipeline's per-backend scene overrides. None means "whatever
+            the pipeline declares" (auditok for the legacy pipelines) -- the feature list
+            is left alone, and that backend's scene overrides still apply, because they
+            describe the backend that will actually run.
 
     Returns:
         Resolved configuration dictionary.
@@ -175,14 +309,27 @@ def resolve_legacy_pipeline(
 
     pipeline_def = LEGACY_PIPELINES[pipeline_name]
 
+    # v1.9.2: the scene-detection feature follows the backend that will actually run,
+    # so the resolved parameter names match the backend that reads them.
+    features = _select_scene_feature(pipeline_def["features"], scene_method)
+
+    # v1.9.2: a pipeline may declare its own scene bounds, per backend, because the
+    # parameter NAMES differ between backends. Merged under any caller overrides, which
+    # keep precedence.
+    effective_overrides = dict(pipeline_def.get("scene_overrides", {}).get(
+        _normalise_scene_method(scene_method, pipeline_def["features"]), {}
+    ))
+    if overrides:
+        effective_overrides.update(overrides)
+
     # Resolve using new system
     config = resolve_config_v3(
         asr=pipeline_def["asr"],
         vad=pipeline_def["vad"],
         sensitivity=sensitivity,
         task=task,
-        features=pipeline_def["features"],
-        overrides=overrides,
+        features=features,
+        overrides=effective_overrides or None,
         device=device,
         compute_type=compute_type,
     )
@@ -190,11 +337,6 @@ def resolve_legacy_pipeline(
     # Add legacy compatibility fields
     config['pipeline_name'] = pipeline_name
     config['sensitivity_name'] = sensitivity
-
-    # For pipelines that use V3 structure (like kotoba-faster-whisper),
-    # return V3 config directly without legacy mapping
-    if pipeline_def.get("use_v3_structure", False):
-        return config
 
     # Map to old output structure for backward compatibility
     return _map_to_legacy_structure(config, pipeline_def)
@@ -338,6 +480,7 @@ def _map_to_legacy_structure(config: Dict[str, Any], pipeline_def: Dict[str, Any
         'sensitivity_name': config['sensitivity_name'],
         'workflow': workflow,
         'model': config['model'],
+        'run_device': config.get('run_device'),  # the speech enhancer follows it (resolver_v3)
         'params': {
             'decoder': filtered_decoder,
             'provider': filtered_provider,
@@ -452,3 +595,75 @@ def get_legacy_pipeline_info(pipeline_name: str) -> Dict[str, Any]:
         'name': pipeline_name,
         **LEGACY_PIPELINES[pipeline_name]
     }
+
+
+def apply_balanced_vad_defaults(
+    resolved_config: Dict[str, Any],
+    sensitivity: str = "balanced",
+    is_balanced: bool = False,
+) -> None:
+    """
+    Apply the v1.9.0 balanced-pipeline VAD defaults to a resolved config, IN PLACE.
+
+    SHARED by the single-pass path (main.py) and the ensemble path
+    (ensemble/pass_worker.py) so the two cannot drift. Behaviour:
+
+    * speech_segmenter backend == "faster-whisper"  → overlay the tuned
+      ``faster_whisper_vad`` VadOptions preset (threshold scaled for
+      faster-whisper's BUNDLED Silero, e.g. balanced=0.40 — NOT the external
+      silero-v3.1/v6.2 scale, e.g. 0.28, which over-triggers here).
+    * ``is_balanced`` AND an EXTERNAL segmenter selected → "Test D" fine-grained
+      grouping default (max_group_duration_s=9.0, chunk_threshold_s=0.1), the
+      best-quality config from the owner A/B (2026-06-30).
+
+    The effective backend is read from
+    ``resolved_config["params"]["speech_segmenter"]["backend"]``. Call this AFTER
+    the backend is set and BEFORE explicit user overrides (CLI flags / GUI
+    Customize params), which must win over these defaults.
+
+    Args:
+        resolved_config: Resolved config dict (mutated in place).
+        sensitivity: Sensitivity level for the native VAD preset lookup.
+        is_balanced: True iff this is the balanced pipeline/mode (gates Test-D).
+    """
+    params = resolved_config.setdefault("params", {})
+    backend = (params.get("speech_segmenter") or {}).get("backend")
+
+    if backend == "faster-whisper":
+        # Native VAD: use the scale-correct faster_whisper_vad preset.
+        try:
+            from whisperjav.config.components.base import get_vad_registry
+            fw_vad = get_vad_registry().get("faster_whisper_vad")
+            preset = fw_vad.get_preset(sensitivity) if fw_vad else None
+            if preset is not None:
+                params["vad"] = preset.model_dump()
+                logger.debug(
+                    "apply_balanced_vad_defaults: native faster_whisper_vad preset "
+                    "(sensitivity=%s): %s", sensitivity, params["vad"],
+                )
+            else:
+                logger.warning(
+                    "faster_whisper_vad preset not found for sensitivity '%s'; "
+                    "native VAD will use faster-whisper library defaults", sensitivity,
+                )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Could not apply faster_whisper_vad preset: %s", e)
+
+    elif is_balanced and backend not in (None, "", "none"):
+        # Balanced + external segmenter → Test-D fine-grained grouping default.
+        #
+        # UNREACHABLE since v1.9.2 (owner S2/S9): both entry points normalise a balanced
+        # pipeline to the built-in VAD before calling this, so `backend` is always
+        # "faster-whisper" here and the first branch takes it. Kept, not deleted, because
+        # this helper is the shared contract for both entry points and the branch would
+        # be the correct behaviour again if balanced ever regained a segmenter.
+        vad = params.setdefault("vad", {})
+        ss = params.setdefault("speech_segmenter", {})
+        vad["max_group_duration_s"] = 9.0
+        vad["chunk_threshold_s"] = 0.1
+        ss["max_group_duration_s"] = 9.0
+        ss["chunk_threshold_s"] = 0.1
+        logger.info(
+            "Balanced + external segmenter '%s': Test-D grouping defaults applied "
+            "(max_group=9.0s, chunk_threshold=0.1s)", backend,
+        )

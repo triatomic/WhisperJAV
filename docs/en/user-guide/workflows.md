@@ -46,7 +46,7 @@ Dedicated pipeline using models trained on anime and JAV dialogue.
 4. Click **Start**
 
 !!! tip
-    For maximum quality, use anime-whisper in Pass 1 and Qwen3-ASR in Pass 2 with Smart Merge.
+    For maximum quality, tick Pass 2: since 1.9.5 the Ensemble tab starts with Qwen3-ASR (FireRedVAD) in Pass 1 and Anime-Whisper (TEN VAD) in Pass 2, both on Aggressive.
 
 ---
 
@@ -93,21 +93,19 @@ Process an entire folder of videos at once.
 Files are processed sequentially. Each output SRT is saved next to its source video (or to your chosen output directory).
 
 !!! tip "Serial Ensemble Mode"
-    In Ensemble mode, enable **Serial** mode to complete each file fully (Pass 1 → Pass 2 → Merge) before starting the next. This lets you see results as they finish instead of waiting for the entire batch.
+    In Ensemble mode, **Finish each file** (ticked by default) completes each file fully (Pass 1 → Pass 2 → Merge) before starting the next. This lets you see results as they finish instead of waiting for the entire batch.
 
 ---
 
-## CPU-Only Mode (No GPU)
+## Without a GPU
 
-WhisperJAV works without a GPU, just slower.
+WhisperJAV works without a GPU, just slower. Choose **CPU only** when you install; every run then uses the CPU, with nothing to tick. On a GPU install, `--device cpu` runs one job on the CPU.
 
-1. Go to the **Advanced** tab
-2. Check **"Accept CPU-only mode"**
-3. Use **Faster** mode for the best speed without GPU
-4. Click **Start**
+1. Use **Faster** mode for the best speed without a GPU
+2. Click **Start**
 
 !!! warning
-    CPU mode is 5-10x slower than GPU mode. A 2-hour video may take 30-60 minutes.
+    On the CPU, transcription is several times slower than on a GPU.
 
 ---
 

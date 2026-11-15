@@ -22,7 +22,7 @@ import time
 
 import torch
 
-from whisperjav.utils.logger import logger
+from whisperjav.utils.logger import hide_weight_loading_bar, logger
 
 # Suppress specific transformers warnings that are informational only
 warnings.filterwarnings("ignore", message=".*chunk_length_s.*is very experimental.*")
@@ -115,11 +115,11 @@ class TransformersASR:
     def _detect_device(self) -> str:
         """Detect best available device."""
         if self.device_request == "auto":
-            if torch.cuda.is_available():
-                return "cuda:0"
-            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                return "mps"
-            return "cpu"
+            # Through device_detector, as every other PyTorch part (design 22.3.1, owner W237 1):
+            # its test of a card this PyTorch has no code for (#411) applies here too.
+            from whisperjav.utils.device_detector import get_best_device
+            best = get_best_device()
+            return "cuda:0" if best == "cuda" else best
         elif self.device_request == "cuda":
             if torch.cuda.is_available():
                 return "cuda:0"
@@ -162,6 +162,8 @@ class TransformersASR:
 
         import os
         from transformers import pipeline
+
+        hide_weight_loading_bar()   # owner W509, console item 3: the "Loading weights" bar only with --debug
 
         # Detect device and dtype
         self._device = self._detect_device()

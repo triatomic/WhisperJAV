@@ -29,14 +29,11 @@
 #   - whisperjav/installer/ - Unified installer module
 #
 # Options (forwarded to install.py):
-#   --cpu-only              Install CPU-only PyTorch
-#   --cuda VERSION          Install PyTorch for specific CUDA (e.g. cu118, cu124, cu128)
+#   --accelerator NAME      What this install is made for: nvidia, own-pytorch or cpu
+#                           (without it: a supported NVIDIA GPU is used, otherwise it asks)
 #   --no-speech-enhancement Skip speech enhancement packages
 #   --minimal               Minimal install (transcription only)
 #   --dev                   Install in development/editable mode
-#   --local-llm             Install local LLM support (prebuilt wheel)
-#   --local-llm-build       Install local LLM support (build from source)
-#   --no-local-llm          Skip local LLM installation
 #   --help                  Show help message
 #
 # Author: Senior Architect
@@ -124,6 +121,14 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     exit 1
 fi
 
+# Is this computer supported by WhisperJAV 1.10? First, before asking for anything else
+# (design 22.1.2, owner W233 R6): the same check install.py makes, run with this system's python3.
+if command -v python3 &>/dev/null; then
+    if ! python3 -I "$REPO_ROOT/whisperjav/installer/core/supported.py"; then
+        exit 1
+    fi
+fi
+
 echo "============================================================"
 echo "  WhisperJAV Linux Installation (via install.py)"
 echo "============================================================"
@@ -132,7 +137,7 @@ echo ""
 # Check for Python
 if ! command -v python3 >/dev/null 2>&1; then
     echo -e "${RED}Error: Python 3 is not installed.${NC}"
-    echo "Please install Python 3.10-3.12 first:"
+    echo "Please install Python 3.13 first:"
     echo "  Debian/Ubuntu: sudo apt-get install python3 python3-pip python3-venv"
     echo "  Fedora/RHEL:   sudo dnf install python3 python3-pip"
     echo "  Arch Linux:    sudo pacman -S python python-pip"
@@ -256,6 +261,30 @@ if [[ -f "$LAUNCHER" ]]; then
 fi
 echo "  Or from Terminal:"
 echo -e "    ${GREEN}whisperjav-gui${NC}"
+echo ""
+
+# --------------------------------------------------------------------------
+# GUI backend note (#366). The system WebKit packages are not enough on their
+# own: pywebview ships no Linux backend by default, and apt/dnf packages land
+# system-wide where a plain virtual environment cannot see them. This prints
+# the two routes from docs/en/guides/installation_linux.md -- it installs
+# nothing, because which route is right depends on the user's environment.
+# --------------------------------------------------------------------------
+echo -e "${YELLOW}  If the window does not open, and you see this instead:${NC}"
+echo -e "${YELLOW}    ModuleNotFoundError: No module named 'gi'${NC}"
+echo ""
+echo "  ...then the part that draws the window is missing. Your Linux distribution"
+echo "  may have installed it system-wide, but Python cannot see it from here."
+echo "  Either of these fixes it. The first is simpler:"
+echo ""
+echo -e "    ${GREEN}pip install \"pywebview[qt]\"${NC}"
+echo "        Installs everything needed. Nothing else to set up."
+echo ""
+echo -e "    ${GREEN}python3 -m venv --system-site-packages whisperjav-env${NC}"
+echo "        Rebuilds your Python environment so it can see what your"
+echo "        distribution already installed. Use this if you prefer GTK."
+echo ""
+echo "  Step-by-step guide: docs/en/guides/installation_linux.md"
 echo ""
 
 exit 0

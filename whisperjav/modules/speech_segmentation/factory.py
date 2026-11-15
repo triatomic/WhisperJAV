@@ -29,7 +29,7 @@ _BACKEND_REGISTRY: Dict[str, str] = {
     "ten": "whisperjav.modules.speech_segmentation.backends.ten.TenSpeechSegmenter",
     "silero-v6.2": "whisperjav.modules.speech_segmentation.backends.silero_v6.SileroV6SpeechSegmenter",
     "whisperseg": "whisperjav.modules.speech_segmentation.backends.whisperseg.WhisperSegSpeechSegmenter",
-    "firered": "whisperjav.modules.speech_segmentation.backends.firered.FireRedSpeechSegmenter",
+    "firered-vad": "whisperjav.modules.speech_segmentation.backends.firered_vad.FireRedVadSpeechSegmenter",
     "none": "whisperjav.modules.speech_segmentation.backends.none.NullSpeechSegmenter",
 }
 
@@ -66,15 +66,17 @@ _BACKEND_DEPENDENCIES: Dict[str, Dict[str, Any]] = {
         "install_hint": "pip install whisperjav[whisperseg] (or whisperjav[whisperseg-gpu] for CUDA)",
         "always_available": False,
     },
+    # v1.9.0 (installed by default since v1.9.2). Exact key required: the base-name fallback below
+    # would otherwise resolve "firered-vad" to unknown base "firered".
+    "firered-vad": {
+        "packages": ["fireredvad"],
+        "install_hint": "pip install fireredvad",
+        "always_available": False,
+    },
     "whisper": {
         "packages": ["faster_whisper"],
         "install_hint": "pip install faster-whisper",
         "always_available": True,  # faster-whisper already required by WhisperJAV
-    },
-    "firered": {
-        "packages": ["fireredvad"],
-        "install_hint": "pip install fireredvad",
-        "always_available": False,
     },
     "none": {
         "packages": [],
@@ -104,6 +106,7 @@ _PARAM_SCHEMAS = {
         "end_pad_ms":              (int,   200,   False),  # v1.8.12: 150→200 (YAML balanced)
         "chunk_threshold_s":       (float, 1.0,   True),
         "max_group_duration_s":    (float, 6.0,   True),   # v1.8.12: 29.0→6.0 (YAML balanced)
+        "min_group_duration_s":    (float, None,  True),   # 1.10.1 (W426 3): shortest group; None/0 = off
     },
     "silero": {
         # All nullable: backend SileroSpeechSegmenter consumes None values via
@@ -131,6 +134,7 @@ _PARAM_SCHEMAS = {
         "use_max_poss_sil_at_max_speech":   (bool,  True, False),
         "chunk_threshold_s":                (float, 1.5,  True),   # v1.8.12: 1.0→1.5 (YAML balanced)
         "max_group_duration_s":             (float, 6.0,  True),   # v1.8.12: 29.0→6.0 (YAML balanced)
+        "min_group_duration_s":             (float, None, True),   # 1.10.1 (W426 3): shortest group; None/0 = off
     },
     "whisper-vad": {
         "no_speech_threshold":     (float, 0.6,   False),
@@ -154,26 +158,48 @@ _PARAM_SCHEMAS = {
     },
     "whisperseg": {
         "threshold":               (float, 0.35, False),
+        "neg_threshold":           (float, None, True),   # v1.9.0: decoupled offset threshold (None=derive from threshold)
+        "speech_start_threshold":  (float, None, True),   # v1.9.0 "3a": refined display-start threshold (None=disabled)
+        "force_split_mode":        (str,   "dip", False),  # v1.9.0: "dip" (smart split) | "chop" (vendor-faithful reset)
+        "segmentation_decoder":    (str,   "hysteresis", False),  # v1.9.0: "hysteresis" | "offline" (two-level TEN-shape)
+        "grow_floor":              (float, 0.05, False),   # v1.9.0 offline: edge-growth floor (capture-vs-cut dial)
+        "gap_merge_ms":            (int,   350,  False),   # v1.9.0 offline: gaps >= this become cuts; shorter merge
+        "split_smooth_ms":         (int,   120,  False),   # v1.9.0 offline: smoothing window for overlong-split minima
+        "dip_search_from":         (float, 0.6,  False),   # v1.9.4 hysteresis "dip" split: search start (fraction)
+        "dip_accept_any":          (bool,  False, False),  # v1.9.4 hysteresis "dip" split: cut at the lowest point always
         "min_speech_duration_ms":  (int,   100,  False),
         "min_silence_duration_ms": (int,   100,  False),
-        "speech_pad_ms":           (int,   300,  False),
+        "speech_pad_ms":           (int,   300,  False),  # Symmetric fallback for start/end pad
+        "start_pad_ms":            (int,   100,  True),   # v1.9.0: asymmetric pad (qwen/anime default)
+        "end_pad_ms":              (int,   200,  True),   # v1.9.0: asymmetric pad (qwen/anime default)
         "max_speech_duration_s":   (float, 5.0,  True),   # v1.8.12: None→5.0 (YAML balanced, explicit)
         "chunk_threshold_s":       (float, 1.0,  True),
         "max_group_duration_s":    (float, 6.0,  True),   # v1.8.12: None→6.0 (YAML balanced)
+        "min_group_duration_s":    (float, None, True),   # 1.10.1 (W426 3): shortest group; None/0 = off
         "force_cpu":               (bool,  False, False),
         "num_threads":             (int,   1,    False),
     },
-    "firered": {
-        "threshold":               (float, 0.4,  False),
-        "min_speech_duration_ms":  (int,   150,  False),
-        "min_silence_duration_ms": (int,   150,  False),
-        "speech_pad_ms":           (int,   100,  False),
-        "max_speech_duration_s":   (float, 5.0,  True),
-        "chunk_threshold_s":       (float, 1.0,  True),
-        "max_group_duration_s":    (float, 6.0,  True),
-        "smooth_window_size":      (int,   5,    False),
+    # v1.9.0 FireRedVAD (DFSMN, ~0.6M params); installed by default since v1.9.2. Detection defaults
+    # mirror upstream README (speech_threshold 0.4, min speech/silence 200ms);
+    # max_speech is JAV-capped at 6s (upstream default 20s produced ~9s segments
+    # in owner testing — JAV utterances rarely exceed ~5s). Upstream splits
+    # overlong runs at the lowest-probability frame, so the cap only affects
+    # segments that exceed it. Grouping matches the other backends' balanced.
+    "firered-vad": {
+        "threshold":               (float, 0.4,   False),
+        "smooth_window_size":      (int,   5,     False),
+        "min_speech_duration_ms":  (int,   200,   False),
+        "min_silence_duration_ms": (int,   200,   False),
+        "max_speech_duration_s":   (float, 6.0,   True),
+        "start_pad_ms":            (int,   50,    False),
+        "end_pad_ms":              (int,   150,   False),
+        "chunk_threshold_s":       (float, 1.0,   True),
+        "max_group_duration_s":    (float, 6.0,   True),
+        "min_group_duration_s":    (float, None,  True),   # 1.10.1 (W426 3): shortest group; None/0 = off
         "use_gpu":                 (bool,  False, False),
-        "model_dir":               (str,   None, True),
+        # A model directory the user downloaded themselves. Nullable with no
+        # default: absent or None means "use the cache, then download".
+        "model_dir":               (str,   None,  True),
     },
 }
 
@@ -209,7 +235,7 @@ class SpeechSegmenterFactory:
     @staticmethod
     def list_unique_backends() -> List[str]:
         """Return list of unique backend names (without version aliases)."""
-        return ["silero", "nemo", "whisper", "ten", "whisperseg", "firered", "none"]
+        return ["silero", "nemo", "whisper", "ten", "whisperseg", "firered-vad", "none"]
 
     @staticmethod
     def is_backend_available(name: str) -> Tuple[bool, str]:
@@ -267,11 +293,11 @@ class SpeechSegmenterFactory:
             "silero-v6.2": "Silero VAD v6.2",
             "ten": "TEN VAD",
             "whisperseg": "WhisperSeg (JA-ASMR)",
-            "firered": "FireRedVAD",
+            "firered-vad": "FireRedVAD",
             "none": "None (Skip)",
         }
 
-        for name in ["silero", "silero-v3.1", "silero-v6.2", "nemo-lite", "nemo-diarization", "whisper-vad", "whisper-vad-tiny", "whisper-vad-medium", "ten", "whisperseg", "firered", "none"]:
+        for name in ["silero", "silero-v3.1", "silero-v6.2", "nemo-lite", "nemo-diarization", "whisper-vad", "whisper-vad-tiny", "whisper-vad-medium", "ten", "whisperseg", "firered-vad", "none"]:
             available, hint = SpeechSegmenterFactory.is_backend_available(name)
             backends.append({
                 "name": name,

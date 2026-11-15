@@ -59,7 +59,8 @@ spec:
   # NOTE: silero v3.1/v4.0 library does not enforce max_speech_duration_s
   # internally — it is stored on the segmenter for config compatibility but
   # never forwarded to the model. Only max_group_duration_s is enforced here.
-  max_speech_duration_s: 5
+  # v1.9.2 (owner O3): 5 -> 6. Display-only for this backend, per the note above.
+  max_speech_duration_s: 6
 
   # --- Segment Grouping ---
   chunk_threshold_s: 2.5
@@ -81,7 +82,7 @@ presets:
     threshold: 0.41
     min_speech_duration_ms: 150
     min_silence_duration_ms: 300
-    max_speech_duration_s: 6
+    max_speech_duration_s: 7          # v1.9.2 (owner O3): 6 -> 7
     max_group_duration_s: 7
     speech_pad_ms: 500
 
@@ -97,9 +98,9 @@ presets:
   # keep utterances distinct rather than lumped)
   aggressive:
     threshold: 0.18
-    min_speech_duration_ms: 30
+    min_speech_duration_ms: 80        # v1.9.2 (owner O3): 30 -> 80 (this one is enforced)
     min_silence_duration_ms: 300
-    max_speech_duration_s: 4
+    max_speech_duration_s: 6          # v1.9.2 (owner O3): 4 -> 6
     max_group_duration_s: 5
     speech_pad_ms: 300
 
@@ -116,7 +117,7 @@ gui:
     label: "Speech Threshold"
     description: "Probability threshold to detect speech (lower = more sensitive)"
     min: 0.01
-    max: 0.5
+    max: 0.95
     step: 0.01
     data_type: float
     group: detection
@@ -155,18 +156,18 @@ gui:
     widget: slider
     label: "Group Gap Threshold (s)"
     description: "Maximum gap to group consecutive segments"
-    min: 1.0
+    min: 0.1
     max: 10.0
-    step: 0.5
+    step: 0.1
     data_type: float
     group: grouping
 
   max_group_duration_s:
     widget: slider
     label: "Max Group Duration (s)"
-    description: "Maximum duration for a segment group (prevents exceeding Whisper's 30s context window)"
-    min: 10.0
-    max: 60.0
+    description: "The longest a group of speech segments may be; each group goes to the ASR model in one call."
+    min: 1.0
+    max: 420
     step: 1.0
     data_type: float
     group: grouping

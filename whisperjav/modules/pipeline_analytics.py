@@ -208,6 +208,13 @@ def _compute_alignment_metrics(scenes: List[Dict]) -> Dict:
     total_groups = t1_total + t2_total
     total_collapsed = t1_collapsed + t2_collapsed
     collapse_rate = total_collapsed / total_groups if total_groups > 0 else 0.0
+    if total_groups == 0:
+        # The decoupled pipeline's scene records carry no step-down tiers: the rate is the
+        # scenes the collapse check flagged, out of the scenes it checked (owner W300 1).
+        statuses = [s.get("sentinel_status") for s in scenes]
+        checked = sum(1 for st in statuses if st in ("OK", "COLLAPSED"))
+        total_collapsed = sum(1 for st in statuses if st == "COLLAPSED")
+        collapse_rate = total_collapsed / checked if checked > 0 else 0.0
 
     # Recovery strategy breakdown from sentinel
     recovery_vad_guided = 0
@@ -334,6 +341,22 @@ def _compute_subtitle_metrics(
 # Metric computation: Timing Sources
 # ---------------------------------------------------------------------------
 
+def scene_timing_sources(scene: Dict) -> Dict:
+    """A scene's timing sources: the nested ``timing_sources`` record when present, else the flat
+    ``timing_*`` fields the decoupled pipeline saves (SceneDiagnostics through ``asdict``). Before
+    1.10.0 only the nested form was read, so the run summary showed "Aligner native: 0.0%" for every
+    ChronosJAV run (found in tuning, owner W296 4; the counts themselves, W300 1)."""
+    ts = scene.get("timing_sources")
+    if isinstance(ts, dict):
+        return ts
+    return {
+        "aligner_native": scene.get("timing_aligner_native", 0),
+        "vad_fallback": scene.get("timing_vad_fallback", 0),
+        "interpolated": scene.get("timing_interpolated", 0),
+        "total_segments": scene.get("timing_total_segments", 0),
+    }
+
+
 def _compute_timing_metrics(scenes: List[Dict]) -> Dict:
     """Compute timing source breakdown across all scenes."""
     aligner_native = 0
@@ -342,7 +365,7 @@ def _compute_timing_metrics(scenes: List[Dict]) -> Dict:
     total_segments = 0
 
     for s in scenes:
-        ts = s.get("timing_sources", {})
+        ts = scene_timing_sources(s)
         aligner_native += ts.get("aligner_native", 0)
         vad_fallback += ts.get("vad_fallback", 0)
         interpolated += ts.get("interpolated", 0)
@@ -369,13 +392,18 @@ def _compute_timing_metrics(scenes: List[Dict]) -> Dict:
 # Health Scorecard
 # ---------------------------------------------------------------------------
 
+ALIGNER_NOT_USED = "not used (VAD Only)"   # owner W501 2: no red mark when the run loads no aligner
+
+
 def _compute_health_scorecard(
     alignment: Dict,
     timing: Dict,
     subtitle: Dict,
     scene: Dict,
+    timestamp_mode: Optional[str] = None,
 ) -> List[Dict]:
-    """Compute traffic-light health indicators."""
+    """Compute traffic-light health indicators. Under the timestamp mode vad_only (ChronosJAV's default since
+    1.10.1, owner W498 D1) no aligner runs, so the aligner line says so instead of a red 0.0 % (owner W501 2)."""
     indicators = []
 
     # 1. Collapse rate
@@ -392,19 +420,22 @@ def _compute_health_scorecard(
         "level": level,
     })
 
-    # 2. Aligner native percentage
+    # 2. Aligner native percentage (no level when the run loads no aligner)
     an_pct = timing["aligner_native_pct"]
-    if an_pct > 90:
-        level = "GREEN"
-    elif an_pct > 70:
-        level = "YELLOW"
+    if timestamp_mode == "vad_only":
+        indicators.append({"name": "Aligner", "value": ALIGNER_NOT_USED, "level": "OFF"})
     else:
-        level = "RED"
-    indicators.append({
-        "name": "Aligner native",
-        "value": f"{an_pct:.1f}%",
-        "level": level,
-    })
+        if an_pct > 90:
+            level = "GREEN"
+        elif an_pct > 70:
+            level = "YELLOW"
+        else:
+            level = "RED"
+        indicators.append({
+            "name": "Aligner native",
+            "value": f"{an_pct:.1f}%",
+            "level": level,
+        })
 
     # 3. Speech ratio
     sr = scene["speech_ratio"] * 100
@@ -459,7 +490,7 @@ def _compute_health_scorecard(
 # Console summary
 # ---------------------------------------------------------------------------
 
-_LEVEL_SYMBOLS = {"GREEN": "+", "YELLOW": "~", "RED": "!"}
+_LEVEL_SYMBOLS = {"GREEN": "+", "YELLOW": "~", "RED": "!", "OFF": "-"}
 
 
 def print_summary(analytics: Dict, title: str = "") -> None:
@@ -581,6 +612,7 @@ def compute_analytics(
     raw_subs_dir: Path,
     srt_path: Path,
     title: Optional[str] = None,
+    timestamp_mode: Optional[str] = None,
 ) -> Dict:
     """
     Compute pipeline analytics from diagnostics and SRT.
@@ -589,6 +621,8 @@ def compute_analytics(
         raw_subs_dir: Directory containing scene_NNNN_diagnostics.json files.
         srt_path: Path to the final (or stitched) SRT file.
         title: Optional title for the analytics report (e.g., media filename).
+        timestamp_mode: The run's timestamp mode (its value, e.g. "vad_only"); under vad_only the aligner line
+            says "not used (VAD Only)" with no level (owner W501 2). None = not known (as before).
 
     Returns:
         Analytics dict with keys: scene, alignment, subtitle, timing, health.
@@ -608,7 +642,7 @@ def compute_analytics(
     )
     timing_metrics = _compute_timing_metrics(scenes)
     health = _compute_health_scorecard(
-        alignment_metrics, timing_metrics, subtitle_metrics, scene_metrics,
+        alignment_metrics, timing_metrics, subtitle_metrics, scene_metrics, timestamp_mode,
     )
 
     analytics = {

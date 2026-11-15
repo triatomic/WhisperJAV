@@ -19,6 +19,7 @@ Date: 2026-01-26
 
 import sys
 import os
+import re
 import subprocess
 from pathlib import Path
 from unittest.mock import patch, MagicMock, mock_open
@@ -80,32 +81,25 @@ class TestDriverVersionParsing:
 class TestCUDAVersionSelection:
     """Test CUDA version selection based on driver."""
 
-    def test_select_cu128_for_modern_driver(self):
-        """Test CUDA 12.8 selection for driver 570+."""
+    def test_select_cu130_for_driver_580(self):
+        """v1.10.0: driver 580+ gets CUDA 13.0 (the only stack)."""
         from whisperjav.installer.core.detector import _select_cuda_version
 
-        # Driver 570+ should get cu128
-        cuda, url, msg = _select_cuda_version((570, 0, 0))
-        assert cuda == "cu128"
-        assert "cu128" in url
+        cuda, url, msg = _select_cuda_version((580, 0, 0))
+        assert cuda == "cu130"
+        assert "cu130" in url
 
-        cuda, url, msg = _select_cuda_version((580, 10, 5))
-        assert cuda == "cu128"
+        cuda, url, msg = _select_cuda_version((610, 47, 0))
+        assert cuda == "cu130"
 
-    def test_select_cu118_for_older_driver(self):
-        """Test CUDA 11.8 selection for driver 450-569."""
+    def test_driver_below_580_gets_no_cuda_build(self):
+        """v1.10.0: below 580 there is no CUDA build; install.py stops and asks for an update."""
         from whisperjav.installer.core.detector import _select_cuda_version
 
-        # Driver 450-569 should get cu118
-        cuda, url, msg = _select_cuda_version((450, 0, 0))
-        assert cuda == "cu118"
-        assert "cu118" in url
-
-        cuda, url, msg = _select_cuda_version((569, 99, 99))
-        assert cuda == "cu118"
-
-        cuda, url, msg = _select_cuda_version((520, 50, 0))
-        assert cuda == "cu118"
+        for driver in [(579, 99, 99), (570, 0, 0), (520, 50, 0), (450, 0, 0)]:
+            cuda, url, msg = _select_cuda_version(driver)
+            assert cuda is None, driver
+            assert "580" in msg
 
     def test_select_cpu_for_old_driver(self):
         """Test CPU fallback for very old drivers."""
@@ -227,18 +221,24 @@ class TestGPUDetection:
         # Mock driver version query
         driver_result = MagicMock()
         driver_result.returncode = 0
-        driver_result.stdout = "570.00.00\n"
+        driver_result.stdout = "580.00.00\n"
 
         # Mock GPU name query
         name_result = MagicMock()
         name_result.returncode = 0
         name_result.stdout = "NVIDIA GeForce RTX 4090\n"
 
-        mock_run.side_effect = [driver_result, name_result]
+        # v1.10.0: the compute capability is read too
+        cc_result = MagicMock()
+        cc_result.returncode = 0
+        cc_result.stdout = "8.9\n"
+
+        mock_run.side_effect = [driver_result, name_result, cc_result]
 
         result = detect_gpu()
         assert result.detected is True
-        assert result.cuda_version == "cu128"
+        assert result.cuda_version == "cu130"
+        assert result.compute_capability == (8, 9)
         assert result.detection_method == "nvidia-smi"
         assert "RTX 4090" in result.name
 
@@ -480,12 +480,12 @@ class TestCUDADriverMatrix:
             prev_driver = entry.min_driver
 
     def test_matrix_has_entries(self):
-        """Test that CUDA matrix has at least cu118 and cu128."""
-        from whisperjav.installer.core.config import CUDA_DRIVER_MATRIX
+        """v1.10.0: the matrix chooses CUDA 13.0 only; cu128 is an index for the fallback."""
+        from whisperjav.installer.core.config import CUDA_DRIVER_MATRIX, TORCH_INDEXES
 
         cuda_versions = {entry.cuda_version for entry in CUDA_DRIVER_MATRIX}
-        assert "cu118" in cuda_versions, "Missing cu118 entry"
-        assert "cu128" in cuda_versions, "Missing cu128 entry"
+        assert cuda_versions == {"cu130"}
+        assert set(TORCH_INDEXES) == {"cu130", "cu128", "cpu"}
 
     def test_torch_index_urls_valid(self):
         """Test that torch index URLs are valid."""
@@ -524,7 +524,7 @@ class TestConfigConstants:
             PYTHON_MAX_VERSION,
         )
 
-        assert PYTHON_MIN_VERSION < PYTHON_MAX_VERSION
+        assert PYTHON_MIN_VERSION <= PYTHON_MAX_VERSION
         assert PYTHON_MIN_VERSION >= (3, 10)
         assert PYTHON_MAX_VERSION <= (3, 13)
 
@@ -776,15 +776,27 @@ class TestShellWrappers:
 # =============================================================================
 
 
+def _locked_requirement_files() -> list:
+    """v1.10.0 (item 2f): uv.lock exported per PyTorch build -- what every install takes.
+
+    Tracked by git (installer/generated/ is not, and may hold a stale build).
+    """
+    project_root = Path(__file__).parent.parent
+    return sorted((project_root / "whisperjav" / "installer" / "locked").glob("requirements_*.txt"))
+
+
+def _normalized(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
 class TestGeneratedRequirements:
-    """Tests for the generated requirements.txt file."""
+    """Tests for the locked requirements files the installer ships (item 2f)."""
 
     def test_requirements_file_exists(self):
-        """Verify requirements.txt is generated."""
-        project_root = Path(__file__).parent.parent
-        # Check for any version of requirements file
-        req_files = list((project_root / "installer" / "generated").glob("requirements_v*.txt"))
-        assert len(req_files) >= 1, "No requirements_v*.txt found in installer/generated/"
+        """One locked file per lock extra (design 22.2.4)."""
+        names = sorted(f.name for f in _locked_requirement_files())
+        assert names == ["requirements_cpu.txt", "requirements_cu128.txt", "requirements_cu130.txt",
+                         "requirements_vulkan.txt"], names
 
     def test_requirements_contains_all_pyproject_packages(self):
         """
@@ -807,51 +819,43 @@ class TestGeneratedRequirements:
         core_deps = project.get("dependencies", [])
         optional_deps = project.get("optional-dependencies", {})
 
-        # Extras included in standalone installer
-        installer_extras = ["cli", "gui", "translate", "enhance", "huggingface", "analysis", "compatibility"]
+        # Extras the installer ships: the "all" extra (item 2f exports --extra all)
+        installer_extras = ["cli", "gui", "translate", "enhance", "huggingface", "qwen", "analysis", "compatibility"]
 
-        # Collect expected packages (non-git)
+        # Collect expected packages, git packages included (item 2f: they are in the
+        # locked files at the commits uv.lock records)
         expected = set()
 
+        def add(dep):
+            # Platform markers: a Windows-only package is still in the universal export
+            name = re.split(r"[>=<\[@ ;!~]", dep)[0].strip()
+            expected.add(_normalized(name))
+
         for dep in core_deps:
-            if "git+" not in dep and "@" not in dep:
-                name = dep.split(">")[0].split("<")[0].split("=")[0].split("[")[0].split(";")[0].strip()
-                expected.add(name.lower())
-
+            add(dep)
         for extra in installer_extras:
-            if extra in optional_deps:
-                for dep in optional_deps[extra]:
-                    if "git+" not in dep and "@" not in dep and not dep.startswith("whisperjav"):
-                        name = dep.split(">")[0].split("<")[0].split("=")[0].split("[")[0].split(";")[0].strip()
-                        expected.add(name.lower())
+            for dep in optional_deps.get(extra, []):
+                if not dep.startswith("whisperjav"):
+                    add(dep)
 
-        # Read actual requirements file
-        req_files = list((project_root / "installer" / "generated").glob("requirements_v*.txt"))
-        assert req_files, "No requirements file found"
-
-        req_file = req_files[0]  # Use first (or only) one
-        content = req_file.read_text()
-
-        actual = set()
-        for line in content.split("\n"):
-            line = line.strip()
-            if line and not line.startswith("#"):
-                name = line.split(">")[0].split("<")[0].split("=")[0].split("[")[0].split(";")[0].strip()
-                actual.add(name.lower())
-
-        # Check for missing packages
-        missing = expected - actual
-        assert not missing, f"Packages missing from requirements.txt: {missing}"
+        req_files = _locked_requirement_files()
+        assert req_files, "No locked requirements file found"
+        for req_file in req_files:
+            actual = set()
+            for line in req_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    actual.add(_normalized(re.split(r"[>=<\[@ ;!~]", line)[0].strip()))
+            missing = expected - actual
+            assert not missing, f"Packages missing from {req_file.name}: {missing}"
 
     def test_requirements_has_translate_packages(self):
         """Verify translate extra packages are in requirements.txt."""
         project_root = Path(__file__).parent.parent
-        req_files = list((project_root / "installer" / "generated").glob("requirements_v*.txt"))
+        req_files = _locked_requirement_files()
+        assert req_files, "No locked requirements file found"
 
-        if not req_files:
-            pytest.skip("No generated requirements file")
-
-        content = req_files[0].read_text().lower()
+        content = req_files[0].read_text(encoding="utf-8").lower()
 
         translate_packages = ["pysubtrans", "openai", "google-genai"]
         missing = [pkg for pkg in translate_packages if pkg not in content]
@@ -861,12 +865,10 @@ class TestGeneratedRequirements:
     def test_requirements_has_gui_packages(self):
         """Verify GUI extra packages are in requirements.txt."""
         project_root = Path(__file__).parent.parent
-        req_files = list((project_root / "installer" / "generated").glob("requirements_v*.txt"))
+        req_files = _locked_requirement_files()
+        assert req_files, "No locked requirements file found"
 
-        if not req_files:
-            pytest.skip("No generated requirements file")
-
-        content = req_files[0].read_text().lower()
+        content = req_files[0].read_text(encoding="utf-8").lower()
 
         gui_packages = ["pywebview", "pythonnet", "pywin32"]
         missing = [pkg for pkg in gui_packages if pkg not in content]
@@ -924,62 +926,231 @@ class TestImportNameMappings:
 class TestPostInstallTemplate:
     """Tests for the standalone installer's post_install template."""
 
-    def test_git_packages_in_template(self):
-        """
-        Regression test: All git-based packages must be in post_install template.
+    def test_every_git_dependency_is_in_the_locked_files(self):
+        """Every git-addressed dependency the installer ships is in each locked file.
 
-        This test ensures that packages excluded from requirements.txt (git-based)
-        are explicitly installed in the post_install.py template Phase 3.5.
-
-        Bug fixed: stable-ts, openai-whisper, ffmpeg-python, clearvoice were
-        filtered from requirements.txt but never installed by post_install.py.
+        v1.10.0 (item 2f): Phase 3.5's own list is gone; the git packages come from
+        the locked file at the commit uv.lock records. A pyproject pin to a commit
+        must be that same commit. (In 1.9.2 faster-whisper went missing because a
+        generator dropped git addresses and nothing else installed it.)
         """
+        try:
+            import tomllib
+        except ImportError:  # Python 3.10 without tomli
+            pytest.skip("tomllib not available")
+
         project_root = Path(__file__).parent.parent
-        template_path = project_root / "installer" / "templates" / "post_install.py.template"
+        with open(project_root / "pyproject.toml", "rb") as f:
+            project = tomllib.load(f)["project"]
 
-        assert template_path.exists(), "post_install.py.template not found"
-
-        content = template_path.read_text()
-
-        # All git-based packages that MUST be in the template
-        required_git_packages = [
-            "openai-whisper",
-            "stable-ts",
-            "ffmpeg-python",
-            "clearvoice",
+        installer_extras = [
+            "cli", "gui", "translate", "enhance",
+            "huggingface", "qwen", "analysis", "compatibility",
         ]
+        expected = {}
+        for dep in project.get("dependencies", []) + [
+                d for e in installer_extras for d in project["optional-dependencies"].get(e, [])]:
+            if " @ git+" in dep:
+                name, url = (part.strip() for part in dep.split(" @ ", 1))
+                expected[_normalized(name)] = url
+        assert expected, "No git dependencies found in pyproject.toml -- parser broken?"
 
-        missing = []
-        for pkg in required_git_packages:
-            if pkg not in content:
-                missing.append(pkg)
+        for req_file in _locked_requirement_files():
+            locked = {}
+            for line in req_file.read_text(encoding="utf-8").splitlines():
+                if " @ git+" in line and not line.lstrip().startswith("#"):
+                    name, url = (part.strip() for part in line.split(";")[0].split(" @ ", 1))
+                    locked[_normalized(name)] = url
+            assert set(locked) == set(expected), (req_file.name, sorted(locked), sorted(expected))
+            for name, url in expected.items():
+                assert re.search(r"@[0-9a-f]{40}", locked[name]), f"{name} is not at a commit in {req_file.name}"
+                pinned = re.search(r"@([0-9a-f]{40})", url)
+                if pinned:
+                    assert pinned.group(1) in locked[name], (name, url, locked[name])
 
-        assert not missing, f"Git-based packages missing from post_install template: {missing}"
+    def test_the_locked_file_is_installed_before_pytorch(self):
+        """Phase order (item 2f): choose the build, its locked file, PyTorch, the wheel.
 
-    def test_phase_35_exists(self):
-        """Verify Phase 3.5 (git packages) exists in template."""
+        PyTorch is installed --no-deps, so it can only be imported (the check right
+        after it) once the packages it needs are in place.
+        """
+        project_root = Path(__file__).parent.parent
+        content = (project_root / "installer" / "templates" / "post_install.py.template").read_text(encoding="utf-8")
+        positions = [content.find(banner) for banner in (
+            'log_section("Phase 3: PyTorch Build Selection")',
+            'log_section("Phase 4: Release-Pinned Dependencies")',
+            'log_section("Phase 4.5: PyTorch Installation")',
+            'log_section("Phase 5: WhisperJAV Application Installation")',
+        )]
+        assert -1 not in positions, positions
+        assert positions == sorted(positions), positions
+        assert "git_packages" not in content, "Phase 3.5's own git list should be gone (item 2f)"
+
+    def test_failed_core_check_ends_the_install(self):
+        """A failed Phase 6 check must write the failure marker and return 1.
+
+        Before v1.9.2 the install script printed "Installation completed
+        successfully!" and returned 0 even when a core package would not
+        import, so a user whose install was unusable was told it had worked.
+        """
         project_root = Path(__file__).parent.parent
         template_path = project_root / "installer" / "templates" / "post_install.py.template"
+        content = template_path.read_text(encoding="utf-8")
 
-        content = template_path.read_text()
+        phase_6_pos = content.find('log_section("Phase 6: Post-Install Verification")')
+        assert phase_6_pos != -1, "Phase 6 banner not found in template"
 
-        assert "Phase 3.5" in content, "Phase 3.5 (git packages) not found in template"
-        assert "git_packages" in content, "git_packages list not found in template"
+        tail = content[phase_6_pos:]
+        # Stop at the end of main(), before the __main__ block
+        end = tail.find('if __name__ ==')
+        assert end != -1, "__main__ block not found after Phase 6"
+        tail = tail[:end]
 
-    def test_git_packages_after_pytorch(self):
-        """Verify git packages are installed AFTER PyTorch (Phase 3)."""
+        assert "if fails > 0:" in tail, (
+            "Phase 6 does not branch on a failed core check — a broken install "
+            "would still be reported as successful"
+        )
+        assert "create_failure_file(" in tail, (
+            "Phase 6's failure branch does not write the failure marker file"
+        )
+        assert "return 1" in tail, (
+            "Phase 6's failure branch does not return a non-zero exit code"
+        )
+
+        failure_branch = tail[tail.find("if fails > 0:"):]
+        assert failure_branch.find("create_failure_file(") < failure_branch.find("return 1"), (
+            "The failure marker must be written before returning"
+        )
+
+
+class TestInstallAbortsOnCoreFailure:
+    """The installer must stop when a package WhisperJAV cannot run without is missing.
+
+    Owner decision, 2026-09-11. Until v1.9.2 the install script's exit code was
+    thrown away by conda-constructor's own runner, the installer reached its
+    normal finish page, and a desktop shortcut was created that opened onto an
+    error. A user was told an unusable install had worked.
+
+    These are text checks on the NSIS template, and that is a real limit: NSIS
+    cannot be compiled or run here, so they prove the instructions are present
+    and in the right order, not that the installer behaves correctly. Only the
+    clean-machine install proves that.
+    """
+
+    @staticmethod
+    def _nsis() -> str:
         project_root = Path(__file__).parent.parent
-        template_path = project_root / "installer" / "templates" / "post_install.py.template"
+        path = project_root / "installer" / "templates" / "custom_template.nsi.tmpl.template"
+        assert path.exists(), "NSIS template not found"
+        return path.read_text(encoding="utf-8")
 
-        content = template_path.read_text()
+    @staticmethod
+    def _post_install() -> str:
+        project_root = Path(__file__).parent.parent
+        path = project_root / "installer" / "templates" / "post_install.py.template"
+        return path.read_text(encoding="utf-8")
 
-        # Find positions
-        phase_3_pos = content.find("Phase 3: PyTorch")
-        phase_35_pos = content.find("Phase 3.5")
-        phase_4_pos = content.find("Phase 4:")
+    def test_a_failed_post_install_reaches_nsis(self):
+        """The post-install's exit code must reach NSIS's retry dialog, and the script
+        must run in a console window of its own.
 
-        assert phase_3_pos < phase_35_pos < phase_4_pos, \
-            "Phase 3.5 must be between Phase 3 (PyTorch) and Phase 4 (requirements)"
+        Up to constructor 3.11.3 the script ran through _nsis.py, which swallowed a
+        non-zero exit unless NSIS_SCRIPTS_RAISE_ERRORS was set, and its cmd.exe got a
+        console window. Constructor 3.17.3 (v1.10.0, i1) runs the bat hidden under
+        nsExec; ours starts it in its own window (post_install.py shows progress and
+        asks questions there) with `start /wait`, which returns the bat's exit code
+        into AbortRetryNSExecWait (checked 2026-10-16 with exit codes 0, 1, 3 in a
+        path with a space). The bat must pass Python's exit code on.
+        """
+        content = self._nsis()
+        runner = ('push \'start "" /wait "$CMD_EXE" /D /C ""$INSTDIR\\pkgs\\post_install.bat"" '
+                  '& call exit !ERRORLEVEL!\'')
+        assert runner in content, "post_install.bat is not run in its own window with its exit code passed on"
+        assert "call AbortRetryNSExecWait" in content[content.find(runner):][:300]
+        assert '_nsis.py" post_install' not in content
+        assert '"$INSTDIR\\pkgs\\post_install.bat" > "${STEP_LOG}"' not in content  # the hidden stock runner
+
+        bat = (Path(__file__).parent.parent / "installer" / "templates" / "post_install.bat.template").read_text(
+            encoding="utf-8")
+        python_run = bat.find('"%~dp0..\\python.exe" "%~dp0..\\post_install_v{{VERSION}}.py"')
+        assert python_run != -1
+        assert "exit /b %errorlevel%" in bat[python_run:], "the bat does not return Python's exit code"
+
+    def test_a_previous_installation_is_removed_only_after_the_path_checks(self):
+        """Replacing a previous installation deletes it, so constructor's path checks
+        (length, spaces, characters, writable) must run first (review 2026-10-16)."""
+        content = self._nsis()
+        start = content.index("Function OnDirectoryLeave")
+        body = content[start:content.index("FunctionEnd", start)]
+        assert body.index("GetFullPathName") < body.index("MAX_RELATIVE_PATH_LENGTH") \
+            < body.index("pathgood:") < body.index("Call IsWhisperJAVInstallation") \
+            < body.index("Call RemoveExistingWhisperJAV") < body.index("whisperjav_continue:")
+        assert "${LogSet} on" not in body
+
+    def test_the_install_aborts_when_the_failure_marker_exists(self):
+        content = self._nsis()
+
+        marker_check = content.find("INSTALLATION_FAILED_v{{VERSION}}.txt")
+        assert marker_check != -1, (
+            "Nothing checks for the failure marker, so a broken install would still finish"
+        )
+
+        tail = content[marker_check:]
+        abort_pos = tail.find("Abort")
+        assert abort_pos != -1 and abort_pos < 2000, (
+            "The failure-marker branch does not Abort the installation"
+        )
+
+    def test_no_desktop_shortcut_is_created_after_a_failed_install(self):
+        """A shortcut that opens onto an error is worse than no shortcut.
+
+        The abort must come first in the script, so the shortcut block is never
+        reached. This also covers the silent-install case, where the retry
+        dialog answers itself with "Ignore".
+        """
+        content = self._nsis()
+
+        marker_check = content.find('${FileExists} "$INSTDIR\INSTALLATION_FAILED')
+        shortcut = content.find('CreateShortCut "$DESKTOP')
+
+        assert marker_check != -1, "failure-marker check not found in the NSIS template"
+        assert shortcut != -1, "desktop shortcut creation not found in the NSIS template"
+        assert marker_check < shortcut, (
+            "The failure check must come BEFORE the desktop shortcut is created, "
+            "or a broken install still puts a shortcut on the desktop"
+        )
+
+    def test_the_failure_message_tells_the_user_what_to_do(self):
+        """The user is not technical. The dialog has to say what happened, where
+        the details are, and what to try -- re-running fixes the usual cause."""
+        content = self._nsis()
+        marker_check = content.find('${FileExists} "$INSTDIR\INSTALLATION_FAILED')
+        block = content[marker_check:marker_check + 2000]
+
+        assert "MessageBox" in block, "the user is not shown anything"
+        assert "install_log_v{{VERSION}}.txt" in block, "the log file is not named"
+        assert "github.com/meizhong986/WhisperJAV/issues" in block, "no way to report it"
+        assert "again" in block.lower(), "does not tell the user to try again"
+
+    def test_a_stale_marker_from_an_earlier_attempt_is_cleared(self):
+        """Otherwise a marker left by a previous failed attempt in the same folder
+        would abort an install that actually worked."""
+        content = self._post_install()
+
+        main_pos = content.find("def main() -> int:")
+        assert main_pos != -1
+        block = content[main_pos:main_pos + 1200]
+
+        assert "INSTALLATION_FAILED_v{{VERSION}}.txt" in block, (
+            "main() does not clear a stale failure marker before the install runs"
+        )
+        assert "os.remove" in block, "the stale marker is found but not removed"
+
+        first_phase = content.find("Phase 1: Preflight Checks", main_pos)
+        clear_pos = content.find("INSTALLATION_FAILED_v{{VERSION}}.txt", main_pos)
+        assert clear_pos < first_phase, (
+            "the stale marker must be cleared before any phase can write a new one"
+        )
 
 
 class TestKnownIssues:
