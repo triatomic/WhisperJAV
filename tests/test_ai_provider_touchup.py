@@ -1,4 +1,4 @@
-"""Cloud AI providers: current default models, and Claude requests the current API accepts.
+"""Cloud AI providers: current default models, the Claude model name, and the Test Connection check.
 
 Model IDs were read from each provider's model page on 2026-11-10.
 """
@@ -58,6 +58,37 @@ class TestGuiModelLists:
         for key, models in _gui_model_lists().items():
             if models:
                 assert models[0] == PROVIDER_CONFIGS[key]["model"], key
+
+
+class TestClaudeModelName:
+    """A Claude model the key's list does not hold is sent as given, not refused before the request."""
+
+    def _provider(self, listed):
+        def strict(name):
+            if name in listed:
+                return name
+            raise ValueError(f"Model {name} not found")
+        return SimpleNamespace(_get_model_id=strict, claude_models=[SimpleNamespace(id=m) for m in listed])
+
+    @pytest.mark.parametrize("listed", [[], ["claude-haiku-4-5-20251001"]])
+    def test_unlisted_name_is_sent_as_given(self, listed, capsys):
+        from whisperjav.translate.core import apply_claude_lenient_model_id
+        provider = self._provider(listed)
+        assert apply_claude_lenient_model_id(provider)
+        assert provider._get_model_id("claude-haiku-4-5") == "claude-haiku-4-5"
+        assert "sending" in capsys.readouterr().err
+
+    def test_listed_name_is_unchanged_and_silent(self, capsys):
+        from whisperjav.translate.core import apply_claude_lenient_model_id
+        provider = self._provider(["claude-haiku-5-5"])
+        apply_claude_lenient_model_id(provider)
+        assert provider._get_model_id("claude-haiku-5-5") == "claude-haiku-5-5"
+        assert capsys.readouterr().err == ""
+
+    def test_pysubtrans_still_has_the_method_we_wrap(self):
+        # A rename in PySubtrans would switch the wrapper off without an error.
+        from PySubtrans.Providers.Provider_Claude import ClaudeProvider
+        assert hasattr(ClaudeProvider, "_get_model_id")
 
 
 class TestConnectionCheck:

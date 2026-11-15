@@ -339,6 +339,38 @@ def apply_server_temperature_patch(translator, debug: bool = False) -> bool:
     return True
 
 
+def apply_claude_lenient_model_id(provider) -> bool:
+    """Make PySubtrans' Claude provider send a model name it cannot find in the key's model list.
+
+    The provider accepts a model only if it finds that exact id or display name in the model list
+    the key can read, and raises "Model X not found" otherwise -- also for an alias the API accepts
+    (claude-haiku-4-5 is listed under a dated id), and for every model when the list could not be
+    read at all. Sending the name as given lets the API answer with the real reason, if there is one.
+
+    Returns:
+        False when the provider has no `_get_model_id` to wrap (a PySubtrans change).
+    """
+    strict = getattr(provider, '_get_model_id', None)
+    if strict is None:
+        return False
+
+    def _lenient_model_id(name):
+        try:
+            return strict(name)
+        except ValueError:
+            listed = [m.id for m in (getattr(provider, 'claude_models', None) or [])]
+            if listed:
+                print(f"[TRANSLATE]   WARNING: '{name}' is not in this key's Claude model list "
+                      f"({', '.join(listed[:15])}); sending it as given.", file=sys.stderr)
+            else:
+                print("[TRANSLATE]   WARNING: the Claude model list could not be read with this "
+                      f"key; sending the model name '{name}' as given.", file=sys.stderr)
+            return name
+
+    provider._get_model_id = _lenient_model_id
+    return True
+
+
 def target_language_name(target_lang: str) -> str:
     """'chinese' -> 'Chinese'; the name the instructions and the prompt use."""
     name = (target_lang or "").strip()
@@ -816,25 +848,8 @@ def translate_subtitle(
                 ) from init_err
             raise
 
-        # PySubtrans' Claude provider accepts a model only if it finds that exact id or display
-        # name in the model list the key can read, and raises "Model X not found" otherwise --
-        # also for an alias the API accepts (claude-haiku-4-5 is listed under a dated id), and
-        # for every model when the list could not be read at all. Send the name as given in
-        # those cases: the API then answers with the real reason, if there is one.
-        if provider_config['pysubtrans_name'] == 'Claude' and hasattr(provider, '_get_model_id'):
-            def _lenient_model_id(name, _strict=provider._get_model_id, _provider=provider):
-                try:
-                    return _strict(name)
-                except ValueError:
-                    listed = [m.id for m in (getattr(_provider, 'claude_models', None) or [])]
-                    if listed:
-                        print(f"[TRANSLATE]   WARNING: '{name}' is not in this key's Claude model list "
-                              f"({', '.join(listed[:15])}); sending it as given.", file=sys.stderr)
-                    else:
-                        print("[TRANSLATE]   WARNING: the Claude model list could not be read with this "
-                              f"key; sending the model name '{name}' as given.", file=sys.stderr)
-                    return name
-            provider._get_model_id = _lenient_model_id
+        if provider_config['pysubtrans_name'] == 'Claude':
+            apply_claude_lenient_model_id(provider)
 
         # Validate provider settings
         if hasattr(provider, 'ValidateSettings') and not provider.ValidateSettings():
