@@ -83,13 +83,21 @@ class TestItIsOffered:
         enhance = project["optional-dependencies"]["enhance"]
         assert "demucs" in enhance
 
-        # The peers it must travel with.
-        assert "bs-roformer-infer" in enhance
+        # The peers it must travel with. 1.10.2: BS-RoFormer's package left with BS-RoFormer
+        # (CrispASR's Mini-BS-RoFormer replaces it, owner W594, W596 6).
+        assert "bs-roformer-infer" not in enhance
         assert any(spec.startswith("modelscope") for spec in enhance)
 
     def test_the_windows_installer_includes_that_extra(self):
-        build = (REPO / "installer" / "build_release.py").read_text(encoding="utf-8")
-        assert '"enhance"' in build, "the installer must build requirements from the enhance extra"
+        # Since 1.10.0 the installer's requirement files are exported from uv.lock with the "all" extra
+        # (build_release.py export_locked_requirements), and "all" holds "enhance".
+        import tomllib
+
+        build =(REPO / "installer" / "build_release.py").read_text(encoding="utf-8")
+        assert '"--extra", "all"' in build, "the installer must export the lock with the all extra"
+        with open(REPO / "pyproject.toml", "rb") as handle:
+            extras = tomllib.load(handle)["project"]["optional-dependencies"]
+        assert any("enhance" in spec for spec in extras["all"]), "the all extra must hold enhance"
 
 
 class TestItDoesNotFailQuietly:
@@ -102,7 +110,8 @@ class TestItDoesNotFailQuietly:
         a failure and the process shall stop with helpful communication." That
         is every clean-up the user has to install.
         """
-        for backend in ("zipenhancer", "bs-roformer", "htdemucs"):
+        # 1.10.2 (owner W594, W596): bs-roformer is gone; the two speech enhancers run by CrispASR take its place.
+        for backend in ("zipenhancer", "htdemucs", "mel-band-roformer", "mini-bs-roformer"):
             assert backend in FATAL_WHEN_UNAVAILABLE, backend
 
     def test_the_two_that_cannot_be_missing_are_not(self):
@@ -130,7 +139,7 @@ class TestItDoesNotFailQuietly:
             pipeline_helper.create_enhancer_from_config(
                 {"params": {"speech_enhancer": {"backend": "htdemucs"}}})
 
-    @pytest.mark.parametrize("backend", ["zipenhancer", "bs-roformer"])
+    @pytest.mark.parametrize("backend", ["zipenhancer", "mel-band-roformer", "mini-bs-roformer"])
     def test_an_installable_enhancer_that_is_missing_now_stops_the_run(
             self, backend, monkeypatch):
         """

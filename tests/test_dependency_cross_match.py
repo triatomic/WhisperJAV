@@ -264,10 +264,10 @@ class TestInstallationConstraints:
                 )
 
     @pytest.mark.parametrize("pkg_info", [
-        ("pysubtrans", ">=1.6.0", "PySubtrans"),
+        ("pysubtrans", ">=1.8.0", "PySubtrans"),
+        ("anthropic", ">=2.0", "anthropic"),
         ("openai", ">=1.35.0", "openai"),
         ("google-genai", ">=1.39.0", "google.genai"),
-        ("anthropic", ">=2.0.0", "anthropic"),
     ], ids=lambda x: x[0] if isinstance(x, tuple) else str(x))
     def test_translate_package_installed(self, pkg_info):
         """Translation packages are importable where applicable."""
@@ -285,7 +285,6 @@ class TestInstallationConstraints:
     @pytest.mark.parametrize("pkg_info", [
         ("modelscope", ">=1.40", "modelscope"),
         ("onnxruntime", ">=1.16.0", "onnxruntime"),
-        ("bs-roformer-infer", None, "bs_roformer"),
     ], ids=lambda x: x[0] if isinstance(x, tuple) else str(x))
     def test_enhance_package_installed(self, pkg_info):
         """Enhancement packages are importable where applicable."""
@@ -426,7 +425,6 @@ class TestCrossSourceConsistency:
         known_mismatches = {
             "openai-whisper",       # whisper (completely different name)
             "stable-ts",            # stable_whisper (different name)
-            "bs-roformer-infer",    # bs_roformer (truncated name)
             "scikit-learn",         # sklearn (abbreviation)
             "pywebview",            # webview (prefix dropped)
             "pywin32",              # win32com (different name)
@@ -434,7 +432,6 @@ class TestCrossSourceConsistency:
             "Pillow",               # PIL (different name)
             "opencv-python",        # cv2 (completely different)
             "python-speech-features",  # python_speech_features (BUT also non-obvious pkg name)
-            "rotary-embedding-torch",  # rotary_embedding_torch
             "more-itertools",       # more_itertools
             "pysubtrans",           # PySubtrans (case-sensitive)
             "google-api-core",      # google.api_core (dotted path)

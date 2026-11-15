@@ -1,4 +1,4 @@
-# WhisperJAV 1.10.1 — 在 Windows 上从源码安装（Python）
+# WhisperJAV 1.10.2 — 在 Windows 上从源码安装（Python）
 
 本指南把 WhisperJAV 从源码安装到你自己管理的 Python 环境中。如果只想开箱即用，请改用 [Windows 安装程序](installation_windows_standalone.md)。
 
@@ -24,7 +24,7 @@
 | Windows | 10 或 11，64 位（x86-64）；不支持 Windows on ARM | — |
 | Python | **3.13**（其他版本会被拒绝） | [python.org](https://www.python.org/downloads/) 或 conda/Miniconda |
 | Git | 任意较新版本 | [git-scm.com](https://git-scm.com/download/win) |
-| FFmpeg | 6.x 或 7.x，需在 PATH 中 | [gyan.dev](https://www.gyan.dev/ffmpeg/builds/)，或 `winget install --id=Gyan.FFmpeg -e` |
+| FFmpeg | 8.x，需在 PATH 中 | [gyan.dev](https://www.gyan.dev/ffmpeg/builds/)，或 `winget install --id=Gyan.FFmpeg -e` |
 | Visual C++ Redistributable | 2015–2022（x64） | [microsoft.com](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
 | WebView2 Runtime | 任意版本，供 GUI 使用 | [microsoft.com](https://go.microsoft.com/fwlink/p/?LinkId=2124703) |
 | NVIDIA 驱动 | 580 或更新，用于 NVIDIA GPU（CUDA）安装 | [nvidia.com/drivers](https://www.nvidia.com/drivers) |
@@ -47,7 +47,7 @@ nvidia-smi
 ## 2. 获取源码 {#2-get-the-source-code}
 
 ```cmd
-git clone --branch v1.10.1 https://github.com/meizhong986/WhisperJAV.git
+git clone --branch v1.10.2 https://github.com/meizhong986/WhisperJAV.git
 cd WhisperJAV
 ```
 
@@ -151,7 +151,7 @@ git checkout v1.10.x
 python install.py
 ```
 
-（`v1.10.x` 代表你想要的版本。）1.9.x 环境无法更新到 1.10.0：1.10.0 需要 Python 3.13。请新建一个 Python 3.13 环境并安装到那里。
+（`v1.10.x` 代表你想要的版本。）1.9.x 环境无法更新到 1.10：1.10 需要 Python 3.13。请新建一个 Python 3.13 环境并安装到那里。
 
 不要用普通的 `pip install -U whisperjav…` 更新：在 Windows 上，PyPI 提供的是仅 CPU 版的 PyTorch，可能会在毫无提示的情况下替换你的 GPU 版本。
 
@@ -161,7 +161,7 @@ python install.py
 
 **"WhisperJAV 1.10 does not support …"。** 电脑不在[受支持列表](../getting-started/index.md#supported-computers)中；提示会说明原因。没有安装任何内容。
 
-**安装程序拒绝你的 Python。** WhisperJAV 1.10.0 需要 Python 3.13。请创建一个 3.13 环境（第 3 节）。
+**安装程序拒绝你的 Python。** WhisperJAV 1.10 需要 Python 3.13。请创建一个 3.13 环境（第 3 节）。
 
 **`--accelerator own-pytorch` 停止："none was found"。** 先把你的 PyTorch 和 torchaudio 安装到激活的环境中，再次运行安装程序。
 

@@ -334,6 +334,9 @@ const AppState = {
     // UI state
     activeTab: 'tab1',
     isRunning: false,
+    // True from the click on Start until the start call returns (1.10.2, owner W647 1). The call can take
+    // many seconds; while it is true the Start button is greyed and a second click starts nothing.
+    isStarting: false,
 
     // Process monitoring
     logPollInterval: null,
@@ -1035,8 +1038,9 @@ const FileListManager = {
         const hasFiles = AppState.selectedFiles.length > 0;
         const hasSelection = AppState.selectedIndices.size > 0;
 
-        document.getElementById('removeSelectedBtn').disabled = !hasSelection || AppState.isRunning;
-        document.getElementById('clearBtn').disabled = !hasFiles || AppState.isRunning;
+        const busy = AppState.isRunning || AppState.isStarting;
+        document.getElementById('removeSelectedBtn').disabled = !hasSelection || busy;
+        document.getElementById('clearBtn').disabled = !hasFiles || busy;
     },
 
     handleKeyboard(e) {
@@ -1205,8 +1209,8 @@ const FormManager = {
         const hasFiles = AppState.selectedFiles.length > 0;
         const startBtn = document.getElementById('startBtn');
 
-        // Disable start button if no files selected or process running
-        startBtn.disabled = !hasFiles || AppState.isRunning;
+        // Disable start button if no files selected, a run is starting, or a run is running
+        startBtn.disabled = !hasFiles || AppState.isRunning || AppState.isStarting;
 
         // Also update the SRT Translate tab's Start button (shared file list)
         const translatorStartBtn = document.getElementById('translatorStartBtn');
@@ -1453,7 +1457,15 @@ const RunStopDialog = {
     async runOnCpu() {
         // "Run on the CPU this time": the same run again with --device cpu (every part on the CPU).
         this.close();
-        const result = await pywebview.api.rerun_on_cpu();
+        if (!ProcessManager.beginStart()) return;   // one start at a time (owner W647 1)
+        let result = null;
+        try {
+            result = await pywebview.api.rerun_on_cpu();
+        } catch (error) {
+            result = { success: false, message: error.toString() };
+        } finally {
+            ProcessManager.endStart(!!(result && result.success));
+        }
         if (result && result.success) {
             AppState.isRunning = true;
             ProcessManager.updateButtonStates();
@@ -1474,13 +1486,41 @@ const RunStopDialog = {
 // Process Management (Real API Integration)
 // ============================================================
 const ProcessManager = {
+    // One start at a time (1.10.2, owner W647 1). beginStart() is called at the click, before the start call:
+    // it answers false when a run is already starting or running, else it greys the Start button and shows
+    // "Starting...". endStart(started) is called when the start call has returned.
+    beginStart() {
+        if (AppState.isStarting || AppState.isRunning) return false;
+        AppState.isStarting = true;
+        this.updateButtonStates();
+        // What the status line said before; a start that fails puts it back (it may name why the last run stopped).
+        this._statusBeforeStart = ProgressManager.statusLabel.textContent;
+        ProgressManager.setIndeterminate(true);
+        ProgressManager.setStatus('Starting...');
+        return true;
+    },
+
+    endStart(started) {
+        AppState.isStarting = false;
+        if (!started) {
+            ProgressManager.setIndeterminate(false);
+            ProgressManager.setStatus(this._statusBeforeStart);
+        }
+        this.updateButtonStates();
+    },
+
     async start() {
+        // A run is already starting or running: this click starts nothing.
+        if (AppState.isStarting || AppState.isRunning) return;
+
         // Validate form
         if (!FormManager.validateForm()) {
             ErrorHandler.show('No Files Selected', 'Please add at least one file or folder before starting.');
             return;
         }
 
+        if (!this.beginStart()) return;
+        let started = false;
         try {
             // Collect form options
             const options = FormManager.collectFormData();
@@ -1493,6 +1533,7 @@ const ProcessManager = {
 
             if (result.success) {
                 // Update UI state
+                started = true;
                 AppState.isRunning = true;
                 this.updateButtonStates();
 
@@ -1517,6 +1558,8 @@ const ProcessManager = {
             }
         } catch (error) {
             ErrorHandler.show('Start Error', error.toString());
+        } finally {
+            this.endStart(started);
         }
     },
 
@@ -1545,6 +1588,8 @@ const ProcessManager = {
     },
 
     startLogPolling() {
+        // Never two readers: an earlier one left running would take lines out of the queue and drop them.
+        this.stopLogPolling();
         // Poll every 100ms for new logs
         AppState.logPollInterval = setInterval(async () => {
             try {
@@ -1577,6 +1622,8 @@ const ProcessManager = {
     },
 
     startStatusMonitoring() {
+        // Never two monitors (same reason as the log reader above).
+        this.stopStatusMonitoring();
         // Poll every 500ms for process status
         AppState.statusPollInterval = setInterval(async () => {
             try {
@@ -1675,6 +1722,11 @@ const ProcessManager = {
                             ProgressManager.setStatus(`Finished with failures · ${tally}`);
                             ErrorHandler.show('Finished with failures',
                                 `Files: ${tally}. Exit status ${status.exit_code}; a run fails on: ${(summary.fails_on || ['failed']).join(', ')}. See the RUN SUMMARY in the console.`);
+                        } else if (status.working_folder_in_use) {
+                            // Another run uses the working folder: this run refused to start (1.10.2, owner W648 2).
+                            ProgressManager.setStatus(`The run did not start (exit status ${status.exit_code})`);
+                            RunStopDialog.show('The run did not start',
+                                `${status.working_folder_in_use} Nothing was processed.`, false);
                         } else if (status.exit_code === 3) {
                             // design 22.9.2 (owner D-G): this install's NVIDIA GPU cannot be used now.
                             ProgressManager.setStatus('The run did not start (exit status 3)');
@@ -1761,8 +1813,8 @@ const ProcessManager = {
         const cancelBtn = document.getElementById('cancelBtn');
         const hasFiles = AppState.selectedFiles.length > 0;
 
-        // Start button: enabled only if files exist and not running
-        startBtn.disabled = !hasFiles || AppState.isRunning;
+        // Start button: enabled only if files exist and no run is starting or running
+        startBtn.disabled = !hasFiles || AppState.isRunning || AppState.isStarting;
 
         // Cancel button: enabled only if running
         cancelBtn.disabled = !AppState.isRunning;
@@ -1897,16 +1949,211 @@ const DirectoryControls = {
 };
 
 // ============================================================
+// Speech Enhancer menu with the "For VAD only" tick box (1.10.2)
+// ============================================================
+// Owner W596 3: "enhance for VAD only" is the default for every speech enhancer; in the Speech Enhancer
+// pull-down, under a divider, a tick box "For VAD only", ticked, which the user may untick. A native <select>
+// cannot hold a tick box, so each pass's select stays in the page, hidden, and keeps its value, its change
+// events and its disabled state for the rest of this file; this menu is drawn from it. The tick box is the
+// pass's existing #passN-enhance-for-vad (its row is never shown); the menu shows it where its row's
+// data-applicable is '1' (EnsembleManager.updateEnhanceForVadCheckbox). Texts drafted for the owner's approval.
+const EnhancerMenu = {
+    VAD_LABEL: 'For VAD only',
+    VAD_TITLE: 'The cleaned-up audio is used to find the speech; the original audio goes to the ASR model. '
+        + 'On by default. Untick it to give the cleaned-up audio to the ASR model too.',
+    _menus: {},
+    _globalBound: false,
+
+    attach(passId) {
+        const select = document.getElementById(`${passId}-enhancer`);
+        if (!select || this._menus[passId]) return;
+        const box = document.getElementById(`${passId}-enhance-for-vad`);
+        const row = document.getElementById(`${passId}-enhance-vad-row`);
+
+        const wrap = document.createElement('div');
+        wrap.className = 'enh-dd';
+        select.parentNode.insertBefore(wrap, select);
+        wrap.appendChild(select);
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = select.className;
+        button.classList.add('enh-dd-button');
+        button.setAttribute('aria-haspopup', 'listbox');
+        // The button and the menu copy the select's texts, which I18n has already translated (and translate their
+        // own two texts with I18n.t), so I18n does not walk them; the select itself stays translated as before.
+        button.setAttribute('data-i18n-skip', '');
+        select.classList.add('enh-dd-native');
+        wrap.appendChild(button);
+        const menu = document.createElement('div');
+        menu.className = 'enh-dd-menu';
+        menu.setAttribute('role', 'listbox');
+        menu.setAttribute('data-i18n-skip', '');
+        menu.style.display = 'none';
+        wrap.appendChild(menu);
+        const m = { passId, select, box, row, wrap, button, menu };
+        this._menus[passId] = m;
+
+        button.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (menu.style.display === 'none') this.open(passId); else this.close(passId);
+        });
+        menu.addEventListener('click', (e) => e.stopPropagation());
+        select.addEventListener('change', () => this.refresh(passId));
+        box?.addEventListener('change', () => this.refresh(passId));
+
+        // Values set from code (presets, saved settings, pipeline presets) fire no event: repaint on them too.
+        const repaint = () => this.refresh(passId);
+        const hook = (el, proto, prop) => {
+            const d = Object.getOwnPropertyDescriptor(proto, prop);
+            if (!el || !d) return;
+            Object.defineProperty(el, prop, {
+                configurable: true,
+                get() { return d.get.call(this); },
+                set(v) { d.set.call(this, v); repaint(); }
+            });
+        };
+        hook(select, HTMLSelectElement.prototype, 'value');
+        hook(select, HTMLSelectElement.prototype, 'selectedIndex');
+        hook(box, HTMLInputElement.prototype, 'checked');
+        new MutationObserver(repaint).observe(select, {
+            attributes: true, attributeFilter: ['disabled', 'label', 'title', 'class'],
+            childList: true, subtree: true, characterData: true
+        });
+        if (row) new MutationObserver(repaint).observe(row, { attributes: true, attributeFilter: ['data-applicable'] });
+
+        if (!this._globalBound) {
+            this._globalBound = true;
+            document.addEventListener('click', () => this.closeAll());
+            document.addEventListener('keydown', (e) => { if (e.key === 'Escape') this.closeAll(); });
+        }
+        this.refresh(passId);
+    },
+
+    _short(text) {
+        // "htdemucs (Demucs v4)" -> "htdemucs"; also the full-width brackets of the Chinese texts.
+        return String(text || '').replace(/\s*[(（].*$/, '').trim();
+    },
+
+    _applies(m) {
+        return !!m.box && !!m.row && m.row.dataset.applicable === '1';
+    },
+
+    refresh(passId) {
+        const m = this._menus[passId];
+        if (!m) return;
+        const sel = m.select;
+        const opt = sel.options[sel.selectedIndex];
+        const group = opt && opt.parentElement && opt.parentElement.tagName === 'OPTGROUP' ? opt.parentElement : null;
+        const optText = opt ? opt.textContent.trim() : '';
+        // 1.10.2 (owner W598 2a): each entry carries its own name; a section heading (Vocal Separation, DSP) only
+        // groups them, so the closed menu shows the entry's name.
+        const shown = this._short(optText);
+        const isReal = !!opt && opt.value !== 'none' && opt.value !== '';
+        const vadOn = this._applies(m) && isReal && m.box.checked;
+        m.button.textContent = shown;
+        const vadNote = vadOn ? ` — ${I18n.t(this.VAD_LABEL)}` : '';
+        m.button.title = (group ? `${group.label}: ${optText}` : optText) + vadNote;
+        m.button.disabled = sel.disabled;
+        if (sel.disabled) this.close(passId);
+        if (m.menu.style.display !== 'none') this._build(m);
+    },
+
+    _item(m, opt, nested) {
+        const div = document.createElement('div');
+        div.className = 'enh-dd-item' + (nested ? '' : ' top');
+        div.setAttribute('role', 'option');
+        div.textContent = opt.textContent.trim();
+        if (opt.title) div.title = opt.title;
+        const off = opt.disabled || opt.classList.contains('coming-soon');
+        if (off) div.classList.add('disabled');
+        if (opt.value === m.select.value) {
+            div.classList.add('selected');
+            div.setAttribute('aria-selected', 'true');
+        }
+        if (!off) {
+            div.addEventListener('click', () => {
+                if (m.select.value !== opt.value) {
+                    m.select.value = opt.value;
+                    m.select.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                this.close(m.passId);
+            });
+        }
+        return div;
+    },
+
+    _build(m) {
+        const menu = m.menu;
+        menu.innerHTML = '';
+        for (const child of m.select.children) {
+            if (child.tagName === 'OPTGROUP') {
+                const head = document.createElement('div');
+                head.className = 'enh-dd-group';
+                head.textContent = child.label;
+                menu.appendChild(head);
+                for (const opt of child.children) {
+                    if (opt.tagName === 'OPTION') menu.appendChild(this._item(m, opt, true));
+                }
+            } else if (child.tagName === 'OPTION') {
+                menu.appendChild(this._item(m, child, false));
+            } else if (child.tagName === 'HR') {
+                const hr = document.createElement('hr');
+                hr.className = 'enh-dd-divider';
+                menu.appendChild(hr);
+            }
+        }
+        if (this._applies(m)) {
+            const hr = document.createElement('hr');
+            hr.className = 'enh-dd-divider';
+            menu.appendChild(hr);
+            const label = document.createElement('label');
+            label.className = 'enh-dd-vad';
+            label.title = I18n.t(this.VAD_TITLE);
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = m.box.checked;
+            cb.addEventListener('change', () => {
+                m.box.checked = cb.checked;
+                m.box.dispatchEvent(new Event('change', { bubbles: true }));
+            });
+            const span = document.createElement('span');
+            span.textContent = I18n.t(this.VAD_LABEL);
+            label.appendChild(cb);
+            label.appendChild(span);
+            menu.appendChild(label);
+        }
+    },
+
+    open(passId) {
+        const m = this._menus[passId];
+        if (!m || m.select.disabled) return;
+        this.closeAll();
+        this._build(m);
+        m.menu.style.display = 'block';
+        m.button.setAttribute('aria-expanded', 'true');
+    },
+
+    close(passId) {
+        const m = this._menus[passId];
+        if (!m) return;
+        m.menu.style.display = 'none';
+        m.button.setAttribute('aria-expanded', 'false');
+    },
+
+    closeAll() {
+        Object.keys(this._menus).forEach(k => this.close(k));
+    }
+};
+
+// ============================================================
 // Two-Pass Ensemble Manager
 // ============================================================
 const EnsembleManager = {
-    // v1.10.0 (item 3, owner W75): speech enhancers WhisperJAV no longer includes.
-    // A remembered setting or an Ensemble preset can still name one. That pass is
-    // then marked until the user chooses an entry in its enhancer list, and Start
-    // is refused while it is marked (text M2, owner W79). removedEnhancer holds the
-    // saved value while the mark stands, so the settings file keeps it until the
-    // user chooses (it is not rewritten on load).
-    REMOVED_ENHANCERS: { clearvoice: 'ClearVoice' },
+    // 1.10.2 (owner W603, rule (ii)): a remembered setting or an Ensemble preset can name a
+    // speech enhancer the Speech Enhancer menu no longer offers. That pass is then marked
+    // until the user chooses an entry in its menu, and Start is refused while it is marked
+    // (text approved, owner W603). removedEnhancer holds the saved value while the mark
+    // stands, so the settings file keeps it until the user chooses (it is not rewritten on load).
     removedEnhancer: { pass1: null, pass2: null },
 
     // State - Full Configuration Snapshot approach
@@ -1936,7 +2183,8 @@ const EnsembleManager = {
             isXxl: false,  // Track if using BYOP Faster Whisper XXL (pass 1 too since 1.10.0, item 5)
             framer: 'vad-grouped',  // Qwen temporal framer (vad-grouped/full-scene)
             dspEffects: ['loudnorm'],  // Default FFmpeg DSP effects
-            enhanceForVad: false,  // Dual-track: use enhanced audio for VAD only, original for ASR
+            // Dual-track: use enhanced audio for VAD only, original for ASR. On by default since 1.10.2 (owner W596 3).
+            enhanceForVad: true,
             // A CrispASR pass's word timestamps, from its Customize Timing tab (1.10.1; owner W413): 'model',
             // 'aligner', or null for the pipeline's default (crispasrDefaults). Sent as --passN-word-timestamps.
             wordTimestamps: null
@@ -1966,7 +2214,8 @@ const EnsembleManager = {
             isXxl: false,  // Track if using BYOP Faster Whisper XXL
             framer: 'vad-grouped',  // Qwen temporal framer (vad-grouped/full-scene)
             dspEffects: ['loudnorm'],  // Default FFmpeg DSP effects
-            enhanceForVad: false,  // Dual-track: use enhanced audio for VAD only, original for ASR
+            // Dual-track: use enhanced audio for VAD only, original for ASR. On by default since 1.10.2 (owner W596 3).
+            enhanceForVad: true,
             // A CrispASR pass's word timestamps, from its Customize Timing tab (1.10.1; owner W413): 'model',
             // 'aligner', or null for the pipeline's default (crispasrDefaults). Sent as --passN-word-timestamps.
             wordTimestamps: null
@@ -2062,6 +2311,14 @@ const EnsembleManager = {
         'moss-crispasr': [
             { value: 'moss-transcribe-diarize-0.9b-f16', label: 'MOSS-Transcribe-Diarize 0.9B (f16), ~2.1 GB VRAM' },
             { value: 'moss-transcribe-diarize-0.9b-q8_0', label: 'MOSS-Transcribe-Diarize 0.9B (q8_0), ~1.7 GB VRAM' }
+        ],
+        // 1.10.2 (owner W574): only the files the GGUF model test tool ran.
+        'haas-crispasr': [
+            { value: 'haas-ja-v1.0-f16', label: 'Haas ja v1.0 (f16), ~1.6 GB VRAM' },
+            { value: 'haas-ja-v1.0-q8_0', label: 'Haas ja v1.0 (q8_0), ~0.9 GB VRAM' }
+        ],
+        'qwen3-asr-crispasr': [
+            { value: 'qwen3-asr-1.7b-f16', label: 'Qwen3-ASR 1.7B (f16), ~6.3 GB VRAM' }
         ]
     },
     // Each CrispASR pipeline's speech segmenter and sensitivity when a pass names none
@@ -2078,7 +2335,11 @@ const EnsembleManager = {
         'whisper-turbo-crispasr': { segmenter: 'firered-vad', sensitivity: 'balanced', wordTimestamps: 'model' },
         'whisper-large-crispasr': { segmenter: 'firered-vad', sensitivity: 'balanced', wordTimestamps: 'model' },
         // MOSS-CrispASR (owner W482): semantic scenes of 90-240 s and FireRedVAD (crispasr/pass_settings.py).
-        'moss-crispasr': { segmenter: 'firered-vad', sensitivity: 'balanced', wordTimestamps: 'model', scene: 'semantic' }
+        'moss-crispasr': { segmenter: 'firered-vad', sensitivity: 'balanced', wordTimestamps: 'model', scene: 'semantic' },
+        // 1.10.2 (owner W574): Parakeet-CrispASR's segmenter settings, on whose VAD groups both were measured;
+        // Qwen3-ASR's text is timed by the aligner (its model gives no times).
+        'haas-crispasr': { segmenter: 'ten', sensitivity: 'aggressive', wordTimestamps: 'model' },
+        'qwen3-asr-crispasr': { segmenter: 'ten', sensitivity: 'aggressive', wordTimestamps: 'aligner' }
     },
     crispasrDefaultScene(pipeline) {
         const defaults = this.crispasrDefaults[pipeline];
@@ -2156,6 +2417,11 @@ const EnsembleManager = {
             this.state.pass2.speechSegmenter = seg2.value;
         }
         this.state.pass2.model = document.getElementById('pass2-model').value;
+        // 1.10.2 (owner W596 3): the "For VAD only" tick box of each Speech Enhancer menu (ticked in index.html).
+        ['pass1', 'pass2'].forEach(p => {
+            const box = document.getElementById(`${p}-enhance-for-vad`);
+            if (box) this.state[p].enhanceForVad = box.checked;
+        });
 
         this.state.mergeStrategy = document.getElementById('merge-strategy').value;
         this.state.serialMode = document.getElementById('ensemble-serial').checked;
@@ -2276,6 +2542,10 @@ const EnsembleManager = {
                 e.target.value = this.state.pass1.sceneDetector;
                 return;
             }
+            if (!this.confirmComponentChangeReset('pass1', 'scene')) {
+                e.target.value = this.state.pass1.sceneDetector;
+                return;
+            }
             this.state.pass1.sceneDetector = e.target.value;
         });
         document.getElementById('pass1-enhancer').addEventListener('change', (e) => {
@@ -2299,6 +2569,10 @@ const EnsembleManager = {
             if (e.target.dataset.mode === 'vad-version') {
                 this.state.pass1.vadVersion = e.target.value;
             } else {
+                if (!this.confirmComponentChangeReset('pass1', 'segmenter')) {
+                    e.target.value = this.state.pass1.speechSegmenter;
+                    return;
+                }
                 this.state.pass1.speechSegmenter = e.target.value;
             }
         });
@@ -2312,6 +2586,10 @@ const EnsembleManager = {
             // A disabled option (rscn for a pipeline without it, 1.10.1) is not a choice: keep what the pass had.
             const chosen = e.target.options[e.target.selectedIndex];
             if (chosen && chosen.disabled) {
+                e.target.value = this.state.pass2.sceneDetector;
+                return;
+            }
+            if (!this.confirmComponentChangeReset('pass2', 'scene')) {
                 e.target.value = this.state.pass2.sceneDetector;
                 return;
             }
@@ -2338,6 +2616,10 @@ const EnsembleManager = {
             if (e.target.dataset.mode === 'vad-version') {
                 this.state.pass2.vadVersion = e.target.value;
             } else {
+                if (!this.confirmComponentChangeReset('pass2', 'segmenter')) {
+                    e.target.value = this.state.pass2.speechSegmenter;
+                    return;
+                }
                 this.state.pass2.speechSegmenter = e.target.value;
             }
         });
@@ -2434,6 +2716,11 @@ const EnsembleManager = {
         this.updateBadges();
         this.updateRowGreyingState('pass1');
         this.updateRowGreyingState('pass2');
+        // 1.10.2 (owner W596 3): the Speech Enhancer menus with their "For VAD only" tick box.
+        EnhancerMenu.attach('pass1');
+        EnhancerMenu.attach('pass2');
+        this.updateEnhanceForVadCheckbox('pass1');
+        this.updateEnhanceForVadCheckbox('pass2');
     },
 
     // The CrispASR pipelines (1.10.0; 1.10.1, owner W401): the keys of crispasrModels, which are
@@ -3079,6 +3366,25 @@ const EnsembleManager = {
         segmenterSelect.dataset.svActive = '0';
     },
 
+    // 1.10.2 (known fault K2 of 1.10.1): Customize values are set for one speech segmenter and one scene detector.
+    // When either changes after Apply, the saved values are reset -- after asking -- as a pipeline or sensitivity
+    // change already does; before, the new one ran with the earlier one's values (e.g. TEN with FireRedVAD's
+    // threshold). Returns false when the user keeps the custom values (the caller then puts the dropdown back).
+    confirmComponentChangeReset(passKey, component) {
+        const passState = this.state[passKey];
+        if (!passState.customized) return true;
+        const passLabel = passKey === 'pass1' ? 'Pass 1' : 'Pass 2';
+        const text = component === 'scene'
+            ? `You have custom parameters for ${passLabel}. Changing the scene detector will reset them. Continue?`
+            : `You have custom parameters for ${passLabel}. Changing the speech segmenter will reset them. Continue?`;
+        if (!confirm(I18n.t(text))) return false;
+        passState.customized = false;
+        passState.params = null;
+        passState.presetName = null;
+        this.updateBadges();
+        return true;
+    },
+
     handleSensitivityChange(passKey, newValue, selectElement) {
         const passState = this.state[passKey];
 
@@ -3134,10 +3440,14 @@ const EnsembleManager = {
         this.updateByopPanel();
     },
 
-    // v1.10.0 (item 3): removed speech enhancers -- see REMOVED_ENHANCERS above.
+    // 1.10.2 (owner W603): a speech enhancer value the Speech Enhancer menu does not offer -- see removedEnhancer above.
+    // None and an empty value are not a choice of enhancer and are never marked.
     isRemovedEnhancer(value) {
-        const backend = String(value || '').split(':')[0].trim().toLowerCase();
-        return Object.prototype.hasOwnProperty.call(this.REMOVED_ENHANCERS, backend);
+        const wanted = String(value ?? '').trim();
+        if (!wanted || wanted === 'none') return false;
+        const select = document.getElementById('pass1-enhancer');
+        if (!select) return false;
+        return !Array.from(select.options).some(o => o.value === wanted && !o.dataset.removedEnhancer);
     },
 
     markRemovedEnhancer(passKey, value) {
@@ -3155,8 +3465,9 @@ const EnsembleManager = {
             marker.dataset.removedEnhancer = '1';
             select.insertBefore(marker, select.firstChild);
         }
-        const backend = String(value).split(':')[0].trim().toLowerCase();
-        marker.textContent = `${this.REMOVED_ENHANCERS[backend]} (no longer included)`;
+        // The name as saved, without what follows a colon ("zipenhancer:onnx" -> "zipenhancer").
+        const name = String(value).split(':')[0].trim();
+        marker.textContent = `${name} (no longer offered)`;
         marker.selected = true;
         this.updateDspPanel(passKey);
     },
@@ -3204,26 +3515,29 @@ const EnsembleManager = {
         this.updateEnhanceForVadCheckbox(passId);
     },
 
-    // Enhance-for-VAD checkbox visibility
+    // Enhance-for-VAD: where the "For VAD only" tick box of the Speech Enhancer menu applies.
+    // 1.10.2 (owner W596 3): ticked by default; the menu (EnhancerMenu) shows it under a divider, so the old
+    // row under the menu is never shown; its tick box carries the value.
     updateEnhanceForVadCheckbox(passId) {
         const row = document.getElementById(`${passId}-enhance-vad-row`);
         if (!row) return;
-        const enhancer = document.getElementById(`${passId}-enhancer`)?.value || 'none';
         const isEnabled = passId === 'pass1' || this.state.pass2.enabled;
         const isXxl = !!this.state[passId]?.isXxl;
         // Owner, 2026-09-17: "balanced shall not have the VAD only enhancement."
         // Balanced detects speech inside faster-whisper's own call, on the audio
         // it recognises, so there is no second track to feed. Offering the box
-        // there would promise something the pipeline cannot do.
+        // there would promise something the pipeline cannot do. Transformers runs
+        // no separate speech segmenter either. The value is kept, not cleared: the
+        // GUI sends no flag for these pipelines (api.py ONE_TRACK_PIPELINES), and a
+        // pass switched back to another pipeline keeps the user's choice.
         const isBalanced = this.state[passId]?.pipeline === 'balanced';
-        // Show when a real enhancer is selected (not none) and pass is enabled
-        row.style.display = (enhancer !== 'none' && enhancer !== '' && isEnabled
-                             && !isXxl && !isBalanced) ? 'block' : 'none';
-        if (isBalanced && this.state[passId]) {
-            // Clear it too, so a value left over from another pipeline is not
-            // carried into the run by a control the user can no longer see.
-            this.state[passId].enhanceForVad = false;
-        }
+        const isTransformers = !!this.state[passId]?.isTransformers;
+        // 1.10.2 (step 7 review): fast and faster run no speech enhancer and no separate speech segmenter, and the
+        // GUI sends no flag for them either (api.py ONE_TRACK_PIPELINES); the tick box is not offered there.
+        const isFastOrFaster = ['fast', 'faster'].includes(this.state[passId]?.pipeline);
+        row.style.display = 'none';
+        row.dataset.applicable = (isEnabled && !isXxl && !isBalanced && !isTransformers && !isFastOrFaster)
+            ? '1' : '0';
         // The tick box and the stored value are two separate things, and until
         // now only the balanced rule above ever wrote the box. Anything else
         // that set the value -- ticking it inside the Customize window, or
@@ -3723,6 +4037,11 @@ const EnsembleManager = {
         model: { text: 'From the model', defaultText: 'From the model (default)' },
         aligner: { text: 'From the aligner (wav2vec2-ja)', defaultText: 'From the aligner (wav2vec2-ja) (default)' }
     },
+    // A pipeline whose model gives no times of its own (1.10.2, owner W574: Qwen3-ASR-CrispASR): without the aligner
+    // each VAD group is one subtitle at its edges, so "From the model" would promise times the model does not give.
+    CRISPASR_NO_MODEL_TIMES: {
+        'qwen3-asr-crispasr': 'From the VAD groups (this model gives no times)'
+    },
 
     crispasrDefaultWordTimestamps(pipeline) {
         const defaults = this.crispasrDefaults[pipeline];
@@ -3758,7 +4077,8 @@ const EnsembleManager = {
         for (const [value, texts] of Object.entries(this.CRISPASR_WORD_TIMESTAMP_OPTIONS)) {
             const option = document.createElement('option');
             option.value = value;
-            option.textContent = value === pipelineDefault ? texts.defaultText : texts.text;
+            const noTimes = value === 'model' ? this.CRISPASR_NO_MODEL_TIMES[passState.pipeline] : null;
+            option.textContent = noTimes || (value === pipelineDefault ? texts.defaultText : texts.text);
             option.selected = value === current;
             select.appendChild(option);
         }
@@ -4525,7 +4845,7 @@ const EnsembleManager = {
         const enhTab = document.getElementById('tab-enhancer');
         const enhNote = document.createElement('p');
         enhNote.className = 'tab-empty';
-        enhNote.innerHTML = 'Speech enhancement is selected in the main Ensemble tab.<br>This tab only tunes the BS-RoFormer enhancer when it is selected there.';
+        enhNote.innerHTML = 'Speech enhancement is selected in the main Ensemble tab.';
         enhTab.appendChild(enhNote);
         const enhSec = schema.enhancer || {};
         if (enhSec.bsrf_overlap) {
@@ -6314,7 +6634,7 @@ const EnsembleManager = {
 
         // Collect values from all tab panels (includes context tab for Qwen).
         // Enhancer tab params are routed to a separate dict because neural
-        // enhancer backends (zipenhancer, bs-roformer, htdemucs) expose
+        // enhancer backends (zipenhancer and the others) expose
         // "device" and "model" keys that collide with the ASR model tab's
         // identically-named keys. The enhancer backend receives its config
         // via --passN-speech-enhancer, not via --passN-params.
@@ -7234,8 +7554,8 @@ const EnsembleManager = {
             if (preset.pipeline) passState.pipeline = preset.pipeline;
             if (preset.sensitivity) passState.sensitivity = preset.sensitivity;
             if (preset.sceneDetector) passState.sceneDetector = preset.sceneDetector;
-            // v1.10.0 (item 3): a removed enhancer (ClearVoice) is not taken into the
-            // state; the pass is marked below instead.
+            // 1.10.2 (owner W603): a speech enhancer the menu no longer offers is not taken into
+            // the state; the pass is marked below instead.
             const presetEnhancerRemoved = this.isRemovedEnhancer(preset.speechEnhancer);
             if (preset.speechEnhancer !== undefined && !presetEnhancerRemoved) {
                 passState.speechEnhancer = preset.speechEnhancer;
@@ -7245,7 +7565,11 @@ const EnsembleManager = {
             if (preset.model) passState.model = preset.model;
             if (preset.framer) passState.framer = preset.framer;
             if (preset.dspEffects) passState.dspEffects = preset.dspEffects;
-            passState.enhanceForVad = preset.enhanceForVad || false;
+            // 1.10.2 default (owner W596 3). A preset saved before 1.10.2 (schema 1.0.0, or none) holds the old default,
+            // false, which cannot be told from a deliberate untick: it is read as not set (owner W602 2).
+            // (api.py _PRESET_MAP hands the file's schema_version over as schemaVersion.)
+            const savedBefore1102 = !preset.schemaVersion || preset.schemaVersion === '1.0.0';
+            passState.enhanceForVad = (savedBefore1102 ? undefined : preset.enhanceForVad) ?? true;
             passState.isTransformers = presetIsTransformers;
             passState.isQwen = presetIsQwen;
             passState.isAnimeWhisper = presetIsAnimeWhisper;
@@ -7515,29 +7839,35 @@ const EnsembleManager = {
     },
 
     async startProcessing() {
+        // A run is already starting or running: this click starts nothing (1.10.2, owner W647 1).
+        if (AppState.isStarting || AppState.isRunning) return;
+
         // Validate
         if (AppState.selectedFiles.length === 0) {
             ErrorHandler.show('No Files Selected', 'Please add at least one file or folder before starting.');
             return;
         }
 
-        // v1.10.0 (item 3, owner W75): a pass still marked with a removed enhancer
-        // (ClearVoice) does not start. Text M2 (owner, W79).
+        // 1.10.2 (owner W603, rule (ii)): a pass still marked with a speech enhancer the menu no
+        // longer offers does not start. Text approved, owner W603; each message whole, so it has one
+        // Chinese text (1.10.0, item 6).
         const marked = this.passesWithRemovedEnhancer();
         if (marked.length) {
-            const which = marked.length === 2 ? 'Pass 1 and Pass 2'
-                : (marked[0] === 'pass1' ? 'Pass 1' : 'Pass 2');
-            // 1.10.0 (item 6): each first sentence whole, so it has one Chinese text; same English.
-            const first = marked.length === 2
-                ? 'Pass 1 and Pass 2 use ClearVoice in your saved settings.'
-                : `${which} uses ClearVoice in your saved settings.`;
-            ErrorHandler.show('ClearVoice is no longer included',
-                `${first} ` +
-                `ClearVoice is no longer included in WhisperJAV 1.10. ` +
-                `Choose another speech enhancer for ${which}, then press Start again.`);
+            const which = marked[0] === 'pass1' ? 'Pass 1' : 'Pass 2';
+            const shown = [...new Set(marked.map(k => String(this.removedEnhancer[k]).split(':')[0].trim()))]
+                .join('", "');
+            ErrorHandler.show('Speech enhancer no longer offered', marked.length === 2
+                ? `Pass 1 and Pass 2 use a speech enhancer that WhisperJAV no longer offers ("${shown}") in your ` +
+                  `saved settings. Choose another speech enhancer for Pass 1 and Pass 2, then press Start again.`
+                : `${which} uses a speech enhancer that WhisperJAV no longer offers ("${shown}") in your saved ` +
+                  `settings. Choose another speech enhancer for ${which}, then press Start again.`);
             return;
         }
 
+        // From here to the end of the start call the Start button is greyed and shows "Starting...": the call
+        // launches the run and can take many seconds, and every click in that time used to start one more run.
+        if (!ProcessManager.beginStart()) return;
+        let started = false;
         try {
             const config = this.collectConfig();
 
@@ -7558,6 +7888,7 @@ const EnsembleManager = {
 
             if (result.success) {
                 // Update UI state
+                started = true;
                 AppState.isRunning = true;
                 ProcessManager.updateButtonStates();
 
@@ -7579,6 +7910,8 @@ const EnsembleManager = {
             }
         } catch (error) {
             ErrorHandler.show('Start Error', error.toString());
+        } finally {
+            ProcessManager.endStart(started);
         }
     },
 
@@ -7624,13 +7957,20 @@ const EnsembleManager = {
                     const lookupName = backend === 'silero-v4.0' ? 'silero' : backend;
                     const info = availabilityMap[lookupName];
 
+                    // 1.10.2 (step 7 review): the install hint replaces the page's own hover text only while the
+                    // backend is missing; an available one keeps its text (it used to be blanked here, so the
+                    // page's descriptions never showed).
                     if (info && !info.available) {
+                        if (option.dataset.pageTitle === undefined) option.dataset.pageTitle = option.title || '';
                         option.disabled = true;
                         option.title = info.hint || 'Not available';
                         option.textContent = I18n.englishText(option).replace(/ \(N\/A\)$/, '') + ' (N/A)';
                     } else {
                         option.disabled = false;
-                        option.title = '';
+                        if (option.dataset.pageTitle !== undefined) {
+                            option.title = option.dataset.pageTitle;
+                            delete option.dataset.pageTitle;
+                        }
                         option.textContent = I18n.englishText(option).replace(/ \(N\/A\)$/, '');
                     }
                 });
@@ -7645,7 +7985,7 @@ const EnsembleManager = {
     /**
      * Update enhancer dropdown options based on backend availability.
      * Called on pywebviewready when API becomes available.
-     * Handles both plain format ("bs-roformer") and backend:model format ("bs-roformer:vocals").
+     * Handles both plain format ("zipenhancer") and backend:model format ("zipenhancer:onnx").
      */
     async updateEnhancerAvailability() {
         if (!window.pywebview || !pywebview.api) {
@@ -7683,13 +8023,20 @@ const EnsembleManager = {
                     const backend = value.includes(':') ? value.split(':')[0] : value;
                     const info = availabilityMap[backend];
 
+                    // 1.10.2 (step 7 review): the install hint replaces the page's own hover text only while the
+                    // backend is missing; an available one keeps its text (it used to be blanked here, so the
+                    // page's descriptions never showed).
                     if (info && !info.available) {
+                        if (option.dataset.pageTitle === undefined) option.dataset.pageTitle = option.title || '';
                         option.disabled = true;
                         option.title = info.hint || 'Not available';
                         option.textContent = I18n.englishText(option).replace(/ \(N\/A\)$/, '') + ' (N/A)';
                     } else {
                         option.disabled = false;
-                        option.title = '';
+                        if (option.dataset.pageTitle !== undefined) {
+                            option.title = option.dataset.pageTitle;
+                            delete option.dataset.pageTitle;
+                        }
                         option.textContent = I18n.englishText(option).replace(/ \(N\/A\)$/, '');
                     }
                 });
@@ -9316,6 +9663,9 @@ const TranslatorManager = {
     },
 
     async startTranslation() {
+        // A translation is already starting or running: this click starts nothing (1.10.2, owner W647 1).
+        if (this.state.isRunning) return;
+
         if (AppState.selectedFiles.length === 0) {
             ErrorHandler.show('No Files', 'Add SRT files in the Source section above, then start translation.');
             return;
@@ -10093,6 +10443,8 @@ const SettingsPersistence = {
         'pass1-sensitivity':{ key: 'pass1Sensitivity',    prop: 'value' },
         'pass1-scene':      { key: 'pass1SceneDetector',  prop: 'value' },
         'pass1-enhancer':   { key: 'pass1SpeechEnhancer', prop: 'value' },
+        // 1.10.2 (step 7 review): the "For VAD only" tick box of the Speech Enhancer menu (owner W596 3).
+        'pass1-enhance-for-vad': { key: 'pass1EnhanceForVad', prop: 'checked' },
         'pass1-segmenter':  { key: 'pass1SpeechSegmenter',prop: 'value' },
         'pass1-model':      { key: 'pass1Model',          prop: 'value' },
         'pass2-enabled':    { key: 'pass2Enabled',        prop: 'checked' },
@@ -10100,6 +10452,7 @@ const SettingsPersistence = {
         'pass2-sensitivity':{ key: 'pass2Sensitivity',    prop: 'value' },
         'pass2-scene':      { key: 'pass2SceneDetector',  prop: 'value' },
         'pass2-enhancer':   { key: 'pass2SpeechEnhancer', prop: 'value' },
+        'pass2-enhance-for-vad': { key: 'pass2EnhanceForVad', prop: 'checked' },
         'pass2-segmenter':  { key: 'pass2SpeechSegmenter',prop: 'value' },
         'pass2-model':      { key: 'pass2Model',          prop: 'value' },
         'merge-strategy':   { key: 'mergeStrategy',       prop: 'value' },
@@ -10127,7 +10480,7 @@ const SettingsPersistence = {
             const el = document.getElementById(id);
             if (el) out[spec.key] = el[spec.prop];
         }
-        // v1.10.0 (item 3): while a pass is marked with a removed enhancer, its saved
+        // While a pass is marked with a speech enhancer the menu no longer offers, its saved
         // value stays as it was; it changes only when the user chooses an entry.
         if (typeof EnsembleManager !== 'undefined') {
             for (const pass of ['pass1', 'pass2']) {
@@ -10174,8 +10527,8 @@ const SettingsPersistence = {
                     `A setting saved earlier, "${wanted}", is no longer one of the ` +
                     `choices, so "${el.value || 'nothing'}" has been kept instead.`,
                     'warn');
-                // v1.10.0 (item 3): a removed enhancer (ClearVoice) marks the pass, so
-                // Start asks the user to choose another one (M2).
+                // 1.10.2 (owner W603): a speech enhancer the menu no longer offers marks the
+                // pass, so Start asks the user to choose another one.
                 const pass = { 'pass1-enhancer': 'pass1', 'pass2-enhancer': 'pass2' }[id];
                 if (pass && typeof EnsembleManager !== 'undefined'
                         && EnsembleManager.isRemovedEnhancer(wanted)) {

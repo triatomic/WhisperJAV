@@ -31,7 +31,7 @@ Video → Pass 2 (Pipeline B) → SRT₂ ─┘
 
 | 控件 | 说明 |
 |------|------|
-| **Pipeline** | 这一轮的处理管线，分为六组：基于 Whisper（Balanced、Fast、Faster、Fidelity）、HuggingFace（Transformers (HF)）、ChronosJAV（Qwen3-ASR、Anime-Whisper）、外部 (BYOP)（XXL Faster Whisper）、GGUF via crispasr（parakeet、cohere），以及分隔线下方的 实验性，欢迎反馈（reazonspeech、kotoba、whisper-turbo、whisper-large、MOSS）。第一轮开始时为 cohere，第二轮为 parakeet。选择处理管线时，这一轮的灵敏度和语音分割器会随之设为它自己的值 |
+| **Pipeline** | 这一轮的处理管线，分为六组：基于 Whisper（Balanced、Fast、Faster、Fidelity）、HuggingFace（Transformers (HF)）、ChronosJAV（Qwen3-ASR、Anime-Whisper）、外部 (BYOP)（XXL Faster Whisper）、GGUF via crispasr（parakeet、cohere），以及分隔线下方的 实验性，欢迎反馈（reazonspeech、kotoba、whisper-turbo、whisper-large、MOSS、haas、qwen3-asr）。第一轮开始时为 cohere，第二轮为 parakeet。选择处理管线时，这一轮的灵敏度和语音分割器会随之设为它自己的值 |
 | **Sensitivity** | 检测阈值（高灵敏、中灵敏、低灵敏） |
 | **Scene Detector** | 音频场景检测方式（Auditok、Silero、Semantic、None） |
 | **Speech Enhancer** | 音频预处理 / 语音增强（None、FFmpeg DSP、ZipEnhancer、htdemucs） |
@@ -47,7 +47,7 @@ Video → Pass 2 (Pipeline B) → SRT₂ ─┘
 | 策略（GUI） | 命令行 | 作用 |
 |------|------|------|
 | **第一轮 + 用第二轮填补**（Pass 1 + Fill From Pass 2，默认） | `pass1_primary` | 保留第一轮的全部字幕；第二轮的字幕只在不与任何第一轮字幕重叠时加入 |
-| **智能合并（质量最佳）**（Smart Merge (Best Quality)） | `smart_merge` | 把每条第一轮字幕与和它重叠最多的第二轮字幕配对（重叠至少为较短一条的 30%），每对只保留一条：自身长度落在重叠部分里的比例更大的那条；比例相近时取文字更多的那条（由很少几种字符组成的行，如 ああああああああああ，按没有文字计）；再相同时取较短的那条。没有配对的字幕两轮都保留 |
+| **智能合并**（Smart Merge） | `smart_merge` | 把每条第一轮字幕与和它重叠最多的第二轮字幕配对（重叠至少为较短一条的 30%），每对只保留一条：自身长度落在重叠部分里的比例更大的那条；比例相近时取文字更多的那条（由很少几种字符组成的行，如 ああああああああああ，按没有文字计）；再相同时取较短的那条。没有配对的字幕两轮都保留 |
 | **完全合并（全部字幕行）**（Full Merge (All Lines)） | `full_merge` | 两轮的全部字幕按时间排列；重叠的字幕都保留 |
 | **第二轮 + 用第一轮填补**（Pass 2 + Fill From Pass 1） | `pass2_primary` | 同"第一轮 + 用第二轮填补"，两轮互换 |
 | **第一轮 + 填补（30% 重叠）**（Pass 1 + Fill (30% Overlap)） | `pass1_overlap` | 保留第一轮的全部字幕；第二轮的字幕只要与第一轮字幕的重叠不超过那条第一轮字幕长度的 30% 就加入 |

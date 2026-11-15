@@ -306,9 +306,12 @@ class SenseVoicePipeline(BasePipeline):
                 logger.info("Speech enhancer is passthrough — skipping enhancement")
                 master_metadata["config"]["speech_enhancement"] = {"backend": "none", "skipped": True}
             else:
+                # 1.10.2 removed the BS-RoFormer enhancer; its overlap knob has no
+                # enhancer left to apply to, so it is accepted but not forwarded.
                 _enh_kwargs = {}
                 if self._bsrf_overlap is not None:
-                    _enh_kwargs["num_overlap"] = self._bsrf_overlap
+                    logger.debug("sv_bsrf_overlap=%s ignored (BS-RoFormer was removed in 1.10.2)",
+                                 self._bsrf_overlap)
                 enhancer = create_enhancer_direct(
                     backend=self._enhancer_config["backend"],
                     model=self._enhancer_config["model"],

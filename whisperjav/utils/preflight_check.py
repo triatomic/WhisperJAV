@@ -90,12 +90,85 @@ CRISPASR_MODEL_NAME = "CrispASR model {model}"
 CRISPASR_MODEL_TEXT = "{label}, for {pipeline}: {state}"
 # What uses an aligner or timing-model file (item 12). Texts approved by the owner as drafted (W268);
 # design note 2026-10-28 section 9, Q11.
-CRISPASR_DEFAULT_ALIGNER_FOR = "ChronosJAV and Cohere-CrispASR (aligner)"
+# 1.10.2 (owner W574): Qwen3-ASR-CrispASR also uses it by default.
+CRISPASR_DEFAULT_ALIGNER_FOR = "ChronosJAV, Cohere-CrispASR and Qwen3-ASR-CrispASR (aligner)"
 CRISPASR_ALIGNER_FOR = "ChronosJAV (aligner)"
 CRISPASR_TIMING_FOR = "ChronosJAV (timing model)"
 CRISPASR_DOWNLOADED = "downloaded"
 CRISPASR_MODEL_NOT_DOWNLOADED = "not downloaded ({size})"
 CRISPASR_CHECK_FAILED = "could not be checked: {error}"
+
+
+# 1.10.2 (owner W563, item 3): --check also prints what support asks for first, so one command's output answers
+# it: WhisperJAV's version and this Python; where PyTorch is loaded from (#502: a PyTorch outside the install loaded
+# before the installed one); PYTHONPATH and the user's own package folder, which Python reads before the install's
+# own packages; and whether the addresses installs and downloads need answer from this computer (#495).
+# Texts approved by the owner (W613).
+INSTALL_PYTHON_TEXT = "WhisperJAV {version}; Python {python} at {executable}"
+TORCH_INSIDE_TEXT = "PyTorch {version} is loaded from this Python's own packages: {folder}"
+# #502's case: a PyTorch elsewhere is found before the one in the install's own package folder.
+TORCH_SHADOWED_TEXT = ("PyTorch {version} is loaded from {folder}, ahead of the PyTorch in this install's own "
+                       "packages ({own}); that other PyTorch is used instead of the install's.")
+TORCH_ELSEWHERE_TEXT = "PyTorch {version} is loaded from {folder} (this Python's own packages: {own})"
+PYTHONPATH_TEXT = "PYTHONPATH is set; this Python reads these folders before its own packages: {value}"
+USER_SITE_TEXT = "Your own Python package folder is read before this Python's own packages: {folder}"
+# The install's own release file: a HEAD request follows GitHub's redirect to its release-download host, the
+# path the install takes for GitHub-hosted packages (a network can let github.com through and block that host).
+GITHUB_DOWNLOAD_PROBE = ("https://github.com/meizhong986/WhisperJAV/releases/download/v1.10.1/"
+                         "whisperjav-1.10.1-py3-none-any.whl")
+NETWORK_OK_TEXT = "These addresses answer from this computer: {hosts}"
+NETWORK_FAIL_TEXT = ("No answer from {failed} ({reasons}). Installs and upgrades need pypi.org, "
+                     "download.pytorch.org and GitHub's release downloads; model downloads need {hf}. "
+                     "Proxy in use: {proxy}")
+NETWORK_TIMEOUT_S = 8
+
+
+def _network_targets() -> List[Tuple[str, str]]:
+    """(name, url) of each address to test; the model address follows HF_ENDPOINT when it is set."""
+    hf = (os.environ.get("HF_ENDPOINT") or "").strip().rstrip("/")
+    return [("pypi.org", "https://pypi.org/simple/"),
+            ("download.pytorch.org", "https://download.pytorch.org/whl/"),
+            ("GitHub release downloads", GITHUB_DOWNLOAD_PROBE),
+            (hf.split("://")[-1] if hf else "huggingface.co", (hf or "https://huggingface.co") + "/")]
+
+
+def _address_answers(url: str) -> Optional[str]:
+    """None when the address answers at all (any HTTP status), else why it did not."""
+    import urllib.error
+    import urllib.request
+    try:
+        from whisperjav.__version__ import __version__ as version
+    except Exception:
+        version = ""
+    request = urllib.request.Request(url, method="HEAD", headers={"User-Agent": f"WhisperJAV/{version}".rstrip("/")})
+    try:
+        urllib.request.urlopen(request, timeout=NETWORK_TIMEOUT_S).close()
+        return None
+    except urllib.error.HTTPError:
+        return None  # the server answered; the status does not matter here
+    except Exception as exc:  # noqa: BLE001 - every network failure is reported the same way
+        reason = getattr(exc, "reason", exc)
+        return str(reason) or type(exc).__name__
+
+
+def _probe_all(targets: List[Tuple[str, str]]) -> List[Tuple[str, Optional[str]]]:
+    """Test every address at once, waiting at most NETWORK_TIMEOUT_S + 4 s in all (a name lookup is not bound
+    by the socket timeout, so each test runs in a daemon thread that is left behind if it does not finish)."""
+    import threading
+    import time
+    answers: Dict[str, Optional[str]] = {}
+
+    def run(name, url):
+        answers[name] = _address_answers(url)
+
+    threads = [threading.Thread(target=run, args=t, daemon=True) for t in targets]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + NETWORK_TIMEOUT_S + 4
+    for t in threads:
+        t.join(max(0.0, deadline - time.monotonic()))
+    late = f"no answer within {NETWORK_TIMEOUT_S + 4} s"
+    return [(name, answers[name] if name in answers else late) for name, _url in targets]
 
 
 def cublas12_files_missing() -> List[str]:
@@ -153,6 +226,7 @@ class PreflightChecker:
         
         # Run checks in order of importance
         self._check_python_version()
+        self._check_install_python()
         self._check_cuda_availability()
         self._check_pytorch_cuda()
         self._check_cublas12_for_faster_whisper()
@@ -162,6 +236,7 @@ class PreflightChecker:
         self._check_dependencies()
         self._check_downloaded_segmenter_models()
         self._check_crispasr()
+        self._check_network()
 
         # Display results
         self._display_results()
@@ -169,6 +244,82 @@ class PreflightChecker:
         # Return False if any fatal check failed
         return not any(r.fatal and r.status == CheckStatus.FAIL for r in self.results)
     
+    def _check_install_python(self):
+        """1.10.2 (W563): WhisperJAV's version, this Python, and what it reads before its own packages (#502)."""
+        import site
+        try:
+            from whisperjav.__version__ import __version__ as version
+        except Exception:
+            version = "unknown"
+        v = sys.version_info
+        self.results.append(CheckResult(
+            name="WhisperJAV", status=CheckStatus.INFO,
+            message=INSTALL_PYTHON_TEXT.format(version=version, python=f"{v.major}.{v.minor}.{v.micro}",
+                                               executable=sys.executable)))
+
+        pythonpath = os.environ.get("PYTHONPATH", "").strip()
+        if pythonpath:
+            self.results.append(CheckResult(name="PYTHONPATH", status=CheckStatus.WARN,
+                                            message=PYTHONPATH_TEXT.format(value=pythonpath)))
+
+        import sysconfig
+        paths = sysconfig.get_paths()
+        own_folders = []
+        for key in ("purelib", "platlib"):
+            try:
+                own_folders.append(Path(paths[key]).resolve())
+            except Exception:
+                pass
+
+        # The user's own folder: listed only when this Python reads it before its own packages.
+        user_site = site.getusersitepackages() if site.ENABLE_USER_SITE else ""
+        if user_site and user_site in sys.path:
+            own_index = min((i for i, p in enumerate(sys.path)
+                             if p and any(Path(p).resolve() == o for o in own_folders if Path(p).exists())),
+                            default=len(sys.path))
+            if sys.path.index(user_site) < own_index:
+                self.results.append(CheckResult(name="User package folder", status=CheckStatus.INFO,
+                                                message=USER_SITE_TEXT.format(folder=user_site)))
+
+        try:
+            import torch
+            folder = Path(torch.__file__).resolve().parent
+        except Exception:
+            return  # PyTorch missing or broken: the PyTorch check below reports it
+        version = getattr(torch, "__version__", "?")
+        own = own_folders[0] if own_folders else Path(sys.prefix)
+        if folder.parent in own_folders:
+            status, message = CheckStatus.PASS, TORCH_INSIDE_TEXT.format(version=version, folder=folder)
+        elif any((o / "torch").is_dir() for o in own_folders):
+            # #502: another PyTorch is found before the one in this install's own packages.
+            status, message = CheckStatus.WARN, TORCH_SHADOWED_TEXT.format(version=version, folder=folder,
+                                                                           own=own / "torch")
+        else:
+            # Elsewhere, and none in the own packages: a venv with system packages, a per-user install, Own PyTorch.
+            status, message = CheckStatus.INFO, TORCH_ELSEWHERE_TEXT.format(version=version, folder=folder, own=own)
+        self.results.append(CheckResult(name="PyTorch location", status=status, message=message))
+
+    def _check_network(self):
+        """1.10.2 (W563): whether the addresses installs and downloads need answer from this computer (#495)."""
+        import urllib.request
+        targets = _network_targets()
+        answers = _probe_all(targets)
+        failed = [(name, why) for name, why in answers if why]
+        if not failed:
+            self.results.append(CheckResult(
+                name="Network", status=CheckStatus.PASS,
+                message=NETWORK_OK_TEXT.format(hosts=", ".join(name for name, _ in answers))))
+            return
+        try:  # what urllib and pip use: the environment, else (Windows) the system proxy setting
+            proxy = urllib.request.getproxies().get("https") or "none"
+        except Exception:
+            proxy = "unknown"
+        self.results.append(CheckResult(
+            name="Network", status=CheckStatus.WARN,
+            message=NETWORK_FAIL_TEXT.format(failed=", ".join(n for n, _ in failed),
+                                             reasons="; ".join(f"{n}: {w}" for n, w in failed),
+                                             hf=targets[-1][0], proxy=proxy)))
+
     def _check_cublas12_for_faster_whisper(self):
         """v1.10.0: the stack this PC was installed with, and its cuBLAS 12 files."""
         try:
@@ -714,6 +865,26 @@ _RUNTIME_DOWNLOADED_SEGMENTERS = {
 }
 
 
+# The speech segmenters run by CrispASR whose model file is downloaded on first use (1.10.2, owner W594, W596):
+# fetched here before any audio is read, for the reason above. Not listed by --check (_check_downloaded_
+# segmenter_models): no pipeline runs them unless the user picks one. Pinned in crispasr/manifest.py.
+_CRISPASR_DOWNLOADED_SEGMENTERS = {
+    "sortformer": "Sortformer",
+    "pyannote": "pyannote",
+}
+
+
+def _ensure_crispasr_segmenter_model(backend: str, download: bool) -> None:
+    """The pinned model file of a CrispASR speech segmenter on this machine; fetched when ``download``."""
+    from whisperjav.crispasr import install, manifest
+    model = manifest.SEGMENTER_MODELS[backend]
+    if not download:
+        if not install.model_status(model).downloaded:
+            raise FileNotFoundError(f"{model.filename} is not downloaded yet")
+        return
+    install.ensure_model(model)
+
+
 def ensure_segmenter_model_available(backend, *, model_dir=None,
                                      download: bool = True,
                                      exit_on_fail: bool = True) -> bool:
@@ -739,6 +910,8 @@ def ensure_segmenter_model_available(backend, *, model_dir=None,
     segmenter is actually built and so cannot be walked around by a path this check
     does not predict.
     """
+    if (backend or "") in _CRISPASR_DOWNLOADED_SEGMENTERS:
+        return _crispasr_segmenter_model_available(backend, download, exit_on_fail)
     entry = _RUNTIME_DOWNLOADED_SEGMENTERS.get(backend or "")
     if entry is None:
         return True
@@ -790,12 +963,17 @@ def ensure_segmenter_model_available(backend, *, model_dir=None,
 
 
 
-def ensure_crispasr_ready(passes, *, device=None, temp_dir=None, exit_on_fail: bool = True) -> bool:
+def ensure_crispasr_ready(passes, *, device=None, temp_dir=None, exit_on_fail: bool = True,
+                          aligners=None) -> bool:
     """
     Make CrispASR, the device and each CrispASR pass's model ready before a run starts.
 
     ``passes`` lists (pass number, pipeline, --passN-model value or None) for every Ensemble pass
-    that names a CrispASR pipeline; ``device`` is --device. A missing model is downloaded here, unless
+    that names a CrispASR pipeline; ``device`` is --device. ``aligners`` maps a pass number to the
+    CrispASR aligner (manifest.ALIGNER_MODELS short name) that pass is set to use: its file is
+    downloaded here too, and a failure stops the run in the same way (1.10.2, owner W622 item 5;
+    before, the pass downloaded it after its first file's ASR and went on without it on failure).
+    The pass still loads it itself. A missing model is downloaded here, unless
     --offline, and staged under a plain-ASCII name when its path has other characters (route B design
     4.2): a missing package, a processor without AVX2, --device cuda without an NVIDIA GPU, a missing
     file under --offline or a failed download then stops the run before any audio is read. Checked
@@ -816,15 +994,23 @@ def ensure_crispasr_ready(passes, *, device=None, temp_dir=None, exit_on_fail: b
             install.prepare_runtime(device, model)
             path = install.ensure_model(model)
             install.stage_model(path, stage_root, model.sha256)
+            aligner = (aligners or {}).get(_n)
+            if aligner:
+                install.ensure_model(manifest.aligner_model_for(aligner))
         return True
     except install.CrispASRSetupError as exc:
         if not exit_on_fail:
             return False
-        names = ", ".join(f"{pipeline} (pass {n})" for n, pipeline, _m in passes)
+        aligners = aligners or {}
+        names = ", ".join(f"{pipeline} (pass {n})" + (f" with the aligner {aligners[n]}" if aligners.get(n) else "")
+                          for n, pipeline, _m in passes)
+        # With an aligner the pass needs two models (owner W624 D1); without, the sentence of 1.10.0 (T4).
+        what = ("its models the first time they are needed" if any(aligners.get(n) for n, _p, _m in passes)
+                else "its model the first time it is needed")
         lines = ["CrispASR is not ready for this run", ""]
         # Wrapped, so the box keeps its frame however many passes are named.
-        lines += textwrap.wrap(f"This run uses {names}. WhisperJAV checks CrispASR and downloads its model "
-                               f"the first time it is needed. That did not work:", BOX_WIDTH - 4)
+        lines += textwrap.wrap(f"This run uses {names}. WhisperJAV checks CrispASR and downloads {what}. "
+                               f"That did not work:", BOX_WIDTH - 4)
         lines += [""]
         lines += [f"  {chunk}" for chunk in textwrap.wrap(str(exc), BOX_WIDTH - 8)[:4]]
         lines += [
@@ -836,6 +1022,233 @@ def ensure_crispasr_ready(passes, *, device=None, temp_dir=None, exit_on_fail: b
                 "",
                 "Downloads are switched off for this run (--offline), so",
                 "nothing can be fetched now. Run once without --offline first.",
+            ]
+        _print_box(lines, Fore.RED)
+        sys.exit(1)
+
+
+# The files of a PyTorch aligner's repository that its from_pretrained reads (config, weights, tokenizer and processor
+# files); README.md, .gitattributes and the like are left out. For Qwen/Qwen3-ForcedAligner-0.6B: chat_template.json,
+# config.json, generation_config.json, merges.txt, model.safetensors, preprocessor_config.json, tokenizer_config.json,
+# vocab.json (its Hugging Face cache on the developer's PC, 2026-11-13).
+PYTORCH_ALIGNER_FILES = ["*.json", "*.safetensors", "*.txt", "*.model", "*.tiktoken"]
+
+
+def _pytorch_aligner_cached(model_id: str) -> bool:
+    """True when the Hugging Face cache holds the aligner's config and its weights (a file is listed in the snapshot
+    only once its download is complete). No network is used."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        config = try_to_load_from_cache(model_id, "config.json")
+    except Exception:
+        return False
+    if not isinstance(config, str):
+        return False
+    folder = Path(config).parent
+    return any(folder.glob("*.safetensors")) or any(folder.glob("*.bin"))
+
+
+def _ensure_pytorch_aligner(model_id: str) -> None:
+    """The PyTorch aligner's files in the Hugging Face cache, where its from_pretrained reads them; a local folder
+    is taken as it is. A model already in the cache is used as it is, without asking the Hub (as the CrispASR files
+    are): snapshot_download would also want files the load never reads (README.md, .gitattributes) and stopped an
+    --offline run whose model was there (review, 2026-11-13). Raises CrispASRSetupError (the start check's one error
+    type) when the files cannot be had."""
+    from whisperjav.crispasr import install
+
+    if os.path.isdir(model_id) or _pytorch_aligner_cached(model_id):
+        return
+    if install.hub_offline():
+        raise install.CrispASRSetupError(
+            f"The model {model_id} is not downloaded yet, and --offline allows no download.")
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_download(repo_id=model_id, allow_patterns=PYTORCH_ALIGNER_FILES)
+    except Exception as exc:
+        first = (str(exc).strip().splitlines() or [type(exc).__name__])[0]
+        raise install.CrispASRSetupError(f"Downloading the model {model_id} failed: {first}") from exc
+
+
+def ensure_chronosjav_ready(runs, *, exit_on_fail: bool = True, devices=None) -> bool:
+    """
+    Download the files a ChronosJAV run or pass uses -- its CrispASR aligner, PyTorch aligner and timing model --
+    before any audio is read (1.10.2, owner W624 C, W626). Before, each was fetched when the pass first needed it,
+    after its first file's ASR, and on failure the pass went on without it (subtitles at the VAD groups' edges, or no
+    timing step), with a note. Now a failure stops the run.
+
+    For the CrispASR aligner and the timing model it first runs the checks their loads run (CrispAligner /
+    CrispTimer.check_runtime: a CrispASR build for this computer, the package, AVX2, the --device rule, the library),
+    with the device the pass hands them (``devices``: label -> device, from main.chronosjav_device; 1.10.2, owner
+    W632 2): a pass that CrispASR cannot serve stops here too, instead of going on without them after its first file.
+
+    ``runs`` lists (label, ChronosFiles) from main.chronosjav_runs: "ChronosJAV" for --mode qwen, "ChronosJAV (pass
+    N)" for an Ensemble pass. A name that is not offered is left to the pipeline, which stops on it as before. On
+    failure this prints the box (texts agreed by the owner: the download box W625 3; the CrispASR box drafted for his
+    word, W632 2) and ends the run with status 1; ``exit_on_fail=False`` returns False instead.
+    """
+    from whisperjav.crispasr import install, manifest
+
+    def offered(lookup, name):
+        try:
+            return lookup(name)
+        except ValueError:
+            return None  # not offered: the pipeline stops on it, as before
+
+    for label, files in runs:
+        device = (devices or {}).get(label)
+        named, crispasr_named, steps = [], [], []   # steps: (kind, call); kind "runtime" or "download"
+        if files.aligner:
+            named.append(f"the aligner {files.aligner}")
+            if files.aligner_backend == "crispasr":
+                model = offered(manifest.aligner_model_for, files.aligner)
+                if model is not None:
+                    from whisperjav.crispasr.aligner import CrispAligner
+                    crispasr_named.append(f"the aligner {files.aligner}")
+                    steps.append(("runtime", lambda d=device: CrispAligner.check_runtime(d)))
+                    steps.append(("download", lambda m=model: install.ensure_model(m)))
+            else:
+                steps.append(("download", lambda a=files.aligner: _ensure_pytorch_aligner(a)))
+        if files.timing_model:
+            model = offered(manifest.timing_model_for, files.timing_model)
+            named.append(f"the timing model {model.label if model is not None else files.timing_model}")
+            if model is not None:
+                from whisperjav.crispasr.timer import CrispTimer
+                crispasr_named.append(f"the timing model {model.label}")
+                steps.append(("runtime", lambda d=device: CrispTimer.check_runtime(d)))
+                steps.append(("download", lambda m=model: install.ensure_model(m)))
+        kind = None
+        try:
+            # Every CrispASR check before any download: nothing is fetched for a pass CrispASR cannot serve.
+            for kind, step in sorted(steps, key=lambda s: s[0] != "runtime"):
+                step()
+        except install.CrispASRSetupError as exc:
+            if not exit_on_fail:
+                return False
+            if kind == "runtime":
+                # CrispASR cannot run here: the GGUF box's heading (ensure_crispasr_ready), the CrispASR parts named.
+                lines = ["CrispASR is not ready for this run", ""]
+                lines += textwrap.wrap(f"This run uses {label} with {' and '.join(crispasr_named)}, run by "
+                                       f"CrispASR. WhisperJAV checks CrispASR before any audio is read. That did not "
+                                       f"work:", BOX_WIDTH - 4)
+                lines += [""]
+                lines += [f"  {chunk}" for chunk in textwrap.wrap(str(exc), BOX_WIDTH - 8)[:4]]
+                lines += ["", "Nothing has been transcribed."]
+                _print_box(lines, Fore.RED)
+                sys.exit(1)
+            what = ("these models the first time they are needed" if len(named) > 1
+                    else "this model the first time it is needed")
+            lines = ["A model this run needs could not be downloaded", ""]
+            lines += textwrap.wrap(f"This run uses {label} with {' and '.join(named)}. WhisperJAV downloads {what}. "
+                                   f"That did not work:", BOX_WIDTH - 4)
+            lines += [""]
+            lines += [f"  {chunk}" for chunk in textwrap.wrap(str(exc), BOX_WIDTH - 8)[:4]]
+            lines += ["", "Nothing has been transcribed."]
+            if install.hub_offline():
+                lines += [
+                    "",
+                    "Downloads are switched off for this run (--offline), so",
+                    "nothing can be fetched now. Run once without --offline first.",
+                ]
+            _print_box(lines, Fore.RED)
+            sys.exit(1)
+    return True
+
+
+def _crispasr_segmenter_model_available(backend: str, download: bool, exit_on_fail: bool) -> bool:
+    """ensure_segmenter_model_available for the CrispASR speech segmenters (sortformer, pyannote).
+
+    Text drafted in the 58th session (owner W596 INSTRUCT1: steps 1-4 preapproved); approved by the owner (W600 3).
+    """
+    display = _CRISPASR_DOWNLOADED_SEGMENTERS[backend]
+    try:
+        _ensure_crispasr_segmenter_model(backend, download)
+        return True
+    except Exception as exc:
+        if not exit_on_fail:
+            return False
+        from whisperjav.crispasr import install, manifest
+        model = manifest.SEGMENTER_MODELS[backend]
+        offline = bool(os.environ.get("HF_HUB_OFFLINE"))
+        lines = [
+            f"{display}'s speech-detection model is not on this machine",
+            "",
+            f"This run needs {display} (run by CrispASR) to find the speech in",
+            f"your audio, and its model ({install.mb(model.size)}) is downloaded once",
+            "from Hugging Face. That did not work:",
+            "",
+            f"  {((str(exc).splitlines() or ['unknown error'])[0])[:BOX_WIDTH - 8]}",
+            "",
+            "Nothing has been transcribed. Without the model every scene would",
+            "fail and you would be handed an empty subtitle file.",
+            "",
+            "What you can do:",
+            "  - Connect to the internet and run this once. The download is",
+            "    kept for every run after it.",
+            "  - Or pick another speech segmenter for this pass. In the",
+            "    Ensemble tab, set that pass's Speech Segmenter to another one.",
+        ]
+        if offline:
+            lines += [
+                "",
+                "Downloads are switched off for this run (HF_HUB_OFFLINE is set,",
+                "which is what --offline does), so nothing can be fetched now.",
+                "The model has to have been downloaded once beforehand.",
+            ]
+        _print_box(lines, Fore.RED)
+        sys.exit(1)
+
+
+# The speech enhancers run by CrispASR whose model file is downloaded on first use (1.10.2, owner W594, W596). Since
+# W602 3 the file is fetched at start-up, before any audio is read, with a box when that fails: otherwise a run
+# without the network would stop only after audio extraction and scene detection (in an Ensemble with the enhancer on
+# pass 2, after all of pass 1). Pinned in crispasr/manifest.py ENHANCER_MODELS.
+_CRISPASR_DOWNLOADED_ENHANCERS = {
+    "mel-band-roformer": "Mel-Band-RoFormer",
+    "mini-bs-roformer": "Mini-BS-RoFormer",
+}
+
+
+def _crispasr_enhancer_model_available(backend: str, *, download: bool, exit_on_fail: bool) -> bool:
+    """The model file of a speech enhancer run by CrispASR on this machine; fetched when ``download``.
+
+    Text approved by the owner (W600 3 for the speech segmenters' box, W602 3 for this one: "clear user communication").
+    """
+    display = _CRISPASR_DOWNLOADED_ENHANCERS[backend]
+    from whisperjav.crispasr import install, manifest
+    model = manifest.ENHANCER_MODELS[backend]
+    try:
+        if download:
+            install.ensure_model(model)
+        elif not install.model_status(model).downloaded:
+            raise FileNotFoundError(f"{model.filename} is not downloaded yet")
+        return True
+    except Exception as exc:
+        if not exit_on_fail:
+            return False
+        offline = bool(os.environ.get("HF_HUB_OFFLINE"))
+        lines = [
+            f"{display}'s model is not on this machine",
+            "",
+            f"This run needs {display} (run by CrispASR) to clean up",
+            f"your audio, and its model ({install.mb(model.size)}) is downloaded once",
+            "from Hugging Face. That did not work:",
+            "",
+            f"  {((str(exc).splitlines() or ['unknown error'])[0])[:BOX_WIDTH - 8]}",
+            "",
+            "Nothing has been transcribed.",
+            "",
+            "What you can do:",
+            "  - Connect to the internet and run this once. The download is",
+            "    kept for every run after it.",
+            "  - Or pick another speech enhancer for this pass. In the",
+            "    Ensemble tab, set that pass's Speech Enhancer to another one.",
+        ]
+        if offline:
+            lines += [
+                "",
+                "Downloads are switched off for this run (HF_HUB_OFFLINE is set,",
+                "which is what --offline does), so nothing can be fetched now.",
+                "The model has to have been downloaded once beforehand.",
             ]
         _print_box(lines, Fore.RED)
         sys.exit(1)
@@ -882,6 +1295,9 @@ def ensure_speech_enhancer_available(backend, *, exit_on_fail: bool = True) -> b
 
     available, hint = SpeechEnhancerFactory.is_backend_available(backend)
     if available:
+        if backend in _CRISPASR_DOWNLOADED_ENHANCERS:
+            # 1.10.2 (owner W602 3): its model file is fetched here, before any audio is read.
+            return _crispasr_enhancer_model_available(backend, download=exit_on_fail, exit_on_fail=exit_on_fail)
         return True
     if not exit_on_fail:
         return False
@@ -985,15 +1401,25 @@ def ensure_segmenter_backend_available(backend, *, exit_on_fail: bool = True) ->
     lines = [
         f"The {backend} speech detector cannot run on this machine",
         "",
-        f"This run needs {backend} to find the speech in your audio, and it is",
-        "not installed.",
+        # Wrapped, so a long backend name keeps the box's frame (the words as before; "whisperseg" overran it).
+        *textwrap.wrap(f"This run needs {backend} to find the speech in your audio, and it is not installed.",
+                       BOX_WIDTH - 4),
         "",
         "Nothing has been transcribed. Without a working speech detector",
         "every scene would fail and you would get an empty subtitle file.",
         "",
         "What you can do:",
-        f"  - Install it, once:  {hint}",
     ]
+    install_line = f"  - Install it, once:  {hint}"
+    if len(install_line) <= BOX_WIDTH - 4:
+        lines.append(install_line)
+    else:
+        # A hint too long for the line goes on its own line(s), so the box keeps its frame (owner W625 2). "them"
+        # when it installs more than one package (WhisperSeg's hint names each missing package).
+        packages = len(hint.split()) - 2 if hint.startswith("pip install ") else 1
+        lines.append(f"  - Install {'them' if packages > 1 else 'it'}, once:")
+        lines += [f"      {chunk}" for chunk in textwrap.wrap(hint, BOX_WIDTH - 10, break_long_words=False,
+                                                              break_on_hyphens=False)]
     if alternatives:
         lines += ["  - Or pick a speech detector that is already installed:"]
         lines += [f"      {name}" for name in alternatives[:8]]

@@ -145,6 +145,8 @@ The language spoken in the video. Affects Whisper's language hint and post-proce
 - **Native** (default) — subtitles in the original spoken language
 - **Direct-to-English** — Whisper translates to English during transcription (lower quality than dedicated translation)
 
+Known issue: with Kotoba Bilingual v1.0, the default model of the transformers pipeline, the model gives the English text no times, so the subtitles are unusable.
+
 ---
 
 ## 6. Advanced Options
@@ -184,11 +186,11 @@ Always active. Each pass has identical controls:
 
 | Control | Options | Default |
 |---------|---------|---------|
-| **Pipeline** | Whisper-Based: Balanced, Fast, Faster, Fidelity; HuggingFace: Transformers (HF); ChronosJAV: Qwen3-ASR, Anime-Whisper; External (BYOP): XXL Faster Whisper; GGUF via crispasr: parakeet, cohere; Experimental, open to feedback: reazonspeech, kotoba, whisper-turbo, whisper-large, MOSS | Pass 1: cohere; Pass 2: parakeet (off until ticked) |
+| **Pipeline** | Whisper-Based: Balanced, Fast, Faster, Fidelity; HuggingFace: Transformers (HF); ChronosJAV: Qwen3-ASR, Anime-Whisper; External (BYOP): XXL Faster Whisper; GGUF via crispasr: parakeet, cohere; Experimental, open to feedback: reazonspeech, kotoba, whisper-turbo, whisper-large, MOSS, haas, qwen3-asr | Pass 1: cohere; Pass 2: parakeet (off until ticked) |
 | **Sensitivity** | Aggressive, Balanced, Conservative | set when you choose the pipeline: Pass 1 (cohere) Balanced, Pass 2 (parakeet) Aggressive |
 | **Scene Detector** | Auditok, Silero, Semantic, None | Semantic |
-| **Speech Enhancer** | None, FFmpeg DSP, ZipEnhancer, htdemucs (BS-RoFormer and ZipEnhancer ONNX: coming soon) | None |
-| **Speech Segmenter** | Silero v4.0, Silero v3.1, Silero v6.2, TEN VAD, WhisperSeg (JA-ASMR), FireRedVAD, None; for Balanced, the Silero version of its built-in VAD: 3.1, 4.0 (default), 6.2; for a GGUF pass, None sends each scene to the model whole | set when you choose the pipeline: Pass 1 (cohere) FireRedVAD, Pass 2 (parakeet) TEN VAD |
+| **Speech Enhancer** | None; Vocal Separation: Mel-Band-RoFormer, Mini-BS-RoFormer, htdemucs (Demucs v4); Noise Suppression: ZipEnhancer; DSP: FFmpeg Audio Filters... | None |
+| **Speech Segmenter** | FireRedVAD, TEN VAD, WhisperSeg (JA-ASMR), Silero v3.1, Silero v4.0, Silero v6.2; under "Experimental, open to feedback": Sortformer (NVIDIA Nemotron), pyannote 3.0; None. For Balanced, the Silero version of its built-in VAD: 3.1, 4.0 (default), 6.2; for a GGUF pass, None sends each scene to the model whole. | set when you choose the pipeline: Pass 1 (cohere) FireRedVAD, Pass 2 (parakeet) TEN VAD |
 | **Model** | the models of the chosen pipeline | the pipeline's default |
 
 ### Available Pipelines
@@ -200,7 +202,7 @@ The pipeline dropdown groups options by backend:
 - **Whisper-Based**: Balanced, Fast, Faster, Fidelity
 - **HuggingFace**: Transformers
 - **ChronosJAV**: Qwen3-ASR, Anime-Whisper
-- **GGUF via crispasr**: parakeet (Parakeet-CrispASR), cohere (Cohere-CrispASR); below a divider line, **Experimental, open to feedback**: reazonspeech (ReazonSpeech-CrispASR), kotoba (Kotoba-CrispASR), whisper-turbo (Whisper-Turbo-CrispASR), whisper-large (Whisper-Large-CrispASR), MOSS (MOSS-CrispASR) — Japanese only, all experimental; parakeet and cohere since 1.10.0, the other five new in 1.10.1 (see [GGUF pipelines (CrispASR)](../pipelines/crispasr.md))
+- **GGUF via crispasr**: parakeet (Parakeet-CrispASR), cohere (Cohere-CrispASR); below a divider line, **Experimental, open to feedback**: reazonspeech (ReazonSpeech-CrispASR), kotoba (Kotoba-CrispASR), whisper-turbo (Whisper-Turbo-CrispASR), whisper-large (Whisper-Large-CrispASR), MOSS (MOSS-CrispASR), haas (Haas-CrispASR), qwen3-asr (Qwen3-ASR-CrispASR) — Japanese only, all experimental; parakeet and cohere since 1.10.0, haas and qwen3-asr new in 1.10.2, the other five new in 1.10.1 (see [GGUF pipelines (CrispASR)](../pipelines/crispasr.md))
 - **External (BYOP)**: XXL Faster Whisper (Pass 1, Pass 2 or both)
 
 ### Customize Parameters
@@ -270,13 +272,9 @@ When **FFmpeg DSP** is selected as the speech enhancer, an additional panel appe
 | De-esser | Reduce harsh sibilance (s/t sounds) |
 | Amplify | Boost overall volume |
 
-### Enhance for VAD Only (v1.8.10+)
+### For VAD only (v1.8.10+)
 
-When a speech enhancer is selected (anything other than "None"), a checkbox appears below the enhancer dropdown:
-
-**Enhance for VAD only** — When ticked, the enhanced audio is used only to find the speech (VAD). The original audio is sent to the ASR model for transcription.
-
-The box is not shown for Balanced and XXL Faster Whisper, nor when the enhancer is "None". It takes effect with Fidelity, Qwen3-ASR, Anime-Whisper and the GGUF pipelines; Fast, Faster and Transformers ignore it, as they run no separate speech segmenter.
+The **Speech Enhancer** menu ends, under a divider line, with the tick box **For VAD only**, ticked by default since 1.10.2. When ticked, the cleaned-up audio is used only to find the speech (VAD), and the original audio goes to the ASR model. Untick it to give the cleaned-up audio to the ASR model too. It takes effect with Fidelity, Qwen3-ASR, Anime-Whisper and the GGUF pipelines when a speech enhancer is chosen; it is not offered for Balanced, Fast, Faster, Transformers and XXL Faster Whisper, which keep one track.
 
 ### Merge Strategy
 
@@ -285,7 +283,7 @@ When Pass 2 is enabled, choose how the two outputs are combined:
 | Strategy (GUI) | Command line | What it does |
 |----------|----------|----------|
 | **Pass 1 + Fill From Pass 2** (default) | `pass1_primary` | Keeps every Pass 1 subtitle; adds a Pass 2 subtitle only where it overlaps no Pass 1 subtitle |
-| **Smart Merge (Best Quality)** | `smart_merge` | Pairs each Pass 1 subtitle with the Pass 2 subtitle that overlaps it most, if the overlap is at least 30% of the shorter one, and keeps one of the pair: the one with more of its own length inside the overlap; if that is about equal, the one with more text (a line of few different characters, such as ああああああああああ, counts as none); then the shorter one. Subtitles without a partner are kept from both passes |
+| **Smart Merge** | `smart_merge` | Pairs each Pass 1 subtitle with the Pass 2 subtitle that overlaps it most, if the overlap is at least 30% of the shorter one, and keeps one of the pair: the one with more of its own length inside the overlap; if that is about equal, the one with more text (a line of few different characters, such as ああああああああああ, counts as none); then the shorter one. Subtitles without a partner are kept from both passes |
 | **Full Merge (All Lines)** | `full_merge` | Keeps every subtitle of both passes, in time order; overlapping subtitles stay |
 | **Pass 2 + Fill From Pass 1** | `pass2_primary` | As Pass 1 + Fill From Pass 2, with the passes swapped |
 | **Pass 1 + Fill (30% Overlap)** | `pass1_overlap` | Keeps every Pass 1 subtitle; adds a Pass 2 subtitle unless it overlaps a Pass 1 subtitle by more than 30% of that subtitle's length |

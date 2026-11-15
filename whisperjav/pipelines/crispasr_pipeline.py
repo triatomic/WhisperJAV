@@ -312,8 +312,11 @@ class CrispASRPipeline(BasePipeline):
             logger.info(f"{self.LABEL}: no speech segmenter: {len(groups)} of {len(scenes)} scenes go to the model "
                         f"whole, {speech_s:.0f} s of audio in {duration:.0f} s")
         else:
-            logger.info(f"{self.LABEL}: {len(groups)} VAD groups over {len(scenes)} scenes, "
-                        f"{speech_s:.0f} s of speech in {duration:.0f} s")
+            # "the groups span", not "of speech": the figure is the summed length of the VAD groups, the pauses
+            # inside a group included; the audio analytics' "Speech detected in N%" is a different measure
+            # (text approved, owner W648 1).
+            logger.info(f"{self.LABEL}: {len(groups)} VAD groups over {len(scenes)} scenes; "
+                        f"the groups span {speech_s:.0f} s of {duration:.0f} s")
 
         self.progress.set_current_step("Transcribing with CrispASR", 5, 6)
         results: List[Tuple[_Group, List[CrispSegment]]] = []
@@ -737,6 +740,11 @@ class CrispASRPipeline(BasePipeline):
     # Texts approved by the owner as drafted (W268); design note 2026-10-28, section 9.
     ALIGNER_NOT_LOADED = ("{label}'s aligner ({model}) could not be loaded ({reason}): each VAD group is one "
                           "subtitle at the group's edges, as before 1.10.0.")
+    # The same for a "group" pipeline newer than 1.10.0 (Qwen3-ASR-CrispASR, 1.10.2, owner W574), for which "as before
+    # 1.10.0" would not be true.
+    ALIGNER_NOT_LOADED_NEW = ("{label}'s aligner ({model}) could not be loaded ({reason}): each VAD group is one "
+                              "subtitle at the group's edges.")
+    GROUP_RULE_BEFORE_1100 = ("cohere-crispasr",)
     GROUPS_NOT_ALIGNED = "{label}: {n} of {m} VAD group(s) could not be aligned; they keep the VAD group's edges"
     # The same for a pipeline whose own rule uses the model's word times, with --passN-word-timestamps aligner
     # (Part B, 1.10.1; drafted under the owner's W416 approval, to be shown to him).
@@ -755,7 +763,9 @@ class CrispASRPipeline(BasePipeline):
         line rule: the VAD group's edges ("group"), the model's word times ("tokens"), its segment times
         ("segments")."""
         if self.engine.line_rule == "group":
-            return self.ALIGNER_NOT_LOADED, self.GROUPS_NOT_ALIGNED
+            first = (self.ALIGNER_NOT_LOADED if self.PIPELINE_NAME in self.GROUP_RULE_BEFORE_1100
+                     else self.ALIGNER_NOT_LOADED_NEW)
+            return first, self.GROUPS_NOT_ALIGNED
         if self.engine.line_rule == "segments":
             return self.ALIGNER_NOT_LOADED_SEGMENT_TIMES, self.GROUPS_NOT_ALIGNED_SEGMENT_TIMES
         return self.ALIGNER_NOT_LOADED_OWN_TIMES, self.GROUPS_NOT_ALIGNED_OWN_TIMES

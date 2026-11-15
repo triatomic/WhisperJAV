@@ -121,7 +121,11 @@ def apply_format_marker_check(translator) -> bool:
     if client is None or not hasattr(client, "GetParser"):
         return False
 
-    from PySubtrans.SubtitleError import TranslationValidationError
+    try:
+        # PySubtrans 1.8.0 moved the class to PySubtrans.ValidationError (1.10.2's lock).
+        from PySubtrans.ValidationError import TranslationValidationError
+    except ImportError:
+        from PySubtrans.SubtitleError import TranslationValidationError
 
     original = client.GetParser
 
@@ -335,86 +339,29 @@ def apply_server_temperature_patch(translator, debug: bool = False) -> bool:
     return True
 
 
-# Claude models that take `output_config.effort`: the 5.x family. Claude Haiku 4.5 rejects it.
-_CLAUDE_EFFORT_MODEL = re.compile(r'claude-[a-z]+-5')
-
-
-class _ClaudeMessages:
-    """`messages` of the Anthropic SDK client, minus the fields current Claude requests reject."""
-
-    def __init__(self, messages, effort: bool):
-        self._messages = messages
-        self._effort = effort
-
-    def _clean(self, kwargs: dict) -> dict:
-        for field in ('temperature', 'top_p', 'top_k'):
-            kwargs.pop(field, None)
-        if self._effort:
-            kwargs.setdefault('output_config', {'effort': 'low'})
-        return kwargs
-
-    def create(self, **kwargs):
-        return self._messages.create(**self._clean(kwargs))
-
-    def stream(self, **kwargs):
-        return self._messages.stream(**self._clean(kwargs))
-
-
-class _ClaudeSdk:
-    """The Anthropic SDK client with `messages` swapped for `_ClaudeMessages`."""
-
-    def __init__(self, sdk, effort: bool):
-        self._sdk = sdk
-        self.messages = _ClaudeMessages(sdk.messages, effort)
-
-    def __getattr__(self, name):
-        return getattr(self._sdk, name)
-
-
-def apply_claude_request_patch(translator, model: str, debug: bool = False) -> bool:
-    """Send Claude requests the current Anthropic API accepts.
-
-    PySubtrans' Claude client passes `temperature` on every request. The Anthropic SDK 2.x
-    has no such argument, and API version 2026-10-21 answers it with a 400 on every model.
-    This patch removes `temperature`, `top_p` and `top_k`. On the 5.x models it also asks
-    for low effort, because subtitle lines need little thinking and thinking is billed as
-    output. PySubtrans creates the SDK client on the first request, so `_get_client_response`
-    wraps it there, once, and leaves it wrapped.
-
-    Args:
-        translator: The PySubtrans translator whose `client` is an `AnthropicClient`.
-        model: The Claude model ID the run uses.
-        debug: Print a line when the SDK client gets wrapped.
-
-    Returns:
-        True if the patch was applied.
-    """
-    client = getattr(translator, 'client', None)
-    if client is None or not hasattr(client, '_get_client_response'):
-        print("[TRANSLATE]   WARNING: could not adapt Claude requests - "
-              "translator.client._get_client_response not found", file=sys.stderr)
-        return False
-
-    original = client._get_client_response
-    effort = bool(_CLAUDE_EFFORT_MODEL.search(model or ''))
-
-    def _patched(request, temperature):
-        if not isinstance(client.client, _ClaudeSdk):
-            client.client = _ClaudeSdk(client.client, effort)
-            if debug:
-                print("[TRANSLATE]   [claude-patch] SDK client wrapped", file=sys.stderr)
-        return original(request, temperature)
-
-    client._get_client_response = _patched
-    print(f"[TRANSLATE]   Claude requests: no temperature, effort {'low' if effort else 'model default'}",
-          file=sys.stderr)
-    return True
-
-
 def target_language_name(target_lang: str) -> str:
     """'chinese' -> 'Chinese'; the name the instructions and the prompt use."""
     name = (target_lang or "").strip()
     return name[:1].upper() + name[1:] if name else "the target language"
+
+
+def shared_text_path(path, text: str) -> Path:
+    """The shared file for this text: ``path``'s name with a code made from the text
+    (instructions_standard.txt -> instructions_standard_<8 hex>.txt), so one name
+    always holds one text (1.10.2, owner W633 3)."""
+    import hashlib
+    path = Path(path)
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+    return path.with_name(f"{path.stem}_{digest}{path.suffix}")
+
+
+def _read_as_written(path: Path):
+    """The file's text without newline translation, or None when it cannot be read (missing, or refused)."""
+    try:
+        with open(path, encoding="utf-8", newline="") as f:
+            return f.read()
+    except OSError:
+        return None
 
 
 def write_shared_text(path, text: str) -> str:
@@ -424,25 +371,51 @@ def write_shared_text(path, text: str) -> str:
     finding, 2026-10-06). Rewriting one while another run reads it could hand that
     run an empty file; on Windows a file another run has open cannot be replaced at
     all. So: a file that already holds this text is left alone (the usual case:
-    same tone, same bundled text); otherwise the text goes to a private temp file
-    that is swapped in, and if the swap is refused the private file is used instead.
+    same tone, same bundled text); otherwise the text goes to a private temp file,
+    which is put in place, and if that is refused the private file is used instead.
+
+    1.10.2 (owner W633 3): the shared file's name carries a code made from its text
+    (shared_text_path), and the private file is put in place with os.rename, which
+    on Windows never replaces a file that exists; elsewhere it replaces in one step,
+    and only a file of the same name, so of the same text. Before, every text of a
+    tone shared one name, instructions_<tone>.txt: a run of another text (an install
+    of 1.9.3 or older, or the Gist's text when a bundled file is missing) could
+    replace the file while a run used it, and the command line reads it again for
+    every file; and two runs creating it within milliseconds could have a read
+    refused on Windows ("Permission denied"), which gave instructions with a literal
+    {LANG} (fill_target_language) or a failed translation (PySubtrans's read). Now
+    no run touches a file another text uses. A file of this name that reads as other
+    text (edited by hand) is not in use by any run, so it is replaced; one whose read
+    is refused is left alone. Written and compared without newline translation, so a
+    text with CR LF matches its file.
     """
     import tempfile
-    path = Path(path)
-    try:
-        if path.read_text(encoding="utf-8") == text:
-            return str(path)
-    except OSError:
-        pass
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=path.stem + "_", suffix=path.suffix, dir=str(path.parent))
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
+    shared = shared_text_path(path, text)
+    if _read_as_written(shared) == text:
+        return str(shared)
+    shared.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=shared.stem + "_", suffix=shared.suffix, dir=str(shared.parent))
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
         f.write(text)
     try:
-        os.replace(tmp, path)
-        return str(path)
+        os.rename(tmp, shared)
+        return str(shared)
     except OSError:
-        return tmp          # the shared file is in use; this run reads its own copy
+        pass
+    seen = _read_as_written(shared)
+    if seen == text:                # another run put the same text in place first
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return str(shared)
+    if seen is not None:            # it holds other text: no run uses it
+        try:
+            os.replace(tmp, shared)
+            return str(shared)
+        except OSError:
+            pass
+    return tmp          # the shared file cannot be used; this run reads its own copy
 
 
 def fill_target_language(instruction_file, target_lang: str) -> str:
@@ -981,10 +954,6 @@ def translate_subtitle(
         # rate-limit hungry, and can leak reasoning text into the subtitles.
         if provider_config.get('pysubtrans_name') == 'DeepSeek':
             apply_deepseek_thinking_patch(translator, model, debug=debug)
-
-        # Claude: the current API rejects a temperature on every model
-        if provider_config.get('pysubtrans_name') == 'Claude':
-            apply_claude_request_patch(translator, model, debug=debug)
 
         # Custom server keeps its own temperature (#444)
         if _server_temperature:

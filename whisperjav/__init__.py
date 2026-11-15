@@ -32,7 +32,7 @@ translate
 
 enhance
     Speech enhancement (denoising, vocal isolation).
-    Includes: modelscope, bs-roformer-infer, demucs
+    Includes: modelscope, demucs
 
 huggingface
     HuggingFace Transformers integration.

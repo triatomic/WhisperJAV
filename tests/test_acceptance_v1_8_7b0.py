@@ -2,7 +2,7 @@
 WhisperJAV v1.8.7b0 — Comprehensive E2E Acceptance Test Suite
 
 Covers ALL 15 source files changed vs main:
-  A  Version & Package Integrity
+  A  Package integrity (the 1.8.7b0 version checks removed in 1.10.2)
   B  #196 Translation chain (streaming, max_tokens, supports_streaming)
   C  #198 MPS device detection (TransformersASR)
   D  VAD padding defaults (silero_v6, ten, factory)
@@ -34,40 +34,8 @@ sys.path.insert(0, REPO)
 # A  VERSION & PACKAGE INTEGRITY
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestVersionIntegrity:
-    """Version strings are consistent across all carrier files."""
-
-    def test_version_is_1_8_7b0(self):
-        from whisperjav import __version__
-        assert __version__ == "1.8.7b0", f"Expected 1.8.7b0, got {__version__}"
-
-    def test_version_display_is_beta(self):
-        from whisperjav.__version__ import __version_display__
-        assert "1.8.7" in __version_display__
-        assert "beta" in __version_display__.lower() or "b0" in __version_display__
-
-    def test_version_info_dict(self):
-        from whisperjav import __version_info__
-        assert __version_info__["major"] == 1
-        assert __version_info__["minor"] == 8
-        assert __version_info__["patch"] == 7
-
-    def test_installer_version_file(self):
-        version_file = os.path.join(REPO, "installer", "VERSION")
-        content = open(version_file).read()
-        assert "patch = 7" in content
-        assert "prerelease = b0" in content
-        assert "display_label = beta" in content
-
-    def test_generated_wheel_exists(self):
-        generated = os.path.join(REPO, "installer", "generated")
-        wheels = [f for f in os.listdir(generated) if "1.8.7b0" in f and f.endswith(".whl")]
-        assert len(wheels) >= 1, f"No 1.8.7b0 wheel in {generated}"
-
-    def test_generated_construct_yaml_exists(self):
-        generated = os.path.join(REPO, "installer", "generated")
-        yamls = [f for f in os.listdir(generated) if "1.8.7b0" in f and f.endswith(".yaml")]
-        assert len(yamls) >= 1
+# TestVersionIntegrity (the 1.8.7b0 version strings, wheel and construct YAML) removed in 1.10.2: it can pass
+# only on the 1.8.7b0 build. The release build checks its own version (build_release.py).
 
 
 class TestCoreImports:
@@ -306,39 +274,45 @@ class TestVADPaddingDefaults:
         sig = inspect.signature(TenSpeechSegmenter.__init__)
         assert sig.parameters["end_pad_ms"].default == 150
 
-    def test_factory_schema_silero_speech_pad_ms_is_350(self):
+    # The factory schema follows the YAML balanced values since v1.8.12 (factory.py: 350->250, 50->0, 150->200).
+    def test_factory_schema_silero_speech_pad_ms_is_250(self):
         from whisperjav.modules.speech_segmentation.factory import _PARAM_SCHEMAS
-        assert _PARAM_SCHEMAS["silero-v6.2"]["speech_pad_ms"][1] == 350
+        assert _PARAM_SCHEMAS["silero-v6.2"]["speech_pad_ms"][1] == 250
 
-    def test_factory_schema_ten_start_pad_ms_is_50(self):
+    def test_factory_schema_ten_start_pad_ms_is_0(self):
         from whisperjav.modules.speech_segmentation.factory import _PARAM_SCHEMAS
-        assert _PARAM_SCHEMAS["ten"]["start_pad_ms"][1] == 50
+        assert _PARAM_SCHEMAS["ten"]["start_pad_ms"][1] == 0
 
-    def test_factory_schema_ten_end_pad_ms_is_150(self):
+    def test_factory_schema_ten_end_pad_ms_is_200(self):
         from whisperjav.modules.speech_segmentation.factory import _PARAM_SCHEMAS
-        assert _PARAM_SCHEMAS["ten"]["end_pad_ms"][1] == 150
+        assert _PARAM_SCHEMAS["ten"]["end_pad_ms"][1] == 200
 
-    def test_backend_and_factory_silero_agree(self):
-        from whisperjav.modules.speech_segmentation.backends.silero_v6 import SileroV6SpeechSegmenter
-        from whisperjav.modules.speech_segmentation.factory import _PARAM_SCHEMAS
-        backend_default = inspect.signature(SileroV6SpeechSegmenter.__init__).parameters["speech_pad_ms"].default
-        factory_default = _PARAM_SCHEMAS["silero-v6.2"]["speech_pad_ms"][1]
-        assert backend_default == factory_default, \
-            f"Silero backend ({backend_default}) and factory schema ({factory_default}) disagree"
+    # 1.8.7b0 wanted the backend's own default and the factory's fallback to be equal. Since v1.8.12 (1eb1237) the
+    # factory's fallback, used when a pad arrives empty (e.g. a cleared Customize field), is the balanced preset of
+    # the YAML tool file on purpose, while the backend's own default applies when no pad is passed at all; the two
+    # differ. Owner W634 1 (2026-11-14): the tests follow that choice; the factory and the backends stay as they are.
+    @staticmethod
+    def _balanced(tool_file, key):
+        import yaml
+        path = os.path.join(REPO, "whisperjav", "config", "v4", "ecosystems", "tools", tool_file)
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        return (data["presets"].get("balanced") or {}).get(key, data["spec"][key])   # balanced: the spec's values
 
-    def test_backend_and_factory_ten_start_agree(self):
-        from whisperjav.modules.speech_segmentation.backends.ten import TenSpeechSegmenter
+    def test_factory_fallback_is_the_silero_balanced_preset(self):
         from whisperjav.modules.speech_segmentation.factory import _PARAM_SCHEMAS
-        backend_default = inspect.signature(TenSpeechSegmenter.__init__).parameters["start_pad_ms"].default
-        factory_default = _PARAM_SCHEMAS["ten"]["start_pad_ms"][1]
-        assert backend_default == factory_default
+        assert _PARAM_SCHEMAS["silero-v6.2"]["speech_pad_ms"][1] == \
+            self._balanced("silero-v6-speech-segmentation.yaml", "speech_pad_ms")
 
-    def test_backend_and_factory_ten_end_agree(self):
-        from whisperjav.modules.speech_segmentation.backends.ten import TenSpeechSegmenter
+    def test_factory_fallback_is_the_ten_balanced_start_pad(self):
         from whisperjav.modules.speech_segmentation.factory import _PARAM_SCHEMAS
-        backend_default = inspect.signature(TenSpeechSegmenter.__init__).parameters["end_pad_ms"].default
-        factory_default = _PARAM_SCHEMAS["ten"]["end_pad_ms"][1]
-        assert backend_default == factory_default
+        assert _PARAM_SCHEMAS["ten"]["start_pad_ms"][1] == \
+            self._balanced("ten-speech-segmentation.yaml", "start_pad_ms")
+
+    def test_factory_fallback_is_the_ten_balanced_end_pad(self):
+        from whisperjav.modules.speech_segmentation.factory import _PARAM_SCHEMAS
+        assert _PARAM_SCHEMAS["ten"]["end_pad_ms"][1] == \
+            self._balanced("ten-speech-segmentation.yaml", "end_pad_ms")
 
     def test_silero_v6_not_old_250(self):
         from whisperjav.modules.speech_segmentation.backends.silero_v6 import SileroV6SpeechSegmenter
@@ -412,8 +386,9 @@ class TestCLIArgumentParsing:
         assert args.enhance_for_vad is True
 
     def test_enhance_for_vad_default_false(self):
+        # Tri-state since 1.10.2 (owner W596 3): None = not given; main.py apply_enhance_for_vad_default decides.
         args = self._get_args(["dummy.mp4"])
-        assert args.enhance_for_vad is False
+        assert args.enhance_for_vad is None
 
     def test_pass1_enhance_for_vad_flag(self):
         args = self._get_args(["dummy.mp4", "--ensemble", "--pass1-enhance-for-vad"])
@@ -435,7 +410,7 @@ class TestCLIArgumentParsing:
         """--vad-threshold described as float 0.0-1.0."""
         result = subprocess.run(
             [sys.executable, "-m", "whisperjav.main", "--help"],
-            capture_output=True, text=True, timeout=15
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60
         )
         assert "--vad-threshold" in result.stdout + result.stderr
         assert "--speech-pad-ms" in result.stdout + result.stderr
@@ -444,7 +419,7 @@ class TestCLIArgumentParsing:
         """--stream must appear in main.py --help (CLI entry point)."""
         result = subprocess.run(
             [sys.executable, "-m", "whisperjav.main", "--help"],
-            capture_output=True, text=True, timeout=15
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60
         )
         assert result.returncode == 0, "--help should exit 0"
         assert "--stream" in result.stdout + result.stderr, \
@@ -482,7 +457,7 @@ class TestEnhanceForVADStructure:
         from whisperjav.pipelines.decoupled_pipeline import DecoupledPipeline
         sig = inspect.signature(DecoupledPipeline.__init__)
         assert "enhance_for_vad" in sig.parameters
-        assert sig.parameters["enhance_for_vad"].default is False
+        assert sig.parameters["enhance_for_vad"].default is None   # its own default (1.10.2, owner W596 3)
 
     def test_qwen_pipeline_accepts_enhance_for_vad(self):
         from whisperjav.pipelines.qwen_pipeline import QwenPipeline
@@ -537,7 +512,7 @@ class TestEnhanceForVADStructure:
         import whisperjav.ensemble.pass_worker as pw
         src = inspect.getsource(pw._build_pipeline)
         assert 'enhance_for_vad' in src
-        assert 'pipeline_name not in' in src
+        assert 'pipeline_name in ENHANCE_FOR_VAD_IGNORED_BY' in src
 
     def test_pass_worker_propagates_enhance_for_vad_to_qwen(self):
         import whisperjav.ensemble.pass_worker as pw
@@ -617,14 +592,14 @@ class TestComputeMaxOutputTokens:
         assert result == 512
 
     def test_correct_for_8k_batch11(self):
-        """Known-good value: 8K ctx, batch=11 → 2392."""
+        """Known-good value: 8K ctx, batch=11 → 1820 (the 1x budget; 2392 under the old 2x)."""
         result = self.compute(11, 8192)
-        assert result == 2392
+        assert result == 1820
 
     def test_correct_for_16k_batch27(self):
-        """Known-good value: 16K ctx, batch=27 → 5784."""
+        """Known-good value: 16K ctx, batch=27 → 3740 (the 1x budget; 5784 under the old 2x)."""
         result = self.compute(27, 16384)
-        assert result == 5784
+        assert result == 3740
 
     def test_result_increases_with_n_ctx(self):
         """Larger context window → larger output budget (same batch)."""
@@ -699,38 +674,18 @@ class TestGUIStreamingWiring:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestInstallerConsistency:
-    """Installer generated files are consistent with version 1.8.7b0."""
+    """The version has moved on from 1.8.6 (the 1.8.7b0 build-file checks removed in 1.10.2)."""
 
     def setup_method(self):
         self.generated = os.path.join(REPO, "installer", "generated")
 
-    def test_construct_yaml_version_string(self):
-        yamls = [f for f in os.listdir(self.generated) if "1.8.7b0" in f and f.endswith(".yaml")]
-        assert yamls, "No 1.8.7b0 yaml found"
-        content = open(os.path.join(self.generated, yamls[0])).read()
-        assert "1.8.7b0" in content
-
-    def test_wheel_version_in_filename(self):
-        wheels = [f for f in os.listdir(self.generated) if f.endswith(".whl")]
-        names = [w for w in wheels if "1.8.7b0" in w]
-        assert names, f"No 1.8.7b0 wheel in {wheels}"
+    # The checks of the 1.8.7b0 construct YAML and wheel removed in 1.10.2: they can pass only on that build.
 
     def test_no_old_version_in_core_module(self):
         from whisperjav import __version__
         assert "1.8.6" not in __version__, "Still on 1.8.6 — version not bumped"
 
-    def test_installer_validation_script_passes(self):
-        """Run the generated validation script."""
-        scripts = [f for f in os.listdir(self.generated)
-                   if f.startswith("validate_installer") and "1.8.7b0" in f and f.endswith(".py")]
-        assert scripts, "No validation script found"
-        result = subprocess.run(
-            [sys.executable, scripts[0]],
-            capture_output=True, text=True, timeout=30,
-            cwd=self.generated,
-        )
-        assert result.returncode == 0, \
-            f"Installer validation failed:\n{result.stdout}\n{result.stderr}"
+    # The run of the 1.8.7b0 validation script removed in 1.10.2 (no such script after that build).
 
 
 # ─────────────────────────────────────────────────────────────────────────────

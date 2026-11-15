@@ -36,7 +36,7 @@ whisperjav [OPTIONS] INPUT [INPUT...]
 |------|--------|------|
 | `--ensemble` | 关闭 | 启用专家模式 |
 | `--ensemble-serial` | 开启 | 先完整处理每个文件再处理下一个；`--no-ensemble-serial` 先对所有文件运行第一轮，再运行第二轮，每一轮只为全部文件启动一次 |
-| `--pass1-pipeline` | `balanced` | 第一轮的处理管线；也可以是七个 GGUF 处理管线 `parakeet-crispasr`、`cohere-crispasr`、`reazonspeech-crispasr`、`kotoba-crispasr`、`whisper-turbo-crispasr`、`whisper-large-crispasr`、`moss-crispasr`（见 [GGUF 处理管线（CrispASR）](../pipelines/crispasr.md)）和 `xxl`（你自己的 Faster Whisper XXL，见 [专家模式](../pipelines/ensemble.md) 中的 BYOP 一节） |
+| `--pass1-pipeline` | `balanced` | 第一轮的处理管线；也可以是九个 GGUF 处理管线 `parakeet-crispasr`、`cohere-crispasr`、`reazonspeech-crispasr`、`kotoba-crispasr`、`whisper-turbo-crispasr`、`whisper-large-crispasr`、`moss-crispasr`、`haas-crispasr`、`qwen3-asr-crispasr`（见 [GGUF 处理管线（CrispASR）](../pipelines/crispasr.md)）和 `xxl`（你自己的 Faster Whisper XXL，见 [专家模式](../pipelines/ensemble.md) 中的 BYOP 一节） |
 | `--pass2-pipeline` | （无） | 第二轮的处理管线，选项相同；指定它即启用第二轮 |
 | `--xxl-exe` | （无） | `faster-whisper-xxl.exe` 的路径；任一轮为 `xxl` 时必需。`--pass1-model` / `--pass2-model` 选择 XXL 运行的模型（默认 `large-v2`） |
 | `--merge-strategy` | `pass1_primary` | 合并策略：`pass1_primary`、`pass2_primary`、`smart_merge`、`full_merge`、`pass1_overlap`、`pass2_overlap`、`longest` |
@@ -50,7 +50,7 @@ whisperjav [OPTIONS] INPUT [INPUT...]
 | `--qwen-timing-model` | `none` | `whisper-small`（488 MB；不使用它写出的文字）在对齐器没有给出时间的地方，把字幕的开始时间往后移到语音开始处；在对齐器标出时间的 VAD 组里，在新句子开始处附近的标点或空格处切分。`none`（从 1.10.1 起的默认值）不使用它 |
 | `--qwen-stepdown` | 关闭 | 用最长 6 秒的 VAD 组重新处理对齐坍塌的场景。关闭时（默认），在 `aligner_vad_fallback` 下，这样的场景采用其 VAD 组的时间 |
 
-对齐器和计时模型是 1.10.0 新增的，从 1.10.1 起默认关闭；在运行第一次使用它们时下载，在本安装的 CrispASR 运行的地方运行；`--device cpu` 不能把它们限制在 CPU 上。见[字幕时间](../pipelines/chronosjav.md#subtitle-timing-1100)。在专家模式的每一轮中，把它们写在 `--pass1-qwen-params` 里，例如 `'{"timestamp_mode": "aligner_vad_fallback", "timing_model": "whisper-small"}'`。
+对齐器和计时模型是 1.10.0 新增的，从 1.10.1 起默认关闭；在第一次使用它们的运行开始时、读取任何音频之前下载（从 1.10.2 起；下载失败时运行停止），在本安装的 CrispASR 运行的地方运行；`--device cpu` 不能把它们限制在 CPU 上。见[字幕时间](../pipelines/chronosjav.md#subtitle-timing-1100)。在专家模式的每一轮中，把它们写在 `--pass1-qwen-params` 里，例如 `'{"timestamp_mode": "aligner_vad_fallback", "timing_model": "whisper-small"}'`。
 
 ### 处理选项
 

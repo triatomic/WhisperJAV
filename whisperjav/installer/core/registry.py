@@ -100,8 +100,8 @@ class Extra(Enum):
     CORE = "core"           # Required for basic operation (in dependencies, not extras)
     CLI = "cli"             # Audio processing, VAD, scene detection
     GUI = "gui"             # PyWebView GUI
-    TRANSLATE = "translate" # AI translation (pysubtrans, OpenAI, Gemini)
-    ENHANCE = "enhance"     # Speech enhancement (ZipEnhancer, BS-RoFormer, htdemucs, FFmpeg-DSP)
+    TRANSLATE = "translate" # AI translation (pysubtrans, Anthropic, OpenAI, Gemini)
+    ENHANCE = "enhance"     # Speech enhancement (ZipEnhancer, htdemucs; FFmpeg-DSP needs none; the CrispASR RoFormers come with CrispASR's build extra)
     HUGGINGFACE = "huggingface"  # HuggingFace Transformers
     QWEN = "qwen"           # Qwen3-ASR support (v1.8.3+)
     ANALYSIS = "analysis"   # Scientific analysis and visualization
@@ -571,11 +571,18 @@ PACKAGES: List[Package] = [
     # =========================================================================
     Package(
         name="pysubtrans",
-        version=">=1.6.0",
+        version=">=1.8.0",  # 1.10.2 (owner W618 1): flags a response label left in a subtitle (#460)
         extra=Extra.TRANSLATE,
         order=60,
         import_name="PySubtrans",  # pip name != import name (case-sensitive)
         reason="AI-powered subtitle translation (requires Python 3.10+)",
+    ),
+    Package(
+        name="anthropic",
+        version=">=2.0",
+        extra=Extra.TRANSLATE,
+        order=61,
+        reason="Claude provider for pysubtrans (without it PySubtrans turns the provider off; 1.10.2, owner W618 4)",
     ),
     Package(
         name="openai",
@@ -590,13 +597,6 @@ PACKAGES: List[Package] = [
         extra=Extra.TRANSLATE,
         order=62,
         reason="Gemini provider for pysubtrans",
-    ),
-    Package(
-        name="anthropic",
-        version=">=2.0.0",
-        extra=Extra.TRANSLATE,
-        order=62,
-        reason="Claude provider for pysubtrans",
     ),
     Package(
         name="google-api-core",
@@ -706,21 +706,8 @@ PACKAGES: List[Package] = [
         order=77,
         reason="Lightweight parallelism (scikit-learn)",
     ),
-    Package(
-        name="rotary-embedding-torch",
-        version=">=0.8",
-        extra=Extra.ENHANCE,
-        order=77,
-        import_name="rotary_embedding_torch",
-        reason="Rotary positional embeddings - required by BS-RoFormer",
-    ),
-    Package(
-        name="bs-roformer-infer",
-        extra=Extra.ENHANCE,
-        order=78,
-        import_name="bs_roformer",  # pip name != import name
-        reason="BS-RoFormer vocal isolation",
-    ),
+    # 1.10.2 (owner W594, W596 6): BS-RoFormer is replaced by CrispASR's Mini-BS-RoFormer; rotary-embedding-torch
+    # and bs-roformer-infer are out.
     Package(
         name="demucs",
         extra=Extra.ENHANCE,

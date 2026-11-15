@@ -9,6 +9,11 @@ repository, file name and commit, with its size and SHA-256 as Hugging Face list
 memory, about 2 GB of it taken, so each pipeline offers its largest files that fit 6-14 GB, and the menus name
 each file's quantization and the GPU memory it needs (W400).
 
+1.10.2 (owner W574): two more pipelines, Haas-CrispASR and Qwen3-ASR-CrispASR, each with only the files that went
+through the GGUF model test tool (tools/crispasr_model_test.py) first; and the model files of four backends CrispASR
+runs for every pipeline (owner W594, W596): the speech segmenters Sortformer and pyannote, the speech enhancers
+Mel-Band-RoFormer and Mini-BS-RoFormer (SEGMENTER_MODELS, ENHANCER_MODELS).
+
 Standard library only.
 """
 
@@ -154,6 +159,30 @@ MODELS = {m.name: m for m in (
               "80cb31198a07e0c456460658e3264b9a829095c07ad8454bdc9f1f999c277154",
               "Apache-2.0 (OpenMOSS-Team/MOSS-Transcribe-Diarize)",
               vram_mib=1673),
+    # 1.10.2 (owner W574): the models of two new pipelines, each file first run through the GGUF model test tool
+    # (tools/crispasr_model_test.py, owner W568-W573; its runs D:\WJ110_measure\haas_2026-11-06\). Their GPU memory
+    # is the tool's measuring stage figure: the card's peak over its use before the model was opened, on the VAD
+    # groups of the seven Netflix reference clips, through CrispASR 0.8.50 (CUDA build, RTX 3060), 2026-11-06.
+    # Haas-ja-v1.0 is a Parakeet-TDT model, which CrispASR 0.8.50 opens as the parakeet family (#561).
+    ModelFile("haas-ja-v1.0-f16", "Haas ja v1.0 (f16)", "parakeet",
+              "cstr/Haas-ja-v1.0-GGUF", "haas-ja-v1.0-f16.gguf",
+              "607fa1450398d589643fbb0e8bb1d0424af68d11", 1_232_807_488,
+              "69dce16668e9bfeaa611562443e52a3bf7000590c6d5870363ac16afedf92923",
+              "Apache-2.0 (third-intelligence/Haas-ja-v1.0)",
+              vram_mib=1550),
+    ModelFile("haas-ja-v1.0-q8_0", "Haas ja v1.0 (q8_0)", "parakeet",
+              "cstr/Haas-ja-v1.0-GGUF", "haas-ja-v1.0-q8_0.gguf",
+              "607fa1450398d589643fbb0e8bb1d0424af68d11", 656_182_656,
+              "630fb47ac99d5111b0f99a7488857405611f05d7acae0fb2ceba4847ae1f9a2c",
+              "Apache-2.0 (third-intelligence/Haas-ja-v1.0)",
+              vram_mib=919),
+    # Qwen3-ASR-1.7B, the model ChronosJAV's Qwen3-ASR runs through PyTorch, here as GGUF through CrispASR.
+    ModelFile("qwen3-asr-1.7b-f16", "Qwen3-ASR 1.7B (f16)", "qwen3",
+              "cstr/qwen3-asr-1.7b-GGUF", "qwen3-asr-1.7b-f16.gguf",
+              "674df5d44b50a63e7102a18895ed20e3f91de301", 4_704_800_576,
+              "ac6c58f9cb0f2bb22290319cde01b0e25a2c1f1ee69aa2f1a9265f29a8bfc9d7",
+              "Apache-2.0 (Qwen/Qwen3-ASR-1.7B)",
+              vram_mib=6367),
 )}
 
 # The models each pipeline offers its users, and its default. 1.10.0: Cohere-CrispASR's default is v0.1 (W129 1);
@@ -170,6 +199,9 @@ PIPELINE_MODELS = {
     "whisper-large-crispasr": ("whisper-large-v2-f16", "whisper-large-v2-q8_0",
                                "whisper-large-v3-f16", "whisper-large-v3-q5_0"),
     "moss-crispasr": ("moss-transcribe-diarize-0.9b-f16", "moss-transcribe-diarize-0.9b-q8_0"),
+    # 1.10.2 (owner W574): only the files the GGUF model test tool ran; the largest is the default (as W400).
+    "haas-crispasr": ("haas-ja-v1.0-f16", "haas-ja-v1.0-q8_0"),
+    "qwen3-asr-crispasr": ("qwen3-asr-1.7b-f16",),
 }
 PIPELINE_DEFAULT_MODEL = {
     "parakeet-crispasr": "parakeet-tdt-0.6b-ja",
@@ -181,15 +213,19 @@ PIPELINE_DEFAULT_MODEL = {
     # Netflix reference clip (2026-10-31, step 1: 4 and 0.520 against 14 and 0.574, both q5_0).
     "whisper-large-crispasr": "whisper-large-v2-f16",
     "moss-crispasr": "moss-transcribe-diarize-0.9b-f16",
+    # Haas f16 scored as q8_0 on the Netflix clips (CER 43.4 % each, 2026-11-06); the largest file is the default.
+    "haas-crispasr": "haas-ja-v1.0-f16",
+    "qwen3-asr-crispasr": "qwen3-asr-1.7b-f16",
 }
 CRISPASR_PIPELINES = tuple(PIPELINE_MODELS)
 # The pipelines whose text the CrispASR aligner times (wav2vec2-ja, DEFAULT_ALIGNER) by default: Cohere-CrispASR
-# (item 12; W248 3, Q7). The others use their models' own times (owner W411, W412): Parakeet, Kotoba,
-# Whisper-Turbo, Whisper-Large token starts and ends; ReazonSpeech starts only, its ends at the VAD group's end;
-# MOSS its own segment starts and ends (1.10.1, W426). --passN-word-timestamps changes it per pass
+# (item 12; W248 3, Q7) and, since 1.10.2, Qwen3-ASR-CrispASR (owner W574: its model gives no word or token times,
+# GGUF model test tool, 2026-11-06). The others use their models' own times (owner W411, W412): Parakeet, Kotoba,
+# Whisper-Turbo, Whisper-Large and Haas (1.10.2) token starts and ends; ReazonSpeech starts only, its ends at the VAD
+# group's end; MOSS its own segment starts and ends (1.10.1, W426). --passN-word-timestamps changes it per pass
 # (word_timestamps_for, below). Each pipeline class's ENGINE.aligner says the same
 # (tests/test_crispasr_pipelines.py); the GUI's status panel reads it here.
-ALIGNED_PIPELINES = frozenset({"cohere-crispasr"})
+ALIGNED_PIPELINES = frozenset({"cohere-crispasr", "qwen3-asr-crispasr"})
 
 # Where a pass's subtitle times come from (--passN-word-timestamps; owner W411-W413): "model" = the ASR model's
 # own word times, "aligner" = the CrispASR aligner DEFAULT_ALIGNER. The default is the pipeline's own
@@ -208,6 +244,14 @@ def word_timestamps_for(pipeline: str, choice: Optional[str] = None) -> str:
             raise ValueError(f"'{choice}' is not a word-timestamps choice; choose one of: {', '.join(WORD_TIMESTAMPS)}")
         return choice
     return "aligner" if pipeline in ALIGNED_PIPELINES else "model"
+
+
+def aligner_for(pipeline: str, choice: Optional[str] = None) -> Optional[str]:
+    """The CrispASR aligner a pass of this pipeline runs with --passN-word-timestamps ``choice`` (DEFAULT_ALIGNER),
+    or None when it runs none. Each pipeline class's engine_row(choice).aligner says the same
+    (tests/test_start_check_aligner_v1102.py); main.py's start-of-run check downloads it (1.10.2, owner W622 item 5).
+    """
+    return DEFAULT_ALIGNER if word_timestamps_for(pipeline, choice) == "aligner" else None
 
 # The aligners: models that time text already written, run by CrispASR's align_words (item 12, C1; design
 # note docs/plans/design/2026-10-28-chronosjav-timing-c3-c1.md section 4). Kept apart from MODELS, which are
@@ -275,6 +319,38 @@ def timing_model_for(name: Optional[str]) -> ModelFile:
     if name not in TIMING_MODELS:
         raise ValueError(f"'{name}' is not a timing model; choose one of: {', '.join(TIMING_MODELS)}")
     return TIMING_MODELS[name]
+
+
+# The speech segmenter backends `sortformer` and `pyannote`, and the speech enhancer backends `mel-band-roformer`
+# and `mini-bs-roformer`, run by CrispASR (1.10.2, owner W594, W596). Keyed by the backend's name. Repository,
+# file, commit, size and SHA-256 as the viability tests fetched and checked them against Hugging Face's listing
+# (D:\WJ110_measure\phase_a2b_diar_2026-11-08\_fetch, D:\WJ110_measure\phase_a_2026-11-07\_fetch). The
+# `backend` field: the separators' CrispASR backend name (passed to Session); for the diarization files, which
+# CrispASR opens through its diarization functions and not as a Session, the method's name.
+SEGMENTER_MODELS = {
+    "sortformer": ModelFile("sortformer", "Sortformer (NVIDIA Nemotron-3-Diarization, q8_0)", "sortformer",
+                            "nvidia/Nemotron-3-Diarization", "Nemotron-3-Diarization.q8_0.gguf",
+                            "f667ed73aee57d40cc39428eb768b4fd87a0a29e", 107_012_128,
+                            "08456d9e22cd9a323c0364d98375f3746d6e68507ebb705cd46438c534c7a3a1",
+                            "OpenMDW-1.1"),
+    "pyannote": ModelFile("pyannote", "pyannote segmentation-3.0", "pyannote",
+                          "cstr/pyannote-v3-segmentation-GGUF", "pyannote-seg-3.0.gguf",
+                          "2b2492e0c04f0df609b9faa1ecf363766ad970fa", 5_976_512,
+                          "1242d50f6642ae86faae72535a8804279c22e7dc410d412b575c893a49bd77f2",
+                          "MIT"),
+}
+ENHANCER_MODELS = {
+    "mel-band-roformer": ModelFile("mel-band-roformer", "Mel-Band-RoFormer vocals (f16)", "mel-band-roformer",
+                                   "cstr/mel-band-roformer-vocals-GGUF", "mel-band-roformer-vocals-f16.gguf",
+                                   "d6909215e1d7a3bc4ea1a569b930e38470d43000", 457_014_016,
+                                   "fe94b114bce12653dae4e94968d28cbab36dcdd0c783fc052c3b656218233f24",
+                                   "MIT"),
+    "mini-bs-roformer": ModelFile("mini-bs-roformer", "Mini-BS-RoFormer (f16)", "mini-bs-roformer",
+                                  "cstr/mini-bs-roformer-GGUF", "mini-bs-roformer-f16.gguf",
+                                  "919fed2376680efd1bcdd917cc44e19c3bcfd3a0", 92_488_448,
+                                  "c9c1c4d99fbab49f8c6e29b2553d7ee50c9aa73226ac5f4891e557165a600474",
+                                  "MIT"),
+}
 
 
 # The source-language values that mean Japanese, lower-cased: the command line's --language value

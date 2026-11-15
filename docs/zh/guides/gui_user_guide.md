@@ -157,6 +157,8 @@ WhisperJAV 接受扩展名为 .mp4、.mkv、.avi、.mov、.wmv、.flv、.webm、
 - **原语言**（默认） — 以原始语言输出字幕
 - **直接转英语** — Whisper 在转写过程中翻译为英语（质量低于专门的翻译工具）
 
+已知问题：使用 transformers 处理管线的默认模型 Kotoba Bilingual v1.0 时，模型给出的英语文字没有时间，因此字幕无法使用。
+
 ---
 
 ## 6. 高级选项
@@ -196,11 +198,11 @@ WhisperJAV 接受扩展名为 .mp4、.mkv、.avi、.mov、.wmv、.flv、.webm、
 
 | 控制项 | 选项 | 默认值 |
 |--------|------|--------|
-| **处理管线** | 基于 Whisper：Balanced、Fast、Faster、Fidelity；HuggingFace：Transformers (HF)；ChronosJAV：Qwen3-ASR、Anime-Whisper；外部 (BYOP)：XXL Faster Whisper；GGUF via crispasr：parakeet、cohere；实验性，欢迎反馈：reazonspeech、kotoba、whisper-turbo、whisper-large、MOSS | 第一轮：cohere；第二轮：parakeet（勾选前不运行） |
+| **处理管线** | 基于 Whisper：Balanced、Fast、Faster、Fidelity；HuggingFace：Transformers (HF)；ChronosJAV：Qwen3-ASR、Anime-Whisper；外部 (BYOP)：XXL Faster Whisper；GGUF via crispasr：parakeet、cohere；实验性，欢迎反馈：reazonspeech、kotoba、whisper-turbo、whisper-large、MOSS、haas、qwen3-asr | 第一轮：cohere；第二轮：parakeet（勾选前不运行） |
 | **灵敏度** | 高灵敏、中灵敏、低灵敏 | 选择处理管线时随之设定：第一轮（cohere）中灵敏，第二轮（parakeet）高灵敏 |
 | **场景检测器** | Auditok、Silero、Semantic、None | Semantic |
-| **语音增强器** | None、FFmpeg DSP、ZipEnhancer、htdemucs（BS-RoFormer 和 ZipEnhancer ONNX：即将推出） | None |
-| **语音分割器** | Silero v4.0、Silero v3.1、Silero v6.2、TEN VAD、WhisperSeg (JA-ASMR)、FireRedVAD、无（None）；Balanced 时改为其内置 VAD 的 Silero 版本：3.1、4.0（默认）、6.2；GGUF 处理管线选 无 时，每个场景整段交给模型 | 选择处理管线时随之设定：第一轮（cohere）FireRedVAD，第二轮（parakeet）TEN VAD |
+| **语音增强器** | 无；人声分离：Mel-Band-RoFormer、Mini-BS-RoFormer、htdemucs (Demucs v4)；噪声抑制：ZipEnhancer；DSP：FFmpeg 音频滤镜...；菜单中的 **仅用于 VAD**（For VAD only）默认勾选（Fidelity、Qwen3-ASR、Anime-Whisper 和 GGUF 处理管线；Balanced、Fast、Faster、Transformers 和 XXL 不提供） | 无 |
+| **语音分割器** | FireRedVAD、TEN VAD、WhisperSeg (JA-ASMR)、Silero v3.1、Silero v4.0、Silero v6.2；在 **实验性，欢迎反馈** 下：Sortformer (NVIDIA Nemotron)、pyannote 3.0；无（None）；Balanced 时改为其内置 VAD 的 Silero 版本：3.1、4.0（默认）、6.2；GGUF 处理管线选 无 时，每个场景整段交给模型 | 选择处理管线时随之设定：第一轮（cohere）FireRedVAD，第二轮（parakeet）TEN VAD |
 | **模型** | 所选处理管线的模型 | 该处理管线的默认模型 |
 
 ### 可用处理管线
@@ -212,7 +214,7 @@ WhisperJAV 接受扩展名为 .mp4、.mkv、.avi、.mov、.wmv、.flv、.webm、
 - **基于 Whisper**：Balanced、Fast、Faster、Fidelity
 - **HuggingFace**：Transformers
 - **ChronosJAV**：Qwen3-ASR、Anime-Whisper
-- **GGUF via crispasr**：parakeet（Parakeet-CrispASR）、cohere（Cohere-CrispASR）；分隔线下方的 **实验性，欢迎反馈**（Experimental, open to feedback）：reazonspeech（ReazonSpeech-CrispASR）、kotoba（Kotoba-CrispASR）、whisper-turbo（Whisper-Turbo-CrispASR）、whisper-large（Whisper-Large-CrispASR）、MOSS（MOSS-CrispASR）——只处理日语，全部为实验性；parakeet 和 cohere 从 1.10.0 起提供，其他五个为 1.10.1 新增（见 [GGUF 处理管线（CrispASR）](../pipelines/crispasr.md)）
+- **GGUF via crispasr**：parakeet（Parakeet-CrispASR）、cohere（Cohere-CrispASR）；分隔线下方的 **实验性，欢迎反馈**（Experimental, open to feedback）：reazonspeech（ReazonSpeech-CrispASR）、kotoba（Kotoba-CrispASR）、whisper-turbo（Whisper-Turbo-CrispASR）、whisper-large（Whisper-Large-CrispASR）、MOSS（MOSS-CrispASR）、haas（Haas-CrispASR）、qwen3-asr（Qwen3-ASR-CrispASR）——只处理日语，全部为实验性；parakeet 和 cohere 从 1.10.0 起提供，haas 和 qwen3-asr 为 1.10.2 新增，其他五个为 1.10.1 新增（见 [GGUF 处理管线（CrispASR）](../pipelines/crispasr.md)）
 - **外部 (BYOP)**：XXL Faster Whisper（第一轮、第二轮或两者）
 
 ### 自定义参数
@@ -289,7 +291,7 @@ WhisperJAV 接受扩展名为 .mp4、.mkv、.avi、.mov、.wmv、.flv、.webm、
 | 策略（GUI） | 命令行 | 作用 |
 |------|------|------|
 | **第一轮 + 用第二轮填补**（Pass 1 + Fill From Pass 2，默认） | `pass1_primary` | 保留第一轮的全部字幕；第二轮的字幕只在不与任何第一轮字幕重叠时加入 |
-| **智能合并（质量最佳）**（Smart Merge (Best Quality)） | `smart_merge` | 把每条第一轮字幕与和它重叠最多的第二轮字幕配对（重叠至少为较短一条的 30%），每对只保留一条：自身长度落在重叠部分里的比例更大的那条；比例相近时取文字更多的那条（由很少几种字符组成的行，如 ああああああああああ，按没有文字计）；再相同时取较短的那条。没有配对的字幕两轮都保留 |
+| **智能合并**（Smart Merge） | `smart_merge` | 把每条第一轮字幕与和它重叠最多的第二轮字幕配对（重叠至少为较短一条的 30%），每对只保留一条：自身长度落在重叠部分里的比例更大的那条；比例相近时取文字更多的那条（由很少几种字符组成的行，如 ああああああああああ，按没有文字计）；再相同时取较短的那条。没有配对的字幕两轮都保留 |
 | **完全合并（全部字幕行）**（Full Merge (All Lines)） | `full_merge` | 两轮的全部字幕按时间排列；重叠的字幕都保留 |
 | **第二轮 + 用第一轮填补**（Pass 2 + Fill From Pass 1） | `pass2_primary` | 同"第一轮 + 用第二轮填补"，两轮互换 |
 | **第一轮 + 填补（30% 重叠）**（Pass 1 + Fill (30% Overlap)） | `pass1_overlap` | 保留第一轮的全部字幕；第二轮的字幕只要与第一轮字幕的重叠不超过那条第一轮字幕长度的 30% 就加入 |

@@ -31,7 +31,7 @@ Each pass has identical controls:
 
 | Control | Description |
 |---------|-------------|
-| **Pipeline** | The pipeline of the pass, in six groups: Whisper-Based (Balanced, Fast, Faster, Fidelity), HuggingFace (Transformers (HF)), ChronosJAV (Qwen3-ASR, Anime-Whisper), External (BYOP) (XXL Faster Whisper), GGUF via crispasr (parakeet, cohere) and, below a divider line, Experimental, open to feedback (reazonspeech, kotoba, whisper-turbo, whisper-large, MOSS). Pass 1 starts on cohere, Pass 2 on parakeet. Choosing a pipeline sets the sensitivity and speech segmenter the pass starts with |
+| **Pipeline** | The pipeline of the pass, in six groups: Whisper-Based (Balanced, Fast, Faster, Fidelity), HuggingFace (Transformers (HF)), ChronosJAV (Qwen3-ASR, Anime-Whisper), External (BYOP) (XXL Faster Whisper), GGUF via crispasr (parakeet, cohere) and, below a divider line, Experimental, open to feedback (reazonspeech, kotoba, whisper-turbo, whisper-large, MOSS, haas, qwen3-asr). Pass 1 starts on cohere, Pass 2 on parakeet. Choosing a pipeline sets the sensitivity and speech segmenter the pass starts with |
 | **Sensitivity** | Detection threshold (Aggressive, Balanced, Conservative) |
 | **Scene Detector** | How to split audio into scenes (Auditok, Silero, Semantic, None) |
 | **Speech Enhancer** | Audio preprocessing (None, FFmpeg DSP, ZipEnhancer, htdemucs) |
@@ -47,7 +47,7 @@ Click **Customize Parameters** on a pass to change its detailed settings; the bu
 | Strategy (GUI) | Command line | What it does |
 |----------|----------|----------|
 | **Pass 1 + Fill From Pass 2** (default) | `pass1_primary` | Keeps every Pass 1 subtitle; adds a Pass 2 subtitle only where it overlaps no Pass 1 subtitle |
-| **Smart Merge (Best Quality)** | `smart_merge` | Pairs each Pass 1 subtitle with the Pass 2 subtitle that overlaps it most, if the overlap is at least 30% of the shorter one, and keeps one of the pair: the one with more of its own length inside the overlap; if that is about equal, the one with more text (a line of few different characters, such as ああああああああああ, counts as none); then the shorter one. Subtitles without a partner are kept from both passes |
+| **Smart Merge** | `smart_merge` | Pairs each Pass 1 subtitle with the Pass 2 subtitle that overlaps it most, if the overlap is at least 30% of the shorter one, and keeps one of the pair: the one with more of its own length inside the overlap; if that is about equal, the one with more text (a line of few different characters, such as ああああああああああ, counts as none); then the shorter one. Subtitles without a partner are kept from both passes |
 | **Full Merge (All Lines)** | `full_merge` | Keeps every subtitle of both passes, in time order; overlapping subtitles stay |
 | **Pass 2 + Fill From Pass 1** | `pass2_primary` | As Pass 1 + Fill From Pass 2, with the passes swapped |
 | **Pass 1 + Fill (30% Overlap)** | `pass1_overlap` | Keeps every Pass 1 subtitle; adds a Pass 2 subtitle unless it overlaps a Pass 1 subtitle by more than 30% of that subtitle's length |

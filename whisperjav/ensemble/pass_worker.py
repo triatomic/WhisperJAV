@@ -17,6 +17,10 @@ from typing import Any, Dict, List, Optional
 
 from whisperjav.modules.audio_integrity import AudioIntegrityStop
 from whisperjav.config.chronosjav_vad import apply_chronosjav_segmenter_defaults, chronosjav_end_pad_default
+from whisperjav.config.chronosjav_timing import (PASS_START as CHRONOSJAV_PASS_START,
+                                                 TIMING_KEYS as CHRONOSJAV_TIMING_KEYS,
+                                                 apply_aligner_choice as chronosjav_apply_aligner_choice,
+                                                 pass_timing as chronosjav_pass_timing)
 from whisperjav.config.anime_whisper_vad import anime_whisperseg_defaults
 from whisperjav.config.legacy import resolve_legacy_pipeline, apply_balanced_vad_defaults
 from whisperjav.pipelines.balanced_pipeline import BalancedPipeline
@@ -33,6 +37,8 @@ from whisperjav.pipelines.kotoba_crispasr_pipeline import KotobaCrispASRPipeline
 from whisperjav.pipelines.whisper_turbo_crispasr_pipeline import WhisperTurboCrispASRPipeline
 from whisperjav.pipelines.whisper_large_crispasr_pipeline import WhisperLargeCrispASRPipeline
 from whisperjav.pipelines.moss_crispasr_pipeline import MossCrispASRPipeline
+from whisperjav.pipelines.haas_crispasr_pipeline import HaasCrispASRPipeline
+from whisperjav.pipelines.qwen3_asr_crispasr_pipeline import Qwen3AsrCrispASRPipeline
 from whisperjav.crispasr.errors import FAILURE_PREFIX as CRISPASR_FAILURE_PREFIX, CrispASRRunError, CrispASRSetupError
 from whisperjav.modules.qwen_errors import QwenModelUnusable
 from whisperjav.crispasr.manifest import CRISPASR_PIPELINES
@@ -64,6 +70,9 @@ PIPELINE_CLASSES = {
     "whisper-turbo-crispasr": WhisperTurboCrispASRPipeline,
     "whisper-large-crispasr": WhisperLargeCrispASRPipeline,
     "moss-crispasr": MossCrispASRPipeline,
+    # 1.10.2 (owner W574).
+    "haas-crispasr": HaasCrispASRPipeline,
+    "qwen3-asr-crispasr": Qwen3AsrCrispASRPipeline,
 }
 
 # Pipelines whose constructors never read enhance_for_vad. Verified against their
@@ -472,12 +481,10 @@ DEFAULT_QWEN_PARAMS = {
     "qwen_batch_size": 1,
     "qwen_max_tokens": 4096,
     "qwen_language": "Japanese",  # WhisperJAV is purpose-built for Japanese
-    "qwen_timestamps": "word",
-    "qwen_aligner": "wav2vec2-ja",  # 1.10.0: the CrispASR aligner (design note 2026-10-28)
-    # The timing model and timestamp mode below are the shared 1.10.0 values (owner W254), still taken by the dormant
-    # Cohere-in-ChronosJAV branch, which this change leaves as it was. Qwen3-ASR and anime-whisper default to no
-    # timing model and vad_only since 1.10.1 (owner W498 D1): set in their branches of _build_pipeline.
-    "qwen_timing_model": "whisper-small",  # the CrispASR timing model, step 8
+    # qwen_timestamps, qwen_aligner, qwen_timing_model, qwen_timestamp_mode: the shared 1.10.0 values (owner W254),
+    # still taken by the dormant Cohere-in-ChronosJAV; Qwen3-ASR and anime-whisper get vad_only and no timing model
+    # (W498 D1). Kept in config/chronosjav_timing.py PASS_START, the one place that decides a pass's files (1.10.2).
+    **CHRONOSJAV_PASS_START,
     "qwen_scene": "semantic",
     "qwen_context": "",
     "qwen_context_file": None,
@@ -491,7 +498,6 @@ DEFAULT_QWEN_PARAMS = {
     "qwen_input_mode": "assembly",
     "qwen_framer": "vad-grouped",  # Preserve previous VAD_SLICING behavior for ensemble
     "qwen_safe_chunking": True,
-    "qwen_timestamp_mode": "aligner_vad_fallback",  # see the note above qwen_timing_model
     "qwen_assembly_cleaner": True,
     "qwen_repetition_penalty": 1.1,
     "qwen_max_tokens_per_second": 20.0,
@@ -519,9 +525,9 @@ def prepare_qwen_params(pass_config: Dict[str, Any]) -> Dict[str, Any]:
         "batch_size": "qwen_batch_size",
         "max_new_tokens": "qwen_max_tokens",
         "language": "qwen_language",
-        "timestamps": "qwen_timestamps",
-        "aligner_id": "qwen_aligner",
-        "use_aligner": "qwen_use_aligner",  # Special handling below
+        # timestamps, aligner_id, use_aligner, aligner_backend, timing_model, timestamp_mode (1.10.2: from the one
+        # place, config/chronosjav_timing.py TIMING_KEYS; use_aligner and aligner_backend: apply_aligner_choice below)
+        **CHRONOSJAV_TIMING_KEYS,
         "scene": "qwen_scene",
         "context": "qwen_context",
         "context_file": "qwen_context_file",
@@ -535,9 +541,6 @@ def prepare_qwen_params(pass_config: Dict[str, Any]) -> Dict[str, Any]:
         "scene_min_duration": "qwen_scene_min_duration",
         "scene_max_duration": "qwen_scene_max_duration",
         "scene_clustering_threshold": "qwen_scene_clustering_threshold",  # v1.9.2 CFF2
-        "aligner_backend": "qwen_aligner_backend",
-        "timing_model": "qwen_timing_model",
-        "timestamp_mode": "qwen_timestamp_mode",
         "assembly_cleaner": "qwen_assembly_cleaner",
         "repetition_penalty": "qwen_repetition_penalty",
         "max_tokens_per_audio_second": "qwen_max_tokens_per_second",
@@ -570,31 +573,10 @@ def prepare_qwen_params(pass_config: Dict[str, Any]) -> Dict[str, Any]:
             params[key] = value
             user_set_keys.add(key)
 
-    # Handle use_aligner special case: if False, set aligner to None
-    if qwen_params.get("use_aligner") is False:
-        params["qwen_aligner"] = None
-
-    # Handle aligner_backend: "none" → disable aligner; "crispasr" / "qwen3" → that
-    # backend, with its default model when the aligner named is not one of its own
-    # (an older GUI preset may pair "qwen3" with nothing, or "crispasr" with the HF id).
-    aligner_backend = qwen_params.get("aligner_backend")
-    if aligner_backend == "none" or qwen_params.get("use_aligner") is False:
-        params["qwen_aligner"] = None
-        params["qwen_timestamps"] = "none"  # Pipeline derives use_aligner from timestamps
-        # The GUI's triple flip, for qwen_params written by hand too: no aligner means
-        # VAD-group times and no step-down, unless the pass names them itself.
-        if "timestamp_mode" not in qwen_params and "qwen_timestamp_mode" not in qwen_params:
-            params["qwen_timestamp_mode"] = "vad_only"
-        if "stepdown" not in qwen_params and "qwen_stepdown" not in qwen_params:
-            params["qwen_stepdown"] = False
-    elif aligner_backend in ("crispasr", "qwen3"):
-        from whisperjav.crispasr.manifest import ALIGNER_MODELS, DEFAULT_ALIGNER
-        is_crispasr_name = params.get("qwen_aligner") in ALIGNER_MODELS
-        if aligner_backend == "crispasr" and not is_crispasr_name:
-            params["qwen_aligner"] = DEFAULT_ALIGNER
-        elif aligner_backend == "qwen3" and (is_crispasr_name or not params.get("qwen_aligner")):
-            params["qwen_aligner"] = "Qwen/Qwen3-ForcedAligner-0.6B"
-    # (absent → the backend follows from qwen_aligner: a CrispASR short name or a PyTorch ID)
+    # use_aligner / aligner_backend (1.10.2: the one place, config/chronosjav_timing.py; moved there unchanged):
+    # "none" or use_aligner false turn the aligner off; "crispasr" / "qwen3" take that backend with its default
+    # model when the aligner named is not one of its own; absent, the backend follows from qwen_aligner.
+    chronosjav_apply_aligner_choice(params, qwen_params)
 
     # Handle assembly_cleaner string values (GUI sends "qwen3"/"passthrough",
     # CLI sends bool via store_true/store_false)
@@ -774,18 +756,17 @@ def run_pass_worker(payload: WorkerPayload, result_file: str) -> None:
         # This line should never be reached, but guard against it
         return  # pragma: no cover
 
-    # v1.10.0 (item 3, owner W75): a speech enhancer WhisperJAV no longer includes
-    # (ClearVoice) stops the pass here, before any audio is read. main.py checks the
-    # command line; this covers whatever else builds a pass configuration.
-    removed = _removed_enhancer_in_pass(pass_config, pass_number)
-    if removed:
-        logger.error("[Worker %s] Pass %s: %s", os.getpid(), pass_number, removed)
+    # A speech enhancer WhisperJAV does not offer stops the pass here, before any audio is read (owner W603, rule
+    # (i)). main.py checks the command line; this covers whatever else builds a pass configuration.
+    unknown = _unknown_enhancer_in_pass(pass_config, pass_number)
+    if unknown:
+        logger.error("[Worker %s] Pass %s: %s", os.getpid(), pass_number, unknown)
         _write_dropbox_and_exit(result_file, {
             "results": [
-                FileResult(basename=info["basename"], status="failed", error=removed).__dict__
+                FileResult(basename=info["basename"], status="failed", error=unknown).__dict__
                 for info in media_files
             ],
-            "worker_error": removed,
+            "worker_error": unknown,
         }, tracer, 1)
 
     try:
@@ -1239,19 +1220,19 @@ def _build_pipeline(
 
     # Pass enhance_for_vad flag to all pipelines via extra_kwargs.
     #
-    # What each pipeline then does with it, read from the code on 2026-09-17:
-    #   qwen (and the decoupled pipeline behind it) -- the real dual track: the
-    #     enhanced audio drives the segmenter, the original goes to the recogniser.
-    #   balanced, fidelity -- the flag is read and reported in an INFO line, but
-    #     the enhanced audio goes to BOTH; separating them needs recogniser-side
-    #     changes (balanced_pipeline.py, fidelity_pipeline.py).
-    #   fast, faster, transformers -- never read.
-    #     The owner accepted that on 2026-09-17; it is stated here and in --help
-    #     so it is not mistaken for an oversight.
-    #   parakeet-crispasr, cohere-crispasr (1.10.0) -- never read either: they run
-    #     no audio clean-up at all (CrispASR master plan 2.2). A user who set it on
-    #     such a pass is told below, in one line naming every pass setting the pass
-    #     does not use; the reason the line here gives would be wrong for them.
+    # What each pipeline then does with it, read from the code on 2026-11-08:
+    #   qwen (and the decoupled pipeline behind it), fidelity, and the GGUF
+    #     (*-crispasr) pipelines (since 1.10.0, design 22.9.1, owner W232 8) -- the
+    #     dual track: the enhanced audio goes to the speech segmenter, the original
+    #     to the ASR model (fidelity_pipeline.py process(), crispasr_pipeline.py
+    #     _enhance()). Since 1.10.2 it is on by default whenever a speech enhancer
+    #     runs in these pipelines (owner W596 3; main.py apply_enhance_for_vad_default).
+    #   balanced -- refused before the run (main.py validate_balanced_vad_options):
+    #     faster-whisper finds the speech inside its own transcribe call, on the
+    #     audio it transcribes; balanced_pipeline.py only warns if it still arrives.
+    #   fast, faster, transformers (ENHANCE_FOR_VAD_IGNORED_BY) -- never read; the
+    #     owner accepted that on 2026-09-17. It is stated here and in --help so it
+    #     is not mistaken for an oversight; the default leaves it off for them.
     #
     # A user who asked for it and is getting nothing is told so once, rather than
     # being left to infer it from the absence of any mention.
@@ -1479,12 +1460,8 @@ def _build_pipeline(
             "batch_size": qwen_defaults.get("qwen_batch_size", 1),
             "max_new_tokens": qwen_defaults.get("qwen_max_tokens", 4096),
             "language": (lambda _l: None if _l in (None, "null", "") else _l)(qwen_defaults.get("qwen_language", "Japanese")),
-            "timestamps": qwen_defaults.get("qwen_timestamps", "word"),
-            "aligner_id": qwen_defaults.get("qwen_aligner", "wav2vec2-ja"),
-            "aligner_backend": (qwen_defaults.get("qwen_aligner_backend")
-                                if qwen_defaults.get("qwen_aligner_backend") in ("crispasr", "qwen3", "none")
-                                else None),
-            "timing_model": qwen_defaults.get("qwen_timing_model", "whisper-small"),
+            # timestamps, aligner_id, aligner_backend, timing_model, timestamp_mode: added below from the one place
+            # (config/chronosjav_timing.py pass_timing; 1.10.2, owner W624 C)
             "scene_detector": qwen_defaults.get("qwen_scene", "none"),
             "context": qwen_defaults.get("qwen_context", ""),
             "context_file": qwen_defaults.get("qwen_context_file", None),
@@ -1498,7 +1475,6 @@ def _build_pipeline(
             "qwen_input_mode": qwen_defaults.get("qwen_input_mode", "assembly"),
             "qwen_framer": qwen_defaults.get("qwen_framer", "vad-grouped"),
             "qwen_safe_chunking": qwen_defaults.get("qwen_safe_chunking", True),
-            "timestamp_mode": qwen_defaults.get("qwen_timestamp_mode", "aligner_vad_fallback"),
             "assembly_cleaner": qwen_defaults.get("qwen_assembly_cleaner", True),
             "repetition_penalty": qwen_defaults.get("qwen_repetition_penalty", 1.1),
             "max_tokens_per_audio_second": qwen_defaults.get("qwen_max_tokens_per_second", 20.0),
@@ -1510,18 +1486,13 @@ def _build_pipeline(
         # When anime-whisper generator is selected, override model defaults
         # unless ensemble config explicitly set them
         _gen_backend = qwen_pipeline_params.get("generator_backend", "qwen3")
-        if _gen_backend in ("qwen3", "anime-whisper"):
-            # 1.10.1 (owner W498 D1): Qwen3-ASR and anime-whisper default to VAD Only with no timing model -- no
-            # aligner, no timing model -- unless the pass names a timestamp mode or a timing model itself. A pass
-            # that names an aligner but no timestamp mode gets aligner_vad_fallback (owner W501 1). One rule with
-            # main.py: config/chronosjav_timing.py.
-            from whisperjav.config.chronosjav_timing import DEFAULT_TIMING_MODEL, timestamp_mode_for_pass
-            _named = pass_config.get("qwen_params") or {}
-            _mode = timestamp_mode_for_pass(_named)
-            if _mode is not None:
-                qwen_pipeline_params["timestamp_mode"] = _mode
-            if "timing_model" not in _named and "qwen_timing_model" not in _named:
-                qwen_pipeline_params["timing_model"] = DEFAULT_TIMING_MODEL
+        # The pass's timing settings, from the one place that also tells main's start-of-run check and --dump-params
+        # which files the pass uses (1.10.2, owner W624 C, W626; config/chronosjav_timing.py). For Qwen3-ASR and
+        # anime-whisper it applies the 1.10.1 defaults: VAD Only with no timing model unless the pass names a
+        # timestamp mode or a timing model itself; a named aligner without a timestamp mode brings
+        # aligner_vad_fallback (owner W498 D1, W501 1). The Cohere branch below sets its own mode, as before.
+        qwen_pipeline_params.update(
+            chronosjav_pass_timing(qwen_defaults, pass_config.get("qwen_params") or {}, _gen_backend))
         if _gen_backend == "anime-whisper":
             _user_qwen = pass_config.get("qwen_params") or {}
             # v1.9.0: per-sensitivity WhisperSeg VAD defaults (owner table, single
@@ -2021,23 +1992,22 @@ def apply_custom_params(
 
 # Map GUI speech enhancer values to factory-compatible backend names
 # Supports two formats:
-#   1. Legacy: "bs-roformer" -> uses default model
-#   2. New:    "bs-roformer:vocals" -> backend + specific model
+#   1. Legacy: "mini-bs-roformer" -> uses default model
+#   2. New:    "mini-bs-roformer:vocals" -> backend + specific model
 #   3. FFmpeg DSP: "ffmpeg-dsp:loudnorm,denoise" -> backend + comma-separated effects
 SPEECH_ENHANCER_MAP = {
     "": "none",                 # Empty string -> disabled
     "ffmpeg-dsp": "ffmpeg-dsp", # FFmpeg DSP audio filters
     "none": "none",             # Explicit disable
     "zipenhancer": "zipenhancer",       # ZipEnhancer 16kHz (recommended, lightweight)
-    "bs-roformer": "bs-roformer",       # BS-RoFormer vocal isolation
 }
 
 
-def _removed_enhancer_in_pass(pass_config: Dict[str, Any], pass_number: int) -> Optional[str]:
-    """The stop message when this pass names a removed speech enhancer (ClearVoice), else None."""
-    from whisperjav.modules.speech_enhancement.factory import removed_backend_in_pass
+def _unknown_enhancer_in_pass(pass_config: Dict[str, Any], pass_number: int) -> Optional[str]:
+    """The stop message when this pass names a speech enhancer WhisperJAV does not offer, else None (owner W603)."""
+    from whisperjav.modules.speech_enhancement.factory import unknown_backend_in_pass
 
-    return removed_backend_in_pass(pass_config, pass_number)
+    return unknown_backend_in_pass(pass_config, pass_number)
 
 
 def _parse_speech_enhancer(enhancer_value: str) -> tuple:
@@ -2046,8 +2016,8 @@ def _parse_speech_enhancer(enhancer_value: str) -> tuple:
 
     Supports formats:
         - "none" -> ("none", None)
-        - "bs-roformer" -> ("bs-roformer", None)  # Uses factory default
-        - "bs-roformer:vocals" -> ("bs-roformer", "vocals")
+        - "mini-bs-roformer" -> ("mini-bs-roformer", None)  # Uses factory default
+        - "mini-bs-roformer:vocals" -> ("mini-bs-roformer", "vocals")
         - "ffmpeg-dsp:loudnorm,denoise" -> ("ffmpeg-dsp", "loudnorm,denoise")
 
     Returns:

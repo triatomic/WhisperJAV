@@ -437,14 +437,9 @@ class QwenPipeline(BasePipeline):
 
     @staticmethod
     def _aligner_backend_for(aligner_backend: Optional[str], aligner_id: Optional[str]) -> str:
-        """Which aligner backend runs: the one named, else the one the model value belongs to — a CrispASR
-        short name (manifest.ALIGNER_MODELS) means "crispasr", anything else (a PyTorch model ID) "qwen3"."""
-        if aligner_backend:
-            return aligner_backend
-        if not aligner_id:
-            return "none"
-        from whisperjav.crispasr.manifest import ALIGNER_MODELS
-        return "crispasr" if aligner_id in ALIGNER_MODELS else "qwen3"
+        """Which aligner backend runs (config/chronosjav_timing.py aligner_backend_for, the one rule since 1.10.2)."""
+        from whisperjav.config.chronosjav_timing import aligner_backend_for
+        return aligner_backend_for(aligner_backend, aligner_id)
 
     # ------------------------------------------------------------------
     # Context resolution
@@ -592,40 +587,40 @@ class QwenPipeline(BasePipeline):
         else:
             cleaner = TextCleanerFactory.create("passthrough")
 
-        # TextAligner: the CrispASR aligner (1.10.0 default, wav2vec2-ja), the Qwen3
-        # ForcedAligner (PyTorch), or None if timestamps are disabled.
-        # G1 fix: vad_only mode has no use for an aligner — skip loading
-        # entirely so we save VRAM and take Branch B (aligner-free) in the
-        # orchestrator's _step9_reconstruct_and_harden().
+        # Which aligner and timing model this pass uses: ONE rule, also read by main's start-of-run check (which
+        # downloads their files before any audio is read) and by --dump-params (1.10.2, owner W624 C, W626;
+        # config/chronosjav_timing.py chronosjav_files). No aligner in vad_only (Branch B, aligner-free, in the
+        # orchestrator's _step9_reconstruct_and_harden; no collapse, so step-down is irrelevant), with the backend
+        # "none" or with timestamps other than "word"; else the CrispASR aligner (wav2vec2-ja by default) or the
+        # Qwen3 ForcedAligner (PyTorch). The timing model (step 8: where speech starts in each VAD group and where a
+        # new sentence starts, design note 2026-10-28 section 5) also runs without an aligner: then it moves the
+        # subtitle's start only (rule T5).
+        from whisperjav.config.chronosjav_timing import chronosjav_files
+        files = chronosjav_files(timestamps=cfg["timestamps"], aligner_id=cfg["aligner_id"],
+                                 aligner_backend=cfg["aligner_backend"], timing_model=cfg["timing_model"],
+                                 timestamp_mode=self.timestamp_mode)
         aligner = None
-        if self.timestamp_mode == TimestampMode.VAD_ONLY or cfg["aligner_backend"] == "none":
-            # No aligner → Branch B; no collapse possible → step-down irrelevant
-            pass
-        elif cfg.get("use_aligner", True):
-            if cfg["aligner_backend"] == "crispasr":
-                aligner = TextAlignerFactory.create(
-                    "crispasr",
-                    model=cfg["aligner_id"],
-                    device=cfg["device"],
-                    language=cfg["language"] or "ja",
-                    temp_dir=self.temp_dir,
-                )
-            else:
-                aligner = TextAlignerFactory.create(
-                    "qwen3",
-                    aligner_id=cfg["aligner_id"],
-                    device=cfg["device"],
-                    dtype=cfg["dtype"],
-                    language=cfg["language"],
-                )
+        if files.aligner_backend == "crispasr":
+            aligner = TextAlignerFactory.create(
+                "crispasr",
+                model=files.aligner,
+                device=cfg["device"],
+                language=cfg["language"] or "ja",
+                temp_dir=self.temp_dir,
+            )
+        elif files.aligner_backend is not None:
+            aligner = TextAlignerFactory.create(
+                "qwen3",
+                aligner_id=files.aligner,
+                device=cfg["device"],
+                dtype=cfg["dtype"],
+                language=cfg["language"],
+            )
 
-        # Timing model (step 8): where speech starts in each VAD group and where a new
-        # sentence starts (design note 2026-10-28 section 5). It also runs without an
-        # aligner: then it moves the subtitle's start only (rule T5).
         timer = None
-        if cfg["timing_model"] != "none":
+        if files.timing_model:
             from whisperjav.modules.subtitle_pipeline.timers.crispasr import CrispASRTimer
-            timer = CrispASRTimer(model=cfg["timing_model"], device=cfg["device"], temp_dir=self.temp_dir)
+            timer = CrispASRTimer(model=files.timing_model, device=cfg["device"], temp_dir=self.temp_dir)
 
         # Step-down retry config (uses existing Qwen pipeline params)
         # Disabled when aligner is None (no alignment = no collapse = nothing to step-down)
@@ -735,6 +730,9 @@ class QwenPipeline(BasePipeline):
         # than only in the log. Reset per file -- the pipeline object is reused
         # across the whole run.
         self.degradations = []
+        # Routine notes, printed under the file's row in the run summary; they never change its state (main.py,
+        # "Routine notes from the passes"). 1.10.2 (#501): the aligner events go here, as in the GGUF pipelines.
+        self.notes = []
         input_file = Path(media_info["path"])
         media_basename = media_info["basename"]
         pipeline_start = time.time()
@@ -1085,13 +1083,20 @@ class QwenPipeline(BasePipeline):
             vad_audio_paths=orch_vad_paths,
         )
 
-        # A failed aligner load no longer ends the job (#436); say so in the summary.
+        # A failed aligner load no longer ends the job (#436); say so in the summary: the file is "suspect".
         if getattr(self._subtitle_pipeline, "alignment_unavailable", None):
             self.degradations.append(self._subtitle_pipeline.alignment_unavailable)
-        # The aligner loaded but gave no times for some VAD groups (1.10.0, item 12).
+        # The aligner loaded but gave no times for some VAD groups (1.10.0, item 12). 1.10.2 (#501, owner W563): when
+        # it timed at least one VAD group, this is a note and the file stays "done" (before, 6 of 1,624 groups made a
+        # full film "suspect"); the groups concerned keep their text, timed from their VAD group. When it timed none,
+        # the aligner did not work at all, as when it cannot be loaded: still "suspect". Where between "some" and
+        # "all" a file should become "suspect" is the owner's open decision (review action 9).
         if getattr(self._subtitle_pipeline, "alignment_partial", None):
-            self.degradations.append(self._subtitle_pipeline.alignment_partial)
-        # The same for the timing model (1.10.0, item 12): the subtitles are kept, unsplit.
+            if getattr(self._subtitle_pipeline, "alignment_none", False):
+                self.degradations.append(self._subtitle_pipeline.alignment_partial)
+            else:
+                self.notes.append(self._subtitle_pipeline.alignment_partial)
+        # The timing model (1.10.0, item 12): the subtitles are kept, unsplit; a degradation, as before.
         if getattr(self._subtitle_pipeline, "timing_unavailable", None):
             self.degradations.append(self._subtitle_pipeline.timing_unavailable)
 
@@ -1442,6 +1447,7 @@ class QwenPipeline(BasePipeline):
         # the same way: the plain path, the async path, and a pass running in
         # its own process (agreed error-handling table, 2026-09-17).
         master_metadata["summary"]["degradations"] = list(getattr(self, "degradations", None) or [])
+        master_metadata["summary"]["notes"] = list(getattr(self, "notes", None) or [])
 
         logger.info(
             "Complete: %s (%d subtitles in %s)",

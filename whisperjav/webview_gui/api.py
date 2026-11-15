@@ -119,6 +119,56 @@ def _with_device_cpu(args: List[str]) -> List[str]:
     return out + ["--device", "cpu"]
 
 
+
+# The pass pipelines (GUI values) that keep one track: balanced finds the speech inside faster-whisper on the audio it
+# transcribes (the flag is refused there), the others run no separate speech segmenter.
+ONE_TRACK_PIPELINES = frozenset({"balanced", "transformers", "xxl", "fast", "faster"})
+
+
+def _enhance_for_vad_args(n, pass_config) -> List[str]:
+    """The "For VAD only" tick box of the pass's Speech Enhancer menu as a flag (1.10.2, owner W596 3: ticked by
+    default). Sent for a pass with a speech enhancer whose pipeline has a separate speech segmenter: ticked
+    --passN-enhance-for-vad, unticked --no-passN-enhance-for-vad. Nothing for the one-track pipelines. The caller
+    has checked that the pass has a speech enhancer."""
+    if pass_config.get('pipeline') in ONE_TRACK_PIPELINES:
+        return []
+    on = pass_config.get('enhanceForVad', True)
+    return [f"--pass{n}-enhance-for-vad" if on else f"--no-pass{n}-enhance-for-vad"]
+
+
+def _one_start_at_a_time(lock_name: str, busy: Dict[str, Any]):
+    """One start call at a time (1.10.2, owner W647 1).
+
+    pywebview runs every call from the page on its own thread, and a start method records its process only
+    when subprocess.Popen returns. Popen can take many seconds (about 20 s on the owner's PC on 2026-11-14),
+    and a second start call arriving in that time passed the "already running" check and launched one more
+    complete run of the same files. With this, a start call that arrives while
+    another is still launching answers ``busy`` and launches nothing. The same answer is given once the
+    window is closing (_end_runs_on_close). The wrapper names its one parameter, so pywebview shows the page
+    the same call as before.
+    """
+    def decorate(method):
+        def start(self, options):
+            lock = getattr(self, lock_name)
+            if not lock.acquire(blocking=False):
+                return dict(busy)
+            try:
+                if self._closing:
+                    return dict(busy)
+                return method(self, options)
+            finally:
+                lock.release()
+        start.__name__ = method.__name__
+        start.__qualname__ = method.__qualname__
+        start.__doc__ = method.__doc__
+        return start
+    return decorate
+
+
+_RUN_START_BUSY = {"success": False, "message": "Process already running"}
+_TRANSLATION_START_BUSY = {"success": False, "error": "Translation already in progress"}
+
+
 class WhisperJAVAPI:
     """
     API class exposed to JavaScript via PyWebView.
@@ -157,6 +207,41 @@ class WhisperJAVAPI:
         # The last run started (which start method, with which options), for "Run on the CPU
         # this time" (design 22.9.2, D-G).
         self._last_start: Optional[Tuple[str, Dict[str, Any]]] = None
+
+        # One start call at a time, and none once the window is closing (1.10.2, owner W647 1 and 3).
+        self._start_lock = threading.Lock()
+        self._translate_start_lock = threading.Lock()
+        self._closing = False
+
+    def _end_runs_on_close(self, wait_s: float = 30.0) -> List[int]:
+        """End every run this window started; called when the window has closed (1.10.2, owner W647 3).
+
+        Before this, closing the window left the run and its workers running, with the models in memory and
+        on the GPU, and the terminal the GUI was started from stayed open. A start call that is still
+        launching its process is waited for (up to ``wait_s`` seconds), so that its run is ended too. Not
+        callable from the page (the name starts with an underscore). Returns the process ids it ended.
+        """
+        self._closing = True
+        for lock in (self._start_lock, self._translate_start_lock):
+            if lock.acquire(timeout=wait_s):
+                lock.release()
+        ended = []
+        for proc in (self.process, getattr(self, "_translate_process", None)):
+            if proc is None or proc.poll() is not None:
+                continue
+            try:
+                if PSUTIL_AVAILABLE:
+                    terminate_process_tree(proc.pid, timeout=5.0, include_parent=True)
+                else:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                ended.append(proc.pid)
+            except Exception as e:  # the window is gone; nothing to show it in
+                print(f"Could not end process {proc.pid}: {e}")
+        return ended
 
     def _output_dir(self, options: Dict[str, Any]) -> Any:
         """
@@ -588,6 +673,7 @@ class WhisperJAVAPI:
         method, options = self._last_start
         return getattr(self, method)({**options, "run_on_cpu": True})
 
+    @_one_start_at_a_time("_start_lock", _RUN_START_BUSY)
     def start_process(self, options: Dict[str, Any]) -> Dict[str, Any]:
         """
         Start WhisperJAV subprocess with given options.
@@ -810,6 +896,12 @@ class WhisperJAVAPI:
         # A run that ended without a run summary: the reason it printed, for the dialog (22.9.2).
         if self.status == "error" and self._run_summary is None:
             result["reason"] = self._stop_reason()
+            # The run refused to start because another run uses its working folder (1.10.2, owner W648 2):
+            # the page shows "The run did not start" with this text instead of "ended without a run summary".
+            from whisperjav.utils.run_lock import gui_refusal_text
+            in_use = gui_refusal_text(getattr(self, "_output_tail", []))
+            if in_use:
+                result["working_folder_in_use"] = in_use
 
         # Include output files when completed (for post-processing like translation)
         if self.status == "completed" and self._expected_output_files:
@@ -1749,6 +1841,9 @@ class WhisperJAVAPI:
             "silero-v6.2": "silero-v6-speech-segmentation.yaml",
             "whisperseg": "whisperseg-speech-segmentation.yaml",
             "firered-vad": "firered-vad-speech-segmentation.yaml",  # v1.9.0; installed by default since v1.9.2
+            # 1.10.2 (owner W594, W596): CrispASR's diarization methods
+            "sortformer": "sortformer-speech-segmentation.yaml",
+            "pyannote": "pyannote-speech-segmentation.yaml",
         }
 
         # v1.9.2: "faster-whisper" is not an external segmenter and has no tool YAML
@@ -1813,7 +1908,7 @@ class WhisperJAVAPI:
         Get parameter schema for a speech enhancer backend.
 
         Args:
-            backend: Enhancer name (ffmpeg-dsp, zipenhancer, bs-roformer, etc.)
+            backend: Enhancer name (ffmpeg-dsp, zipenhancer, htdemucs, mel-band-roformer, mini-bs-roformer)
 
         Returns:
             Schema dict with parameters and options
@@ -1886,36 +1981,32 @@ class WhisperJAVAPI:
                 "defaults": {"model": "torch", "device": "auto"},
             }
 
-        # BS-RoFormer schema
-        if backend == "bs-roformer":
+        # 1.10.2 (owner W602 5): the speech enhancers without settings show their name, their menu description and
+        # one line, instead of "Failed to load enhancer schema" (htdemucs had the same fault before).
+        no_settings = {
+            "mel-band-roformer": ("Mel-Band-RoFormer",
+                                  "Isolates the voice from music and effects; run by CrispASR. Its 457 MB model is "
+                                  "downloaded from Hugging Face the first time. Fast on an NVIDIA GPU, very slow on "
+                                  "the CPU. If it cannot run, the run stops and says so."),
+            "mini-bs-roformer": ("Mini-BS-RoFormer",
+                                 "Isolates the voice from music and effects; run by CrispASR. Its 92 MB model is "
+                                 "downloaded from Hugging Face the first time. If it cannot run, the run stops and "
+                                 "says so."),
+            "htdemucs": ("htdemucs (Demucs v4)",
+                         "Isolates the voice from music and effects. Installed with WhisperJAV; its 84 MB model is "
+                         "fetched once on first use, from Meta's site rather than Hugging Face. If it cannot run, the "
+                         "run stops and says so."),
+        }
+        if backend in no_settings:
+            display_name, description = no_settings[backend]
             return {
                 "success": True,
-                "backend": "bs-roformer",
-                "display_name": "BS-RoFormer Vocal Isolation",
-                "description": "Separate vocals from background music (44.1kHz stereo)",
-                "parameters": {
-                    "model": {
-                        "type": "dropdown",
-                        "label": "Target",
-                        "description": "What to extract",
-                        "options": [
-                            {"value": "vocals", "label": "Vocals (speech/singing)"},
-                            {"value": "other", "label": "Other (background)"},
-                        ],
-                        "default": "vocals",
-                    },
-                    "device": {
-                        "type": "dropdown",
-                        "label": "Device",
-                        "options": [
-                            {"value": "auto", "label": "Auto (the GPU when one can be used, else the CPU)"},
-                            {"value": "cuda", "label": "NVIDIA GPU (CUDA)"},
-                            {"value": "cpu", "label": "CPU (not accelerated)"},
-                        ],
-                        "default": "auto",
-                    },
-                },
-                "defaults": {"model": "vocals", "device": "auto"},
+                "backend": backend,
+                "display_name": display_name,
+                "description": description,
+                "parameters": {},
+                "defaults": {},
+                "info_message": "This speech enhancer has no settings.",
             }
 
         # None (passthrough)
@@ -2196,6 +2287,7 @@ class WhisperJAVAPI:
                 "warnings": []
             }
 
+    @_one_start_at_a_time("_start_lock", _RUN_START_BUSY)
     def start_ensemble_process(self, options: Dict[str, Any]) -> Dict[str, Any]:
         """
         Start WhisperJAV subprocess with ensemble configuration.
@@ -2675,13 +2767,7 @@ class WhisperJAVAPI:
                         "min": 10, "max": 300, "step": 10, "default": 60,
                     },
                 },
-                "enhancer": {
-                    "bsrf_overlap": {
-                        "type": "slider",
-                        "label": "BS-RoFormer overlap (speed vs quality)",
-                        "min": 1, "max": 4, "step": 1, "default": 2,
-                    },
-                },
+                # (1.10.2 removed the BS-RoFormer enhancer, and with it this modal's overlap knob.)
                 # Post-processing filters. The shared sanitizer is tuned for
                 # Whisper and over-removes SenseVoice output; defaults are relaxed
                 # (hallucination + CPS off, repetition on). (#350)
@@ -2759,6 +2845,16 @@ class WhisperJAVAPI:
             audio["max_group_duration"]["default"] = aw["max_group_duration_s"]
             audio["vad_start_pad"]["default"] = int(aw["start_pad_ms"])
             audio["vad_end_pad"]["default"] = int(aw["end_pad_ms"])
+            # 1.10.2 (guide point d): anime-whisper always runs its own text cleaner (qwen_pipeline.py: the cleaner
+            # follows the model; the Qwen3 cleaner is off), so the menu showed "Passthrough (no cleaning)" wrongly and
+            # its choice had no effect. One entry, named for what runs; the value sent stays "passthrough" (unchanged).
+            result["schema"]["alignment"]["assembly_cleaner"] = {
+                "type": "dropdown",
+                "label": "Text Cleaner",
+                "description": "anime-whisper always uses its own text cleaner",
+                "options": [{"value": "passthrough", "label": "anime-whisper's own text cleaner"}],
+                "default": "passthrough",
+            }
 
         # Qwen3-ASR + WhisperSeg: end pad 0 ms (owner, 2026-10-09), as a run uses it.
         from whisperjav.config.chronosjav_vad import chronosjav_end_pad_default
@@ -2772,9 +2868,15 @@ class WhisperJAVAPI:
                 audio.pop(key, None)
             return result
 
+        # 1.10.2 (owner W602 4): Sortformer and pyannote take no VAD threshold (CrispASR uses its own, 0.5), so the
+        # control is not offered for them.
+        from whisperjav.config.segmenter_presets import NO_THRESHOLD_SEGMENTERS
+        if segmenter in NO_THRESHOLD_SEGMENTERS:
+            audio.pop("vad_threshold", None)
+
         from whisperjav.config.chronosjav_vad import resolve_chronosjav_segmenter_config
         cfg = resolve_chronosjav_segmenter_config(generator_backend, segmenter, sensitivity)
-        if cfg.get("threshold") is not None:
+        if cfg.get("threshold") is not None and "vad_threshold" in audio:
             audio["vad_threshold"]["default"] = float(cfg["threshold"])
         if segmenter == "whisperseg":
             if cfg.get("segmentation_decoder"):
@@ -3610,6 +3712,7 @@ class WhisperJAVAPI:
                 "error": str(e)
             }
 
+    @_one_start_at_a_time("_start_lock", _RUN_START_BUSY)
     def start_ensemble_twopass(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """
         Start two-pass ensemble processing.
@@ -3804,20 +3907,28 @@ class WhisperJAVAPI:
                                        timestamp_mode: Optional[str] = None) -> Dict[str, Any]:
         """The CrispASR status panel of a ChronosJAV pass: its CrispASR aligner and timing model, downloaded
         or not, and where CrispASR runs. No lines when the pass uses neither (another aligner or none, and no
-        timing model). Reads files only; never downloads."""
+        timing model). Reads files only; never downloads.
+
+        Which files: the one place the run uses (config/chronosjav_timing.py pass_files, as main's start check and
+        the pass worker; 1.10.2, owner W632 4), given the pass's values as the run's --passN-qwen-params would carry
+        them. Before, the panel kept its own copy of the rule (no backend counted as crispasr; no mode as vad_only)."""
         try:
+            from whisperjav.config.chronosjav_timing import pass_files
             from whisperjav.crispasr import install, manifest
 
+            named = {key: value for key, value in (("aligner_backend", aligner_backend), ("aligner_id", aligner),
+                                                   ("timing_model", timing_model),
+                                                   ("timestamp_mode", timestamp_mode))
+                     if value not in (None, "")}
+            files = pass_files(named)
             lines = []
-            uses_aligner = (timestamp_mode or "vad_only") != "vad_only"   # default vad_only since W498 D1
-            backend = aligner_backend or "crispasr"
-            if uses_aligner and backend == "crispasr":
-                name = aligner if aligner in manifest.ALIGNER_MODELS else None
+            if files.aligner and files.aligner_backend == "crispasr":
+                name = files.aligner if files.aligner in manifest.ALIGNER_MODELS else None
                 lines.append(self._crispasr_part_line(install, self.CRISPASR_PART_ALIGNER,
                                                       manifest.aligner_model_for(name)))
-            if (timing_model or "none") != "none":   # off by default since W498 D1
+            if files.timing_model:
                 lines.append(self._crispasr_part_line(install, self.CRISPASR_PART_TIMING,
-                                                      manifest.timing_model_for(timing_model or None)))
+                                                      manifest.timing_model_for(files.timing_model)))
             if not lines:
                 return {"success": True, "lines": [], "can_run": True}
             return self._with_crispasr_runtime([self.CRISPASR_CHRONOSJAV_HEADING] + lines)
@@ -3855,8 +3966,7 @@ class WhisperJAVAPI:
                 effects = pass_config.get('dspEffects', ['loudnorm']) or ['loudnorm']
                 enhancer = f"ffmpeg-dsp:{','.join(effects)}"
             args += [f"--pass{n}-speech-enhancer", enhancer]
-            if pass_config.get('enhanceForVad'):
-                args += [f"--pass{n}-enhance-for-vad"]
+            args += _enhance_for_vad_args(n, pass_config)
         if pass_config.get('customized') and pass_config.get('params'):
             args += [f"--pass{n}-params", json.dumps(pass_config['params'])]
         # The Customize Timing tab (1.10.1; owner W413 2): sent only when it differs from the pipeline's default.
@@ -4057,9 +4167,8 @@ class WhisperJAVAPI:
             #     which the owner accepted on 2026-09-17; documented in --help.
             #   parakeet-crispasr, cohere-crispasr -- dual-track since design 22.9.1 (sent by
             #     _crispasr_pass_args).
-            if (pass1.get('enhanceForVad') and enhancer1 and enhancer1 not in ('none', '')
-                    and pass1.get('pipeline') != 'balanced'):
-                args += ["--pass1-enhance-for-vad"]
+            if enhancer1 and enhancer1 not in ('none', ''):
+                args += _enhance_for_vad_args(1, pass1)
 
             # Pass 1: Model
             # Note: All pipelines use --pass1-model. For Qwen, pass_worker.py
@@ -4198,9 +4307,8 @@ class WhisperJAVAPI:
                 # The program refuses this flag on a balanced pass (v1.9.3), so a
                 # stale value from another pipeline must not be sent: the run would
                 # stop with a usage error the user could not act on.
-                if (pass2.get('enhanceForVad') and enhancer2 and enhancer2 not in ('none', '')
-                        and pass2.get('pipeline') != 'balanced'):
-                    args += ["--pass2-enhance-for-vad"]
+                if enhancer2 and enhancer2 not in ('none', ''):
+                    args += _enhance_for_vad_args(2, pass2)
 
                 # Pass 2: Model
                 # Note: All pipelines use --pass2-model. For Qwen, pass_worker.py
@@ -4832,6 +4940,7 @@ class WhisperJAVAPI:
         "pass1_sensitivity":         "pass1Sensitivity",
         "pass1_scene_detector":      "pass1SceneDetector",
         "pass1_speech_enhancer":     "pass1SpeechEnhancer",
+        "pass1_enhance_for_vad":     "pass1EnhanceForVad",   # 1.10.2: "For VAD only" (owner W596 3)
         "pass1_speech_segmenter":    "pass1SpeechSegmenter",
         "pass1_model":               "pass1Model",
         "pass2_enabled":             "pass2Enabled",
@@ -4839,6 +4948,7 @@ class WhisperJAVAPI:
         "pass2_sensitivity":         "pass2Sensitivity",
         "pass2_scene_detector":      "pass2SceneDetector",
         "pass2_speech_enhancer":     "pass2SpeechEnhancer",
+        "pass2_enhance_for_vad":     "pass2EnhanceForVad",
         "pass2_speech_segmenter":    "pass2SpeechSegmenter",
         "pass2_model":               "pass2Model",
         "merge_strategy":            "mergeStrategy",
@@ -5076,24 +5186,11 @@ class WhisperJAVAPI:
                     "error": f"No API key. Set {config.get('env_var')} or provide key."
                 }
 
-            # Claude: look up the default model, which checks the key and the model ID at once
-            if provider == 'claude':
-                return self._test_claude_key(key, config.get('model'))
-
-            # Test with a minimal request to the provider's own model list
-            headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-            if provider == 'gemini':
-                api_base = 'https://generativelanguage.googleapis.com/v1beta'
-                headers = {"x-goog-api-key": key}
-            elif config.get('server_address'):
-                # Custom Server providers (glm, groq) keep the API root in front of /chat/completions
-                endpoint = config.get('endpoint', '').removesuffix('/chat/completions')
-                api_base = config['server_address'].rstrip('/') + endpoint
-            else:
-                api_base = config.get('api_base', 'https://api.openai.com/v1')
-            test_url = f"{api_base.rstrip('/')}/models"
-
-            req = urllib.request.Request(test_url, headers=headers)
+            # Test with a minimal request at the provider's own models list (#465: Gemini, Claude, GLM and Groq
+            # keys used to be checked at OpenAI's address).
+            from whisperjav.translate.providers import key_check_request, is_invalid_key_response
+            test_url, headers = key_check_request(provider, key)
+            req = urllib.request.Request(test_url, headers={**headers, "Content-Type": "application/json"})
 
             try:
                 with urllib.request.urlopen(req, timeout=10) as response:
@@ -5103,8 +5200,11 @@ class WhisperJAVAPI:
                         "status_code": response.status
                     }
             except urllib.error.HTTPError as e:
-                # Gemini answers a bad key with 400 "API key not valid"
-                if e.code == 401 or (provider == 'gemini' and e.code == 400):
+                try:
+                    body = e.read().decode("utf-8", "replace")
+                except Exception:
+                    body = ""
+                if is_invalid_key_response(provider, e.code, body):
                     return {"success": False, "error": "Invalid API key"}
                 elif e.code == 403:
                     return {"success": False, "error": "API key lacks permissions"}
@@ -5118,29 +5218,6 @@ class WhisperJAVAPI:
 
         except Exception as e:
             return {"success": False, "error": str(e)}
-
-    @staticmethod
-    def _test_claude_key(key: str, model: str) -> Dict[str, Any]:
-        """Check a Claude API key by looking up the default model with the Anthropic SDK.
-
-        Args:
-            key: The Anthropic API key.
-            model: The model ID to look up.
-
-        Returns:
-            dict: Connection test result, shaped like `test_provider_connection`'s.
-        """
-        import anthropic
-
-        try:
-            anthropic.Anthropic(api_key=key, max_retries=0, timeout=10).models.retrieve(model)
-        except anthropic.AuthenticationError:
-            return {"success": False, "error": "Invalid API key"}
-        except anthropic.PermissionDeniedError:
-            return {"success": False, "error": "API key lacks permissions"}
-        except anthropic.NotFoundError:
-            return {"success": False, "error": f"API key works, but model {model} was not found"}
-        return {"success": True, "message": "Connected to claude"}
 
     # ── Ollama-specific API methods ──────────────────────────────────────
 
@@ -5296,6 +5373,7 @@ class WhisperJAVAPI:
             return {"success": False, "message": "No .srt files found in selected folder"}
         return {"success": False, "message": "No folder selected"}
 
+    @_one_start_at_a_time("_translate_start_lock", _TRANSLATION_START_BUSY)
     def start_translation(self, options: Dict[str, Any]) -> Dict[str, Any]:
         """
         Start translation process.

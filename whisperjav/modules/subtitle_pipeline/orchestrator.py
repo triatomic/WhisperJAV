@@ -268,6 +268,8 @@ class DecoupledSubtitlePipeline:
 
         self.alignment_unavailable = None
         self.alignment_partial = None
+        # 1.10.2 (#501): True when the aligner gave times for no VAD group with text (it ran, but timed nothing).
+        self.alignment_none = False
         self.timing_unavailable = None
 
         logger.info(
@@ -290,6 +292,7 @@ class DecoupledSubtitlePipeline:
         if unaligned:
             self.alignment_partial = GROUPS_NOT_ALIGNED_TEXT.format(
                 name=getattr(self.aligner, "display_name", "aligner"), n=unaligned, m=with_text)
+            self.alignment_none = unaligned >= with_text
 
         # --- Identify collapsed scenes ---
         collapsed_indices = [
@@ -1372,7 +1375,9 @@ class DecoupledSubtitlePipeline:
                 total_segments += segment_count
 
                 # Per-scene progress
-                (logger.debug if sentinel_status == "OK" else logger.info)(
+                # "N/A" (no aligner ran, the default since 1.10.1) is as ordinary as "OK": one line per scene
+                # at INFO put 268 lines into the console for one film (owner W647 5). Anything else is shown.
+                (logger.debug if sentinel_status in ("OK", "N/A") else logger.info)(
                     "Scene %d/%d: %d words → %d segments (sentinel: %s)",
                     scene_idx + 1, n_scenes, word_count, segment_count, sentinel_status,
                 )
