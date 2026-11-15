@@ -5038,25 +5038,22 @@ class WhisperJAVAPI:
                     "error": f"No API key. Set {config.get('env_var')} or provide key."
                 }
 
-            # Test with a minimal request
-            api_base = config.get('api_base', 'https://api.openai.com/v1')
-            test_url = f"{api_base.rstrip('/')}/models"
-            headers = {
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json"
-            }
-            # Claude and Gemini have no api_base and are not OpenAI-shaped. Without
-            # their own endpoint the key was sent to api.openai.com, which answers
-            # 401 for any non-OpenAI key: the test always said "Invalid API key",
-            # and the key went to the wrong company.
-            invalid_key_codes = (401,)
+            # Claude: look up the default model, which checks the key and the model ID at once
             if provider == 'claude':
-                test_url = "https://api.anthropic.com/v1/models"
-                headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
-            elif provider == 'gemini':
-                test_url = "https://generativelanguage.googleapis.com/v1beta/models"
+                return self._test_claude_key(key, config.get('model'))
+
+            # Test with a minimal request to the provider's own model list
+            headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+            if provider == 'gemini':
+                api_base = 'https://generativelanguage.googleapis.com/v1beta'
                 headers = {"x-goog-api-key": key}
-                invalid_key_codes = (400, 401)   # Gemini answers 400 API_KEY_INVALID
+            elif config.get('server_address'):
+                # Custom Server providers (glm, groq) keep the API root in front of /chat/completions
+                endpoint = config.get('endpoint', '').removesuffix('/chat/completions')
+                api_base = config['server_address'].rstrip('/') + endpoint
+            else:
+                api_base = config.get('api_base', 'https://api.openai.com/v1')
+            test_url = f"{api_base.rstrip('/')}/models"
 
             req = urllib.request.Request(test_url, headers=headers)
 
@@ -5068,7 +5065,8 @@ class WhisperJAVAPI:
                         "status_code": response.status
                     }
             except urllib.error.HTTPError as e:
-                if e.code in invalid_key_codes:
+                # Gemini answers a bad key with 400 "API key not valid"
+                if e.code == 401 or (provider == 'gemini' and e.code == 400):
                     return {"success": False, "error": "Invalid API key"}
                 elif e.code == 403:
                     return {"success": False, "error": "API key lacks permissions"}
@@ -5082,6 +5080,29 @@ class WhisperJAVAPI:
 
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    @staticmethod
+    def _test_claude_key(key: str, model: str) -> Dict[str, Any]:
+        """Check a Claude API key by looking up the default model with the Anthropic SDK.
+
+        Args:
+            key: The Anthropic API key.
+            model: The model ID to look up.
+
+        Returns:
+            dict: Connection test result, shaped like `test_provider_connection`'s.
+        """
+        import anthropic
+
+        try:
+            anthropic.Anthropic(api_key=key, max_retries=0, timeout=10).models.retrieve(model)
+        except anthropic.AuthenticationError:
+            return {"success": False, "error": "Invalid API key"}
+        except anthropic.PermissionDeniedError:
+            return {"success": False, "error": "API key lacks permissions"}
+        except anthropic.NotFoundError:
+            return {"success": False, "error": f"API key works, but model {model} was not found"}
+        return {"success": True, "message": "Connected to claude"}
 
     # ── Ollama-specific API methods ──────────────────────────────────────
 
