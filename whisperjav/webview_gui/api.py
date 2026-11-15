@@ -5029,6 +5029,9 @@ class WhisperJAVAPI:
             # Get API key
             env_var = config.get('env_var') or ''
             key = api_key or (os.getenv(env_var) if env_var else None)
+            # A pasted key often carries a trailing space or line break, which the
+            # provider rejects as a wrong key.
+            key = key.strip() if isinstance(key, str) else key
             if not key:
                 return {
                     "success": False,
