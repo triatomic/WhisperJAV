@@ -40,7 +40,12 @@ PROVIDER_CONFIGS = {
     },
     'claude': {
         'pysubtrans_name': 'Claude',
-        'model': 'claude-3-5-haiku-20241022',
+        # claude-3-5-haiku-20241022 is retired (the API answers 'model not found').
+        # PySubtrans always sends `temperature`; of the current models only Haiku 4.5,
+        # Sonnet 4.6 and Opus 4.6 accept a non-default value, so the default stays in
+        # that group. Needs anthropic<2: from 2.0 the SDK sends API version 2026-10-21,
+        # which rejects `temperature` on every model.
+        'model': 'claude-haiku-4-5',
         'env_var': 'ANTHROPIC_API_KEY'
     },
     'gpt': {
