@@ -5038,14 +5038,24 @@ class WhisperJAVAPI:
             # Test with a minimal request
             api_base = config.get('api_base', 'https://api.openai.com/v1')
             test_url = f"{api_base.rstrip('/')}/models"
+            headers = {
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json"
+            }
+            # Claude and Gemini have no api_base and are not OpenAI-shaped. Without
+            # their own endpoint the key was sent to api.openai.com, which answers
+            # 401 for any non-OpenAI key: the test always said "Invalid API key",
+            # and the key went to the wrong company.
+            invalid_key_codes = (401,)
+            if provider == 'claude':
+                test_url = "https://api.anthropic.com/v1/models"
+                headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+            elif provider == 'gemini':
+                test_url = "https://generativelanguage.googleapis.com/v1beta/models"
+                headers = {"x-goog-api-key": key}
+                invalid_key_codes = (400, 401)   # Gemini answers 400 API_KEY_INVALID
 
-            req = urllib.request.Request(
-                test_url,
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Content-Type": "application/json"
-                }
-            )
+            req = urllib.request.Request(test_url, headers=headers)
 
             try:
                 with urllib.request.urlopen(req, timeout=10) as response:
@@ -5055,7 +5065,7 @@ class WhisperJAVAPI:
                         "status_code": response.status
                     }
             except urllib.error.HTTPError as e:
-                if e.code == 401:
+                if e.code in invalid_key_codes:
                     return {"success": False, "error": "Invalid API key"}
                 elif e.code == 403:
                     return {"success": False, "error": "API key lacks permissions"}
