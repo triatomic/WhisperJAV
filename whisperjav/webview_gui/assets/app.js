@@ -4835,48 +4835,11 @@ const EnsembleManager = {
             bs.min, bs.max, bs.step, currentValues.batch_size_s ?? bs.default,
             'FunASR batch_size_s: total audio-seconds decoded per dynamic batch. Higher = faster throughput but more VRAM. Independent of subtitle timing.'));
 
-        // Enhancer tab: enhancer selection itself lives on the main Ensemble
-        // row (like Transformers); the modal only exposes the BS-RoFormer
-        // overlap knob. Gated behind an enable checkbox so that when no speech
-        // enhancement is used we don't emit a floating bsrf_overlap into
-        // --passN-params. The gating checkbox is consumed locally and is NOT
-        // collected as a param (see applyCustomization's data-gating-toggle
-        // handling); the slider is skipped entirely when the box is unchecked.
-        const enhTab = document.getElementById('tab-enhancer');
+        // Enhancer tab: the enhancer itself is chosen on the main Ensemble row.
         const enhNote = document.createElement('p');
         enhNote.className = 'tab-empty';
-        enhNote.innerHTML = 'Speech enhancement is selected in the main Ensemble tab.';
-        enhTab.appendChild(enhNote);
-        const enhSec = schema.enhancer || {};
-        if (enhSec.bsrf_overlap) {
-            const ov = enhSec.bsrf_overlap;
-            // Override is "on" only if a non-default value was previously saved.
-            const overlapEnabled = currentValues.bsrf_overlap != null;
-            const gate = this.createParamGateToggle('enable_bsrf_overlap',
-                'Override BS-RoFormer overlap', overlapEnabled,
-                'Only applies when this pass uses the BS-RoFormer speech enhancer. Leave off to use its default overlap (2).');
-            enhTab.appendChild(gate);
-            enhTab.appendChild(this.createTransformersSlider('bsrf_overlap', ov.label,
-                ov.min, ov.max, ov.step, currentValues.bsrf_overlap ?? ov.default,
-                'BS-RoFormer chunk overlap — lower = faster separation, slight quality cost (only used when Speech Enhancer = BS-RoFormer)'));
-            // Tie the slider control to the gate so the collector skips it when off.
-            const ovCtrl = enhTab.querySelector('.param-control[data-param="bsrf_overlap"]');
-            if (ovCtrl) {
-                ovCtrl.dataset.gatedBy = 'enable_bsrf_overlap';
-                ovCtrl.style.opacity = overlapEnabled ? '1' : '0.5';
-            }
-            // Wire the gate checkbox to enable/disable the slider live.
-            const gateCb = gate.querySelector('.gate-checkbox');
-            if (gateCb && ovCtrl) {
-                const sync = () => {
-                    const on = gateCb.checked;
-                    ovCtrl.style.opacity = on ? '1' : '0.5';
-                    ovCtrl.querySelectorAll('input').forEach(el => { el.disabled = !on; });
-                };
-                gateCb.addEventListener('change', sync);
-                sync();
-            }
-        }
+        enhNote.textContent = 'Speech enhancement is selected in the main Ensemble tab.';
+        document.getElementById('tab-enhancer').appendChild(enhNote);
 
         // Scene tab. NOTE: in ensemble the main-tab Scene Detector dropdown
         // overrides this when set (pass_worker applies it after modal params)
@@ -4891,7 +4854,7 @@ const EnsembleManager = {
 
         // Mark integer sliders so applyCustomization parses them as ints.
         [['tab-segmenter', 'merge_length_s'], ['tab-segmenter', 'vad_max_segment_ms'],
-         ['tab-segmenter', 'batch_size_s'], ['tab-enhancer', 'bsrf_overlap']].forEach(([tabId, p]) => {
+         ['tab-segmenter', 'batch_size_s']].forEach(([tabId, p]) => {
             const ctrl = document.querySelector(`#${tabId} .param-control[data-param="${p}"]`);
             if (ctrl) ctrl.dataset.originalType = 'int';
         });
@@ -4933,43 +4896,6 @@ const EnsembleManager = {
         return control;
     },
 
-    // Gate toggle: an enable checkbox that controls whether a sibling param is
-    // collected. Uses classes 'param-gate'/'gate-checkbox' (NOT param-control/
-    // param-checkbox) so the generic applyCustomization collector never harvests
-    // it as a parameter — it only consults gateCb.checked to decide whether to
-    // skip controls marked data-gated-by="<paramName>".
-    createParamGateToggle(paramName, label, currentValue, description) {
-        const gate = document.createElement('div');
-        gate.className = 'param-gate';
-        gate.dataset.gate = paramName;
-
-        const wrap = document.createElement('label');
-        wrap.style.display = 'flex';
-        wrap.style.alignItems = 'center';
-        wrap.style.gap = '0.5rem';
-
-        const cb = document.createElement('input');
-        cb.type = 'checkbox';
-        cb.className = 'gate-checkbox';
-        cb.id = `gate-${paramName}`;
-        cb.checked = !!currentValue;
-
-        const span = document.createElement('span');
-        span.textContent = label;
-
-        wrap.appendChild(cb);
-        wrap.appendChild(span);
-        gate.appendChild(wrap);
-
-        if (description) {
-            const desc = document.createElement('p');
-            desc.className = 'param-description';
-            desc.textContent = description;
-            gate.appendChild(desc);
-        }
-        return gate;
-    },
-
     // --- Cohere-Transcribe customize modal (issue #262, v1.9.0 handler) ---
     // Renders the focused get_cohere_schema fields instead of the full
     // Qwen-shaped modal, so users only see knobs the cohere generator
@@ -4984,7 +4910,7 @@ const EnsembleManager = {
         max_new_tokens: 512,     // D2
         batched: true,           // batch VAD frames per generate() — speed default
         batch_size: 8,
-        aligner_backend: 'qwen3', // D7: ForcedAligner ON by default (no native timestamps)
+        aligner_backend: 'none', // fork default: VAD-only timing (matches get_cohere_schema)
         // Audio tab (qwen-shell framing/VAD — same plumbing as Anime-Whisper).
         // vad_threshold/vad_padding become threshold/speech_pad_ms overrides on
         // the segmenter selected on the pass row (whisperseg, firered-vad, ...).
@@ -6654,17 +6580,6 @@ const EnsembleManager = {
                 const originalType = control.dataset.originalType;
                 let value;
 
-                // Gated controls (e.g. bsrf_overlap) are only collected when
-                // their gating checkbox is checked. When off, skip entirely so
-                // the param never reaches --passN-params — avoids emitting a
-                // floating value (like overlap) that has no effect unless the
-                // BS-RoFormer enhancer is selected.
-                const gatedBy = control.dataset.gatedBy;
-                if (gatedBy) {
-                    const gateCb = panel.querySelector(`.param-gate[data-gate="${gatedBy}"] .gate-checkbox`);
-                    if (gateCb && !gateCb.checked) return;
-                }
-
                 // Find the input element
                 const checkbox = control.querySelector('.param-checkbox');
                 const slider = control.querySelector('.param-slider');
@@ -7423,13 +7338,6 @@ const EnsembleManager = {
             panel.querySelectorAll('.param-control').forEach(control => {
                 const paramName = control.dataset.param;
                 if (!paramName) return;
-                // Skip gated controls (e.g. bsrf_overlap) when their gate is off,
-                // so presets don't bake in a floating overlap value.
-                const gatedBy = control.dataset.gatedBy;
-                if (gatedBy) {
-                    const gateCb = panel.querySelector(`.param-gate[data-gate="${gatedBy}"] .gate-checkbox`);
-                    if (gateCb && !gateCb.checked) return;
-                }
                 const checkbox = control.querySelector('.param-checkbox');
                 const slider = control.querySelector('.param-slider');
                 const number = control.querySelector('.param-number');

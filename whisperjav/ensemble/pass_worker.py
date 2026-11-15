@@ -1534,6 +1534,9 @@ def _build_pipeline(
                 qwen_pipeline_params["model_id"] = "CohereLabs/cohere-transcribe-03-2026"
             if "timestamp_mode" not in _user_qwen:
                 qwen_pipeline_params["timestamp_mode"] = "vad_only"
+            # No timing model unless the pass names one, as for Qwen3-ASR and anime-whisper.
+            if "timing_model" not in _user_qwen and "qwen_timing_model" not in _user_qwen:
+                qwen_pipeline_params["timing_model"] = "none"
             if "assembly_cleaner" not in _user_qwen:
                 qwen_pipeline_params["assembly_cleaner"] = False  # D3: passthrough
             if "stepdown" not in _user_qwen:

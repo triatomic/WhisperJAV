@@ -71,7 +71,7 @@ class SenseVoicePipeline(BasePipeline):
         # Cleans audio BEFORE SenseVoice sees it (helps noisy/music scenes).
         sv_speech_enhancer: str = "none",
         sv_speech_enhancer_model: Optional[str] = None,
-        sv_bsrf_overlap: Optional[int] = None,
+        sv_bsrf_overlap: Optional[int] = None,  # ignored: BS-RoFormer was removed in 1.10.2
         # Customize-modal params (issue #350)
         sv_ban_emo_unk: bool = False,
         sv_merge_vad: bool = True,
@@ -142,8 +142,6 @@ class SenseVoicePipeline(BasePipeline):
             "backend": sv_speech_enhancer or "none",
             "model": sv_speech_enhancer_model,
         }
-        # BS-RoFormer overlap knob — only forwarded to the enhancer factory.
-        self._bsrf_overlap = sv_bsrf_overlap
         self._enhancer_is_passthrough = is_passthrough_backend(self._enhancer_config["backend"])
         extraction_sr = get_extraction_sample_rate(self._enhancer_config["backend"])
         self.audio_extractor = AudioExtractor(sample_rate=extraction_sr)
@@ -306,16 +304,9 @@ class SenseVoicePipeline(BasePipeline):
                 logger.info("Speech enhancer is passthrough — skipping enhancement")
                 master_metadata["config"]["speech_enhancement"] = {"backend": "none", "skipped": True}
             else:
-                # 1.10.2 removed the BS-RoFormer enhancer; its overlap knob has no
-                # enhancer left to apply to, so it is accepted but not forwarded.
-                _enh_kwargs = {}
-                if self._bsrf_overlap is not None:
-                    logger.debug("sv_bsrf_overlap=%s ignored (BS-RoFormer was removed in 1.10.2)",
-                                 self._bsrf_overlap)
                 enhancer = create_enhancer_direct(
                     backend=self._enhancer_config["backend"],
                     model=self._enhancer_config["model"],
-                    **_enh_kwargs,
                 )
                 enhancer_name = enhancer.name
                 logger.info(f"Step 2.5: Preparing audio with {enhancer.display_name}...")
