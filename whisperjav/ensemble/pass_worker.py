@@ -71,6 +71,7 @@ PIPELINE_CLASSES = {
 # tests/test_speech_enhancer_spec.py, which greps the pipeline modules.
 ENHANCE_FOR_VAD_IGNORED_BY = frozenset({
     "fast", "faster", "transformers",
+    "sensevoice",  # fork: its VAD is internal to FunASR, no separate segmenter track
 })
 
 DEFAULT_HF_PARAMS = {

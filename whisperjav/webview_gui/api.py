@@ -496,6 +496,23 @@ class WhisperJAVAPI:
         if options.get('keep_temp', False):
             args += ["--keep-temp"]
 
+        # Run-level flags every mode forwards (mirror of _build_transformers_args).
+        if options.get('skip_existing', False):
+            args += ["--skip-existing"]
+
+        # Run-outcome contract: same words and same rule as the CLI's --fail-on.
+        _fail_on = [s for s in ("empty", "suspect") if options.get(f"fail_on_{s}", False)]
+        if _fail_on:
+            args += ["--fail-on", ",".join(_fail_on)]
+
+        # Per-scene ASR telemetry is on by default; the checkbox only opts out.
+        if options.get('asr_telemetry', True) is False:
+            args += ["--no-asr-telemetry"]
+
+        # #415: downloaded Hugging Face models only.
+        if options.get('offline_mode', False):
+            args += ["--offline"]
+
         if options.get('debug', False):
             args += ["--debug"]
 
